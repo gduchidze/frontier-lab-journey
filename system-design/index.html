@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>System Design Course — Index</title>
+<link rel="stylesheet" href="assets/course.css">
+<style>
+  .lang-toggle {
+    display: inline-flex; gap: 0; border: 1px solid var(--rule);
+    border-radius: 8px; overflow: hidden; font-family: var(--mono); font-size: 0.8rem;
+  }
+  .lang-toggle button {
+    font: inherit; border: none; background: var(--paper);
+    padding: 0.45rem 1rem; cursor: pointer; color: var(--ink-soft);
+  }
+  .lang-toggle button.active { background: var(--accent); color: #fff; }
+  ol.lesson-list { padding-left: 1.4rem; }
+  ol.lesson-list li { margin: 0.45rem 0; }
+  .tag {
+    font-family: var(--mono); font-size: 0.66rem; letter-spacing: 0.08em;
+    text-transform: uppercase; padding: 0.1rem 0.45rem; border-radius: 999px;
+    border: 1px solid var(--rule); color: var(--ink-soft); margin-left: 0.4rem;
+  }
+  .tag.lab { border-color: var(--good); color: var(--good); }
+</style>
+</head>
+<body>
+<div class="lesson">
+  <header class="lesson-header">
+    <p class="kicker" data-en="Course Hub · System Design for Frontier-Lab AI Engineers" data-ka="კურსის ცენტრი · სისტემური დიზაინი Frontier-Lab AI ინჟინრებისთვის"></p>
+    <h1 data-en="System Design Course" data-ka="სისტემური დიზაინის კურსი"></h1>
+    <p class="dek" data-en="Mission: Anthropic-level system design, from fundamentals to LLM inference platforms. Lessons open in your chosen language; labs and references are English-only." data-ka="მისია: Anthropic-ის დონის სისტემური დიზაინი — საფუძვლებიდან LLM inference პლატფორმებამდე. გაკვეთილები იხსნება არჩეულ ენაზე; ლაბები და reference მასალები მხოლოდ ინგლისურადაა."></p>
+    <p style="margin-top:1rem">
+      <span class="lang-toggle">
+        <button id="btn-en" type="button">English</button>
+        <button id="btn-ka" type="button">ქართული</button>
+      </span>
+    </p>
+  </header>
+
+  <h2 data-en="Phase 1 — Distributed Systems Core" data-ka="ფაზა 1 — განაწილებული სისტემების საფუძვლები"></h2>
+  <ol class="lesson-list">
+    <li><a data-base="lessons/0001-performance-vocabulary" href="#" data-en="Latency, Throughput, and the Tail" data-ka="დაყოვნება, გამტარუნარიანობა და კუდი"></a><span class="tag lab"><a href="labs/lab-0001-measure-the-tail/README.md" style="color:inherit;text-decoration:none">lab</a></span></li>
+    <li><a data-base="lessons/0002-back-of-envelope" href="#" data-en="Back-of-Envelope Estimation" data-ka="Back-of-Envelope შეფასება"></a><span class="tag lab"><a href="labs/lab-0002-napkin-math/README.md" style="color:inherit;text-decoration:none">lab</a></span></li>
+    <li><a data-base="lessons/0003-traffic-edge" href="#" data-en="The Traffic Edge: DNS, CDN, Load Balancing" data-ka="ტრაფიკის კიდე: DNS, CDN, Load Balancing"></a><span class="tag lab"><a href="labs/lab-0003-toy-load-balancer/README.md" style="color:inherit;text-decoration:none">lab</a></span></li>
+    <li><a data-base="lessons/0004-cap-and-replication" href="#" data-en="CAP, Consistency &amp; Availability" data-ka="CAP, თანმიმდევრულობა და ხელმისაწვდომობა"></a><span class="tag lab"><a href="labs/lab-0004-replication-lag/README.md" style="color:inherit;text-decoration:none">lab</a></span></li>
+    <li><a data-base="lessons/0005-rdbms-scaling" href="#" data-en="RDBMS Scaling: Replication, Sharding, Indexes" data-ka="RDBMS სქეილინგი: რეპლიკაცია, შარდინგი, ინდექსები"></a><span class="tag lab"><a href="labs/lab-0005-shard-and-index/README.md" style="color:inherit;text-decoration:none">lab</a></span></li>
+    <li><a data-base="lessons/0006-nosql-taxonomy" href="#" data-en="NoSQL Taxonomy &amp; Consistent Hashing" data-ka="NoSQL ტაქსონომია და Consistent Hashing"></a><span class="tag lab"><a href="labs/lab-0006-consistent-hashing/README.md" style="color:inherit;text-decoration:none">lab</a></span></li>
+    <li><a data-base="lessons/0007-caching-deep" href="#" data-en="Caching, Deeply" data-ka="ქეშირება სიღრმისეულად"></a><span class="tag lab"><a href="labs/lab-0007-cache-lab/README.md" style="color:inherit;text-decoration:none">lab</a></span></li>
+    <li><a data-base="lessons/0008-async-and-communication" href="#" data-en="Queues, Backpressure &amp; Communication" data-ka="რიგები, Backpressure და კომუნიკაცია"></a><span class="tag lab"><a href="labs/lab-0008-backpressure/README.md" style="color:inherit;text-decoration:none">lab</a></span></li>
+    <li><a data-base="lessons/0009-interview-os" href="#" data-en="The Interview OS: 4-Step Framework" data-ka="ინტერვიუს OS: 4-ნაბიჯიანი ჩარჩო"></a><span class="tag lab"><a href="labs/lab-0009-design-rep/README.md" style="color:inherit;text-decoration:none">lab</a></span></li>
+  </ol>
+
+  <h2 data-en="Reference (English only)" data-ka="Reference მასალები (მხოლოდ ინგლისურად)"></h2>
+  <ul>
+    <li><a href="reference/0001-glossary.html" data-en="Glossary" data-ka="გლოსარიუმი (Glossary)"></a></li>
+    <li><a href="reference/0002-estimation-kit.html" data-en="Estimation Kit — numbers to memorize" data-ka="Estimation Kit — დასამახსოვრებელი რიცხვები"></a></li>
+  </ul>
+
+  <h2 data-en="Coming phases" data-ka="მომდევნო ფაზები"></h2>
+  <ul>
+    <li data-en="Phase 2 — Software architecture &amp; reliability (microservices, APIs, storage engines, streams, transactions, observability, security)" data-ka="ფაზა 2 — Software არქიტექტურა და საიმედოობა (microservices, API-ები, storage engines, streams, ტრანზაქციები, observability, უსაფრთხოება)"></li>
+    <li data-en="Phase 3 — Classic design reps (rate limiter, chat, Dropbox, payments → 1B-doc search)" data-ka="ფაზა 3 — კლასიკური დიზაინის ვარჯიშები (rate limiter, chat, Dropbox, payments → 1B-doc search)"></li>
+    <li data-en="Phase 4 — ML system design patterns (Mercari catalog)" data-ka="ფაზა 4 — ML სისტემური დიზაინის პატერნები (Mercari კატალოგი)"></li>
+    <li data-en="Phase 5 — LLM inference &amp; GPU infra (THE Anthropic prompt)" data-ka="ფაზა 5 — LLM inference და GPU ინფრასტრუქტურა (Anthropic-ის მთავარი ამოცანა)"></li>
+    <li data-en="Phase 6 — RAG, agents, evals at scale" data-ka="ფაზა 6 — RAG, აგენტები, eval-ები მასშტაბში"></li>
+    <li data-en="Phase 7 — Interview execution &amp; mocks" data-ka="ფაზა 7 — ინტერვიუს შესრულება და mock-ები"></li>
+  </ul>
+
+  <footer class="lesson-footer">
+    <p data-en="Ask your teacher (the agent) anything. Curriculum lives in NOTES.md; mission in MISSION.md." data-ka="ჰკითხე მასწავლებელს (აგენტს) ნებისმიერი რამ. სასწავლო გეგმა — NOTES.md-ში; მისია — MISSION.md-ში."></p>
+  </footer>
+</div>
+
+<script>
+(function () {
+  var KEY = 'course-lang';
+  function apply(lang) {
+    document.documentElement.lang = lang;
+    document.querySelectorAll('[data-en]').forEach(function (el) {
+      el.innerHTML = el.getAttribute(lang === 'ka' ? 'data-ka' : 'data-en');
+    });
+    document.querySelectorAll('a[data-base]').forEach(function (a) {
+      a.href = a.getAttribute('data-base') + (lang === 'ka' ? '.ka.html' : '.html');
+    });
+    document.getElementById('btn-en').classList.toggle('active', lang === 'en');
+    document.getElementById('btn-ka').classList.toggle('active', lang === 'ka');
+    try { localStorage.setItem(KEY, lang); } catch (e) { /* file:// may block */ }
+  }
+  document.getElementById('btn-en').addEventListener('click', function () { apply('en'); });
+  document.getElementById('btn-ka').addEventListener('click', function () { apply('ka'); });
+  var saved = 'en';
+  try { saved = localStorage.getItem(KEY) || 'en'; } catch (e) { /* default en */ }
+  apply(saved);
+})();
+</script>
+</body>
+</html>

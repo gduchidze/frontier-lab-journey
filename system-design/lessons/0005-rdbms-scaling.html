@@ -1,0 +1,188 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lesson 5 · RDBMS Scaling: Replication, Sharding, Indexes</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<div class="lesson">
+  <header class="lesson-header">
+    <p class="kicker">Lesson 0005 · Phase 1 — Distributed Systems Core · <a href="0005-rdbms-scaling.ka.html">ქართული ვერსია</a></p>
+    <h1>RDBMS Scaling: Replication, Sharding, Indexes</h1>
+    <p class="dek">One box of Postgres carries you astonishingly far — here is the exact order in which to spend its lives, and why sharding is the last rung of the ladder, not the first.</p>
+  </header>
+
+  <div class="mission-tie">
+    <strong>Mission tie.</strong> Anthropic's design rounds still lean on the classics — a feed, a payments ledger, an orders table — because they expose whether you can scale the world's default database. The interviewer is listening for two specific sentences: one that names the index behind every query you promise, and one that defends your shard key against the hot-key problem. Both sentences are the deliverable of this lesson.
+  </div>
+
+  <h2>1 · ACID, and when you actually need it</h2>
+  <p><strong>ACID</strong> is the transaction contract: <strong>Atomicity</strong> (a multi-statement change lands entirely or not at all), <strong>Consistency</strong> (declared constraints and invariants hold before and after), <strong>Isolation</strong> (concurrent transactions cannot observe each other's half-done work), <strong>Durability</strong> (once committed, a crash cannot un-commit it). (<a href="https://www.oreilly.com/library/view/designing-data-intensive-applications/9781098119058/">DDIA ch. 7</a>)</p>
+  <p>You <em>need</em> transactions when several rows must change together and a partial state is unacceptable. The canonical case is checkout: decrement inventory, create the order row, record the charge — if the process dies between steps, you've either sold a phantom item or charged for nothing. Same for moving money between accounts and claiming a unique username. You do <em>not</em> need multi-statement transactions for single-row appends (a log line, a page-view event) — the row insert is already atomic on its own.</p>
+  <p>Two refinements interviewers reward. First, <strong>isolation has levels</strong>: most databases default to something weaker than serializable (read committed, snapshot isolation) because full serializability costs throughput — say which level your invariant actually requires. Second, the failure mode of transaction enthusiasm: long transactions hold locks, stall replication, and turn a hot row (a single inventory counter on a flash-sale item) into a global convoy. Transactions are a scalpel, not a blanket.</p>
+
+  <h2>2 · Indexes: the B-tree you must be able to draw</h2>
+  <p>An index is a <strong>B-tree</strong>: keys kept sorted in a wide, shallow tree. Do the arithmetic once and keep it forever: an 8 KB page holds roughly 400 branch entries, so depth 3 reaches 400³ ≈ 64 million rows and depth 4 reaches ≈ 25 <em>billion</em>. A point read on a billion-row table is therefore ~4 page touches in <strong>O(log n)</strong> — and since the top levels stay cached in RAM, it is usually <em>one</em> random SSD read, ~150 µs on the lesson-0001 latency table. A range query descends once to the start of the range, then reads leaves sequentially — this is why "give me this user's messages from last week" can be cheap while "scan everything" never is.</p>
+  <p>The price is <strong>write amplification</strong>: every index is one more B-tree that must be updated on <em>every</em> insert and update. A table with five indexes does six structure writes per logical row written; bulk loads slow down, pages split, storage bloats. Indexes are not free reads — they are prepaid reads, billed to the write path.</p>
+  <ul>
+    <li><strong>Composite ordering rule.</strong> An index on <code>(user_id, created_at)</code> is a phone book sorted by last name, then first. It serves "equality on <code>user_id</code>, then range/sort on <code>created_at</code>" perfectly — and is nearly useless for "range on <code>created_at</code> alone," exactly as a phone book is useless for finding everyone named Anna. Rule: <em>equality columns first, the range/sort column last</em>. This is the leftmost-prefix rule, and the lab makes you feel it as a timing gap.</li>
+    <li><strong>Covering index.</strong> If the index contains every column the query touches, the engine never visits the table at all — an index-only scan. Adding one displayed column to an index can delete millions of table lookups per day.</li>
+    <li><strong>Classic self-inflicted wounds.</strong> Indexing a two-value column (<code>is_active</code>) buys nothing — half the table still matches. Wrapping the column in a function (<code>WHERE lower(email) = …</code>) silently defeats the index unless the index is on the expression. And a write-heavy table with nine "just in case" indexes is a write-throughput incident scheduled in advance.</li>
+  </ul>
+  <div class="callout"><span class="label">Design discipline</span>
+    <strong>Every query in the design should name its index.</strong> "We fetch the customer's last 50 orders — via the <code>(customer_id, created_at)</code> index" is an answer. "We fetch the orders" is a full table scan waiting to be discovered in the follow-up question.
+  </div>
+
+  <h2>3 · The scaling ladder — in order, no skipping</h2>
+  <p>When one primary saturates, climb in this order. The ordering is not aesthetic: each rung is cheaper, better understood, and <em>more reversible</em> than the next, and each buys time before the next is needed. (<a href="https://github.com/donnemartin/system-design-primer#relational-database-management-system-rdbms">Primer §12: RDBMS</a>)</p>
+  <table>
+    <tr><th>Rung</th><th>What it buys</th><th>What it costs</th></tr>
+    <tr><td>1 · Read replicas</td><td>Read throughput, cheaply</td><td>Replication lag (lesson 0004); writes still one box</td></tr>
+    <tr><td>2 · Caching</td><td>Absorbs the hot read set</td><td>Invalidation bugs, stale reads, stampedes</td></tr>
+    <tr><td>3 · Federation</td><td>Split by <em>function</em>: users DB, catalog DB, orders DB</td><td>No cross-database joins; per-function ceilings remain</td></tr>
+    <tr><td>4 · Sharding</td><td>Write scaling, at last</td><td>Everything in section 6</td></tr>
+  </table>
+  <p>Anchor number for the whole ladder: a single well-tuned Postgres/MySQL box comfortably serves <strong>tens of thousands of reads/sec, low thousands of writes/sec, and terabytes of data</strong>. Most systems that "need sharding" on a whiteboard never outgrow rungs 1–2 in production. Saying <em>why you are not sharding yet</em> is a senior-signal sentence.</p>
+
+  <h2>4 · Rungs 1–2: read replicas and caching</h2>
+  <p><strong>Read replicas.</strong> One primary takes all writes and streams its changes (asynchronously, usually) to N copies that serve reads. This fits the shape of almost every consumer workload: an e-commerce site doing 10,000 RPS at a 98:2 read/write ratio has 9,800 reads/sec to distribute and only 200 writes/sec — three replicas absorb the reads, the primary barely notices the writes. The costs: <strong>replication lag</strong> resurrects lesson 0004's problems — a shopper posts a review, the page reloads from a replica that hasn't heard about it, and the review "disappears" (the read-your-own-writes problem: pin the author's reads to the primary, briefly). And replicas do nothing for write volume: the ceiling is still one box.</p>
+  <p><strong>Caching.</strong> Before touching the database tier again, put the hot read set in memory (cache-aside with Redis/Memcached is the default pattern: read cache → miss → read DB → fill cache). A product page rendered a million times an hour has no business being a query a million times an hour. Costs are the two famous hard problems: <strong>invalidation</strong> (stale price on a live product page) and the <strong>stampede</strong> (a hot key expires and ten thousand concurrent misses hit the database at once — bound it with request coalescing or jittered TTLs). Cache layers are covered properly in a later lesson; here they are rung 2 because they are cheap and reversible.</p>
+
+  <h2>5 · Rung 3: federation — split by function</h2>
+  <p><strong>Federation</strong> gives each business function its own database: users in one, product catalog in another, orders in a third. Each gets its own hardware, its own replicas, its own cache, and its own failure domain — the catalog going down no longer takes checkout with it. This is the database-side twin of service decomposition, and it delays sharding by carving the write load into independent slices. (<a href="https://github.com/donnemartin/system-design-primer#federation">Primer: federation</a>)</p>
+  <p>The bill: <strong>cross-database joins stop existing.</strong> "Orders joined to user emails" becomes two queries stitched in application code. Transactions spanning functions (place order + decrement catalog stock) stop being one <code>COMMIT</code> and become a distributed-coordination problem — the usual escape hatches (sagas, outbox pattern) arrive in a later lesson. And federation has a horizon: it splits load <em>between</em> tables, so the single hottest table — always <code>orders</code>, in the end — still lives on one primary. When that one function outgrows one box, only rung 4 is left.</p>
+
+  <h2>6 · Rung 4: sharding — the last resort, itemized</h2>
+  <p><strong>Sharding</strong> splits <em>one table's rows</em> across machines by a <strong>shard key</strong>. It is the only rung that scales writes for a single table, and it is priced accordingly. First decision: how the key maps to shards. (<a href="https://www.oreilly.com/library/view/designing-data-intensive-applications/9781098119058/">DDIA ch. 6</a>)</p>
+  <table>
+    <tr><th>Strategy</th><th>Wins</th><th>Breaks</th></tr>
+    <tr><td><strong>Hash sharding</strong> — <code>hash(key) % N</code></td><td>Even key spread, no planning</td><td>Range scans die: adjacent keys live on different machines</td></tr>
+    <tr><td><strong>Range sharding</strong> — key intervals per shard</td><td>Ranges stay local; easy splits</td><td>Hot ranges: shard by <code>created_at</code> and today's shard takes 100% of writes</td></tr>
+  </table>
+  <p>Four costs arrive the day you shard, whatever you choose:</p>
+  <ul>
+    <li><strong>Hot keys — the celebrity problem.</strong> Hashing balances <em>keys</em>, not <em>load</em>. Shard a social network by <code>user_id</code> and the day a celebrity with 100M followers joins, one shard glows while the rest idle; real workloads are Zipf-distributed, where the top 1% of keys can carry a third of the traffic. Mitigations you should be able to say out loud: sub-partition the hot key (append a salt), isolate whales onto dedicated shards, or handle them through a different path entirely. The lab manufactures this with a Zipf workload so you can watch the hot shard emerge.</li>
+    <li><strong>Resharding pain.</strong> With naive <code>hash(key) % N</code>, changing N remaps almost everything: going from 4 to 5 shards, a key keeps its shard only when <code>hash % 4 == hash % 5</code> — true for 4 residues out of 20, i.e. <strong>80% of all rows move</strong>. Mitigations: consistent hashing (a later lesson), or the pragmatic industry standard — pre-split into far more <em>logical</em> shards than physical hosts and move whole logical shards, as <a href="https://www.notion.so/blog/sharding-postgres-at-notion">Notion did with 480 logical shards on 32 hosts</a>.</li>
+    <li><strong>Cross-shard queries become scatter-gather.</strong> Any question not anchored on the shard key — "top sellers today" on a customer-sharded orders table — must fan out to every shard and merge. Lesson 0001 told you what fan-out does to tail latency: the query is now as slow as the slowest shard. Cross-shard <em>joins</em> are worse: they effectively move the join into your application. Every sharded design should name the queries it deliberately gave up.</li>
+    <li><strong>Auto-increment IDs break.</strong> Every shard happily generates its own <code>1, 2, 3…</code> — colliding sequences. Real systems switch to structured IDs: <a href="https://blog.twitter.com/engineering/en_us/a/2010/announcing-snowflake">Twitter's Snowflake</a> packs a 41-bit timestamp + worker id + sequence into 64 bits; <a href="https://instagram-engineering.com/sharding-ids-at-instagram-1cf5a71e5a5c">Instagram embedded the shard id in the ID itself</a>, so the ID tells you where the row lives. UUIDs work too, at the cost of index locality.</li>
+  </ul>
+  <p>Real-world anchors worth citing in an interview: <a href="https://vitess.io/">Vitess</a> (built to shard YouTube's MySQL, now the engine behind PlanetScale), Notion's workspace-sharded Postgres, Instagram's sharded Postgres. All three chose the shard key by asking one question first: <em>what does the dominant query filter on?</em></p>
+
+  <h2>7 · Denormalization: paying writes to buy reads</h2>
+  <p>Normalization optimizes writes (one fact, one place); <strong>denormalization</strong> copies data so a read that was a three-way join becomes one lookup. You pay every write twice or thrice to make every read cheap — the right trade whenever reads dominate, which is nearly always (100:1 is unremarkable). (<a href="https://github.com/donnemartin/system-design-primer#denormalization">Primer: denormalization</a>)</p>
+  <p>The classic worked example is the social feed. Normalized, "show my feed" is a join across ~200 followees' recent posts, per user, per refresh — unpayable at scale. Denormalized (<em>fan-out on write</em>), each new post is copied into every follower's precomputed feed list: reads become one lookup, but a celebrity posting to 100M followers turns one write into 100M. Twitter's famous answer is the hybrid: fan-out on write for normal accounts, pull-on-read for celebrities, merge at request time. Notice this is the hot-key problem again, wearing a different hat — the same whales break both your shards and your fan-out.</p>
+  <p>A <strong>materialized view</strong> is denormalization with the bookkeeping handled by the database: a precomputed query result (say, revenue per seller per day) refreshed on a schedule or incrementally. The failure mode of hand-rolled denormalization is <strong>drift</strong> — a copy nobody remembered to update on the write path. Every denormalized copy needs a named owner and an update rule, or it will quietly become a lie.</p>
+
+  <h2>8 · One AI note — the chat messages table</h2>
+  <p>Everything above transfers directly to an AI chat product's <code>messages</code> table; the only new content is the key choice. Shard by <code>conversation_id</code> and rendering one chat is a single shard, but "list all my conversations" scatter-gathers on every sidebar load. Shard by <code>user_id</code> and the whole history page is one shard, but a hugely active account — an org workspace, a bot hammering the API — is your celebrity, and any future shared-conversation feature loses colocation. Where conversations belong to one user, <code>user_id</code> usually wins (it is Notion's <code>workspace_id</code> decision in miniature) — then you defend the whale case out loud, exactly as in section 6.</p>
+
+  <h2>9 · Interview talking points</h2>
+  <p>How this lesson deploys in a live design round:</p>
+  <ul>
+    <li><strong>Open with the ratio.</strong> Before choosing any storage move, state the read/write ratio and the working-set size. Every rung of the ladder is chosen by those two numbers.</li>
+    <li><strong>Name the index, every time.</strong> For each query in your design, say the index that serves it, in composite-order: "last 50 orders per customer → <code>(customer_id, created_at)</code>." Free seniority signal, costs five seconds.</li>
+    <li><strong>Climb in order, and say why you're stopping.</strong> "At 200 writes/sec one primary is bored; replicas plus a cache carry us to ~50× current traffic, so I'm not sharding yet" beats jumping to shards unprompted.</li>
+    <li><strong>If you shard, recite the liturgy unprompted:</strong> the key and the dominant query it serves; the hot-key defense; the resharding plan (logical shards ≫ physical hosts); the ID scheme (Snowflake-style); and the cross-shard queries you are knowingly giving up.</li>
+    <li><strong>Trade writes for reads explicitly.</strong> When you denormalize, say the sentence: "I'm paying N extra writes to make the hot read O(1), and here is what keeps the copies honest."</li>
+    <li><strong>Keep the anchor numbers loaded:</strong> one box ≈ low-thousands of writes/sec and terabytes; B-tree depth 4 ≈ billions of rows ≈ one 150 µs SSD read; <code>% N</code> resharding moves ~80% of rows at 4→5.</li>
+  </ul>
+
+  <h2>10 · Lab — shard and index with your own hands</h2>
+  <div class="callout"><span class="label">Hands-on (do this before the quiz)</span>
+    In <code>labs/lab-0005-shard-and-index/</code>: <code>python3 shard_index_lab.py</code> builds a 300,000-row
+    messages table and runs three experiments — point/range queries with and without an index (with
+    <code>EXPLAIN QUERY PLAN</code> receipts), the composite ordering rule as a timing gap you can feel,
+    and a 4-shard split where a Zipf workload produces a hot shard and a top-10 query forces
+    scatter-gather. Then do exercises E1–E4 in the lab README: <em>predict, edit config, re-run, compare.</em>
+  </div>
+
+  <h2>11 · Project step</h2>
+  <p>Our spine project, the <strong>LLM inference gateway</strong>, keeps a <code>request_log</code> table: <code>(api_key_id, model, created_at, prompt_tokens, completion_tokens, latency_ms)</code>. Choose its shard key and justify it in exactly two sentences — one naming the dominant query pattern and its index, one defending against the hot-key case (one enterprise API key can be 30% of all traffic). Bring both sentences to the next session; your teacher will attack the second one.</p>
+
+  <h2>Check yourself</h2>
+  <div class="quiz" id="quiz"></div>
+
+  <h2>Primary source</h2>
+  <p>Read <strong>DDIA chapters 6 (Partitioning) and 7 (Transactions)</strong> (<a href="https://www.oreilly.com/library/view/designing-data-intensive-applications/9781098119058/">2nd ed., O'Reilly</a>). Free alternative covering the same ground: the Primer's <a href="https://github.com/donnemartin/system-design-primer#relational-database-management-system-rdbms">RDBMS section</a> — replication, federation, sharding, denormalization, and SQL tuning. For the war stories: <a href="https://www.notion.so/blog/sharding-postgres-at-notion">Notion's sharding post</a> and <a href="https://instagram-engineering.com/sharding-ids-at-instagram-1cf5a71e5a5c">Instagram's ID scheme</a>.</p>
+
+  <footer class="lesson-footer">
+    <p><strong>Stuck or curious?</strong> Ask your teacher (the agent) anything — "why can't I just add a secondary index on every shard and query that instead of scatter-gathering?" is an excellent follow-up question.</p>
+    <nav class="lesson-nav">
+      <span>◀ Prev: <a href="0004-cap-and-replication.html">0004 · CAP and Replication</a></span>
+      <span>Next: <a href="0006-nosql-taxonomy.html">0006 · NoSQL Taxonomy</a> ▶</span>
+    </nav>
+  </footer>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+renderQuiz(document.getElementById('quiz'), {
+  title: 'Check yourself',
+  questions: [
+    {
+      q: 'An index exists on (user_id, created_at). Which query shape uses it fully?',
+      options: [
+        'Range on created_at alone across all users',
+        'Equality on user_id then range on created_at',
+        'Equality on body then range on created_at',
+      ],
+      answer: 1,
+      explain: 'Composite indexes serve leftmost-prefix queries: equality on the first column, then range/sort on the second. A range on created_at alone skips the first sort column — like searching a phone book by first name.',
+    },
+    {
+      q: 'Every extra index on a table primarily costs you what?',
+      options: [
+        'Slower point reads on the indexed column',
+        'More network round trips per read query',
+        'Extra B-tree updates on every single write',
+      ],
+      answer: 2,
+      explain: 'Write amplification: each index is one more B-tree the engine must update per insert/update. Reads on the indexed column get faster, not slower — the bill lands on the write path.',
+    },
+    {
+      q: 'Your single Postgres primary is read-saturated. Per the scaling ladder, what do you reach for first?',
+      options: [
+        'Add read replicas behind the primary database',
+        'Shard the data across many primary databases',
+        'Rewrite the whole service on NoSQL storage',
+      ],
+      answer: 0,
+      explain: 'Read replicas are the cheapest, most reversible rung: they multiply read capacity without touching the data model. Sharding is the last resort, and a rewrite is not a rung at all.',
+    },
+    {
+      q: 'A social network shards accounts by hash(user_id). One account is a hugely followed celebrity. What happens?',
+      options: [
+        'Every shard heats up evenly under load',
+        'One shard glows hot while others idle',
+        'The router rebalances that key automatically',
+      ],
+      answer: 1,
+      explain: 'Hashing balances keys, not load. A single key carrying 100x traffic all lands on one shard — the celebrity / hot-key problem. Nothing rebalances a single key automatically; you sub-partition or isolate it.',
+    },
+    {
+      q: 'Why do plain auto-increment primary keys break once you shard?',
+      options: [
+        'They grow too large for BIGINT columns',
+        'They index too slowly on B-tree pages',
+        'Each shard generates the same colliding sequence',
+      ],
+      answer: 2,
+      explain: 'Every shard\'s local counter starts at 1, so different rows on different shards get identical IDs. Sharded systems need structured ID generation — Snowflake-style IDs or UUIDs.',
+    },
+    {
+      q: 'What makes an index a covering index for a query?',
+      options: [
+        'It contains every column the query touches',
+        'It covers every row the table stores',
+        'It spans every shard the database owns',
+      ],
+      answer: 0,
+      explain: 'If all columns the query reads live in the index itself, the engine never visits the table — the whole read is served from the index. That is the "covering" in covering index.',
+    },
+  ],
+});
+</script>
+</body>
+</html>

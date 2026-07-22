@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="ka">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>გაკვეთილი 12 — საპროდაქშენო Edge: Ingress, Gateway, TLS</title>
+<link rel="stylesheet" href="../../assets/course.css">
+</head>
+<body>
+<div class="page">
+<p class="lang-switch"><a href="../0012-production-edge.html">🇬🇧 English</a></p>
+
+<p class="lesson-kicker">SLM Production Stack · გაძლიერებული · გაკვეთილი 12 · ~2 სთ</p>
+<h1>საპროდაქშენო Edge: Ingress, Gateway, TLS</h1>
+<p class="lesson-lede">NodePort-მა დემომდე მიგიყვანა. საპროდაქშენო ტრაფიკი ერთ გამაგრებულ შესასვლელ წერტილში შემოდის — hostname-ებით, TLS-ით, timeout-ებითა და ავთენტიფიკაციით — LLM streaming (ნაკადური გადაცემა) კი ამსხვრევს ყველა ოდესმე გამოშვებული proxy-ის ნაგულისხმევ პარამეტრებს. დღეს ნამდვილ edge-ს (ქსელის კიდეს) ააგებ.</p>
+
+<h2>ცოდნა</h2>
+
+<h3>1. Edge-სტეკი ქვემოდან ზემოთ</h3>
+<p><strong>Service (L4)</strong> → <strong>Ingress (L7 წესები: host/path → Service)</strong>, რომელსაც ინტერპრეტირებს <strong>ingress controller</strong> (nginx, Traefik, Envoy) → ღრუბელში წინ დგას <strong>LoadBalancer</strong>. ერთი controller, ერთი IP, N სერვისი hostname-ების უკან: <code>api.company.com</code> → router, <code>chat.company.com</code> → UI. (<a href="https://kubernetes.io/docs/concepts/services-networking/ingress/">დოკუმენტაცია</a>)</p>
+
+<h3>2. Gateway API მემკვიდრეა — ისწავლე ორივე</h3>
+<p><a href="https://gateway-api.sigs.k8s.io/">Gateway API</a> Ingress-ის მონოლითს ჰყოფს როლებზე ორიენტირებულ რესურსებად: <code>GatewayClass</code> (ინფრასტრუქტურის პროვაიდერი) → <code>Gateway</code> (ოპერაციების გუნდი: listener-ები, TLS) → <code>HTTPRoute</code> (აპლიკაციის გუნდები: მარშრუტიზაცია, ტრაფიკის წონები). შეწონილი <code>backendRefs</code> გაძლევს canary-ს (ეტაპობრივი გამოშვება) პირდაპირ edge-ზე — დაიმახსოვრე ეს მე-14 გაკვეთილისთვის. ახალი პლატფორმები Gateway-API-first არიან; არსებული ინფრასტრუქტურა ჯერ კიდევ Ingress-ზე მუშაობს. ინტერვიუსთვის მზადყოფნა = ორივეს ცოდნა.</p>
+
+<h3>3. TLS: cert-manager სერტიფიკატებს controller-ის ამოცანად აქცევს</h3>
+<p><a href="https://cert-manager.io/">cert-manager</a> აკვირდება <code>Certificate</code>/Issuer CRD-ებს და Secret-ებს ვალიდური სერტიფიკატებით ავსებულს ინახავს (პროდაქშენში Let's Encrypt ACME-ს გავლით, ლოკალურად — self-signed CA). Ingress მიუთითებს Secret-ზე; განახლება არავის pager-ს აღარ არეკინებს. იგივე reconciliation (შეჯერების) პატერნია, რაც K8s-ში ყველაფერ დანარჩენს აქვს — ეს არის ღრმა გაკვეთილი.</p>
+
+<h3>4. LLM-ტრაფიკი ამსხვრევს proxy-ის ნაგულისხმევ პარამეტრებს</h3>
+<p>ეს ცხრილი ამ გაკვეთილის ღირებულების ნახევარია — ეს არის ის, რასაც "AI infra გამოცდილება" ნიშნავს edge-ზე:</p>
+<table>
+<tr><th>ნაგულისხმევი</th><th>რას ამტვრევს</th><th>გამოსწორება (nginx-ingress annotations)</th></tr>
+<tr><td>60 წმ read timeout</td><td>გრძელი გენერაციები ნაკადის შუაში კვდება</td><td><code>proxy-read-timeout: "600"</code></td></tr>
+<tr><td>Response buffering ჩართული</td><td>SSE ტოკენები ბოლოში ერთ გროვად ჩამოდის — streaming ვიზუალურად მკვდარია</td><td><code>proxy-buffering: "off"</code></td></tr>
+<tr><td>1 MB body limit</td><td>გრძელკონტექსტიანი / მულტიმოდალური payload-ები 413-ით უარიყოფა</td><td><code>proxy-body-size: "10m"</code></td></tr>
+<tr><td>Round-robin LB</td><td>ეწინააღმდეგება შენს session-affinity router-ს</td><td>ტრაფიკი router-ის Service-ისკენ წარმართე და engine-ების დაბალანსება მას მიანდე</td></tr>
+<tr><td>Retries timeout-ზე</td><td>ძვირადღირებული გენერაციების დუბლირება</td><td>Idempotency keys / retry-ის გამორთვა POST-ისთვის</td></tr>
+</table>
+
+<h3>5. Edge არის იქ, სადაც ავთენტიფიკაცია ცხოვრობს</h3>
+<p>Engine-ები "ბრიყვები" რჩებიან; edge (ან AI gateway, მაგალითად LiteLLM router-ის წინ) ახორციელებს API keys-ს, per-tenant rate limit-ებსა და მოხმარების აღრიცხვას. vLLM-ის <code>--api-key</code> ბოლო ხაზია და არა პირველი — მე-13 გაკვეთილი მას შეაერთებს.</p>
+
+<h2>ლაბორატორია (labs/lab-12): hostname-ები და TLS შენს სტეკზე</h2>
+<div class="lab">
+<div class="step"><h3>დააინსტალირე ingress-nginx (kind ვარიანტი)</h3><p>გაძლიერებული კლასტერი 80/443 პორტებს ამისამართებს. გამოიყენე kind-სპეციფიკური მანიფესტი, დაელოდე controller-ს.</p></div>
+<div class="step"><h3>მარშრუტიზაცია hostname-ის მიხედვით</h3><p>Ingress LLM-ზე მორგებული annotation-ებით: <code>chat.llm.local</code> → open-webui, <code>api.llm.local</code> → vllm-router. ორივე host დაამატე <code>/etc/hosts</code>-ში → 127.0.0.1. ისაუბრე ბრაუზერში <code>http://chat.llm.local</code> მისამართზე — პორტის ნომრების გარეშე, როგორც ნამდვილ პროდუქტში.</p></div>
+<div class="step"><h3>cert-manager + self-signed CA</h3><p>დააინსტალირე cert-manager, შექმენი CA <code>ClusterIssuer</code>, დაამატე annotation Ingress-ს — TLS Secret-ები გაჩნდება. <code>curl -k https://api.llm.local/v1/models</code>, შემდეგ სერტიფიკატების ჯაჭვი შეამოწმე <code>openssl s_client</code>-ით.</p></div>
+<div class="step"><h3>დაამტკიცე streaming-ის გამოსწორება</h3><p>გაატარე გრძელი გენერაცია edge-ის გავლით buffering ჩართული vs გამორთული (გადართე annotation) — უყურე, როგორ გროვდება ტოკენები ერთად ან მიედინება ნაკადად. ეს 2-წუთიანი დემო არის მთელი "LLM edge" საბრძოლო ისტორია, უსაფრთხოდ საკუთარ თავზე მოწყობილი.</p></div>
+</div>
+
+<h2>შეამოწმე შენი თავი</h2>
+<div class="quiz" data-quiz>
+  <div class="q">
+    <p class="stem">მომხმარებლები ამბობენ: "პასუხი ბოლოში ერთბაშად ჩნდება". Edge-ის ეჭვმიტანილი #1?</p>
+    <button class="opt" data-correct>Proxy buffering, რომელიც SSE ნაკადს ყლაპავს</button>
+    <button class="opt">Engine-ის batching, რომელიც პირველ ტოკენს აყოვნებს</button>
+    <button class="opt">TLS handshake-ის overhead თითოეულ chunk-ზე</button>
+    <p class="explain">Buffering-ის მქონე proxy-ები პასუხს დასრულებამდე იკავებენ — streaming ბოლომდე მუშაობს, მაგრამ გატეხილს ჰგავს. Engine-ის დაყოვნება TTFT-ს გაზრდიდა და არა მთელ პასუხს ერთ გროვად აქცევდა.</p>
+  </div>
+  <div class="q">
+    <p class="stem">Gateway API Ingress-თან შედარებით — სტრუქტურული უპირატესობა?</p>
+    <button class="opt" data-correct>როლების გამიჯვნა და ტიპიზირებული routing-რესურსები</button>
+    <button class="opt">უფრო სწრაფი data plane, ვიდრე Ingress controller-ებს აქვთ</button>
+    <button class="opt">ჩაშენებული სერტიფიკატების გამოშვება cert-manager-ის გარეშე</button>
+    <p class="explain">Gateway/HTTPRoute ოპერაციების გუნდს აპლიკაციის გუნდებისგან მიჯნავს და წონებსა და match-ებს API-ის სრულფასოვან ნაწილად აქცევს — annotation-ების "წვნიანის" გარეშე. Data plane იგივე proxy-ებია; სერტიფიკატებს კვლავ issuer სჭირდება.</p>
+  </div>
+  <div class="q">
+    <p class="stem">სად უნდა ცხოვრობდეს per-tenant rate limiting?</p>
+    <button class="opt" data-correct>Edge-ზე ან gateway-ზე, engine-ებამდე</button>
+    <button class="opt">vLLM-ის შიგნით, engine-ის არგუმენტებით</button>
+    <button class="opt">კლიენტის SDK-ში, შეთანხმების საფუძველზე</button>
+    <p class="explain">იაფად უარყავი edge-ზე, სანამ მოთხოვნა ძვირადღირებულ prefill გამოთვლას მოიხმარს. Engine-ები tenant-ებს ვერ ხედავენ; კლიენტებს ვერ ენდობი.</p>
+  </div>
+</div>
+
+<h2>პირველწყარო</h2>
+<p><a href="https://kubernetes.github.io/ingress-nginx/user-guide/nginx-configuration/annotations/">ingress-nginx annotations reference</a> (გადაავლე თვალი, ჩაინიშნე) + <a href="https://gateway-api.sigs.k8s.io/concepts/api-overview/">Gateway API overview</a>.</p>
+
+<h2>შემდეგი</h2>
+<p><a href="0013-security-multitenancy.html">გაკვეთილი 13</a>: ჩაკეტე ყველაფერი — NetworkPolicy default-deny, RBAC აუდიტები, კვოტები და engine-ის ავთენტიფიკაცია.</p>
+
+<div class="lesson-footer"><p><a href="index.html">კურსის მთავარი გვერდი</a> · ლაბორატორია: <code>labs/lab-12/</code></p></div>
+</div>
+<script src="../../assets/quiz.js"></script>
+</body>
+</html>

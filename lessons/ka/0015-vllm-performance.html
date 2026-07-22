@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="ka">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>გაკვეთილი 15 — vLLM-ის წარმადობის ინჟინერია</title>
+<link rel="stylesheet" href="../../assets/course.css">
+</head>
+<body>
+<div class="page">
+<p class="lang-switch"><a href="../0015-vllm-performance.html">🇬🇧 English</a></p>
+
+<p class="lesson-kicker">SLM Production Stack · გაძლიერებული · გაკვეთილი 15 · ~2.5 სთ</p>
+<h1>vLLM-ის წარმადობის ინჟინერია</h1>
+<p class="lesson-lede">საბაზისო კურსი ძრავას კარგ „შავ ყუთად" განიხილავდა. სენიორებს იმაში უხდიან, რომ ის გახსნან: quantization (კვანტიზაცია), batching-ის სახელურები, chunked prefill, speculative decoding — და, უპირველეს ყოვლისა, დისციპლინირებული მეთოდი ტიუნინგისთვის, ფლაგების ქაოსური ცვლის ნაცვლად.</p>
+
+<h2>ცოდნა</h2>
+
+<h3>1. ძირეული პრინციპები: prefill გამოთვლებით შეზღუდულია, decode — გამტარუნარიანობით</h3>
+<p>Prefill (პრომპტის წინასწარი დამუშავება) მთელ პრომპტს პარალელურად ამუშავებს — FLOPs-ით შეზღუდული. Decode (ტოკენების გენერაცია) ყოველ ნაბიჯზე თითო ტოკენს აწარმოებს თითო მიმდევრობაზე და ყოველ ნაბიჯზე ხელახლა კითხულობს წონებს + KV cache-ს — მეხსიერების გამტარუნარიანობით შეზღუდული. ქვემოთ მოცემული ყველა ოპტიმიზაცია ან ერთ მხარეს ესხმის თავს, ან მათ ურთიერთხელშეშლას. თქვი რომელს — და სენიორად ჟღერ; გამოტოვე — და სახელურები ასტროლოგიაა.</p>
+
+<h3>2. Quantization-ის ტაქსონომია</h3>
+<table>
+<tr><th>ოჯახი</th><th>რა მცირდება</th><th>ეფექტი</th><th>შენიშვნები</th></tr>
+<tr><td><strong>FP8 (W8A8)</strong></td><td>წონები + აქტივაციები</td><td>~2× მეხსიერება, prefill-ის აჩქარება H100+-ზე</td><td>თითქმის უდანაკარგო; production-ის ნაგულისხმევი Hopper-ზე</td></tr>
+<tr><td><strong>AWQ / GPTQ (4-bit)</strong></td><td>მხოლოდ წონები</td><td>~4× წონების მეხსიერება, decode-ის აჩქარება (ნაკლებია წასაკითხი)</td><td>კალიბრაციაზე დაფუძნებული; მცირე ხარისხობრივი დანახარჯი; შესანიშნავია დიდი მოდელების ჩასატევად</td></tr>
+<tr><td><strong>KV cache FP8</strong> (<code>--kv-cache-dtype fp8</code>)</td><td>KV cache</td><td>~2× cache → ~2× batch/კონტექსტის ტევადობა</td><td>ტევადობის ბოთლყელს პირდაპირ ესხმის თავს</td></tr>
+<tr><td><strong>GGUF</strong></td><td>წონები (llama.cpp-ის სამყარო)</td><td>CPU-სთვის მოსახერხებელი ფორმატები</td><td>vLLM-ის მხარდაჭერა არსებობს; ყურადღება მიაქციე წყაროს ხარისხს</td></tr>
+</table>
+<p>გადაწყვეტილების ფორმა: მეხსიერება გაკლია → წონების quantization; batch/კონტექსტი გაკლია → KV quantization; Hopper GPU-ები → FP8 ნაგულისხმევად; და ყოველთვის ხელახლა გაუშვი შენივე ევალები — quantization-ით ხარისხის დანაკარგი დატვირთვის ტიპზეა დამოკიდებული. (<a href="https://docs.vllm.ai/en/latest/features/quantization/">docs</a>)</p>
+
+<h3>3. Batching-ის სახელურები</h3>
+<table>
+<tr><th>სახელური</th><th>რას მართავს</th><th>როდის გაზარდო</th></tr>
+<tr><td><code>--max-num-seqs</code></td><td>მაქს. მიმდევრობა თითო ნაბიჯზე</td><td>რიგი იზრდება, სანამ KV-ის გამოყენება დაბალია</td></tr>
+<tr><td><code>--max-num-batched-tokens</code></td><td>ტოკენების ბიუჯეტი თითო ნაბიჯზე</td><td>throughput-ზე ორიენტირებული დატვირთვები; შეამცირე TPOT-ის დასაცავად</td></tr>
+<tr><td><code>--gpu-memory-utilization</code></td><td>წინასწარ გამოყოფილი წილი (წონები+KV)</td><td>ნაგულისხმევი 0.9; დატოვე თავისუფალი ადგილი პიკებისთვის/სხვა pod-ებისთვის</td></tr>
+<tr><td><code>--max-model-len</code></td><td>უარესი შემთხვევის KV თითო მიმდევრობაზე</td><td>შეამცირე, რომ მეტი პარალელური მიმდევრობა დაუშვა</td></tr>
+</table>
+
+<h3>4. Chunked prefill: აღარ მისცე გრძელ პრომპტებს decode-ის დაშიმშილების საშუალება</h3>
+<p>გულუბრყვილო დაგეგმვა უზარმაზარ prefill-ს ერთ ნაბიჯად უშვებს — ყველა decode-ის ფაზაში მყოფი მომხმარებელი ჩერდება (TPOT-ის ნახტომი). <strong>Chunked prefill</strong> (ნაწილებად დაყოფილი prefill) პრომპტებს ბიუჯეტის ზომის ნაჭრებად ჭრის და ყოველ ნაბიჯზე decode-ის ტოკენებთან ერთად ურევს: ოდნავ ნელი prefill-ის დასრულება, სამაგიეროდ მკვეთრად უფრო გლუვი ITL. თანამედროვე vLLM-ში (V1) ნაგულისხმევად ჩართულია; სახელური ტოკენების ბიუჯეტია. ეს არის კანონიკური „throughput vs tail latency" ინტერვიუს კითხვა ერთ ფუნქციაში. (<a href="https://docs.vllm.ai/en/latest/configuration/optimization.html">optimization docs</a>)</p>
+
+<h3>5. Speculative decoding: დახარჯე FLOPs, რომ იყიდო latency</h3>
+<p>Decode პარალელურ აპარატურას ერთ ტოკენზე ფლანგავს ერთ ჯერზე. გამოსავალი: იაფი <em>drafter</em> (პატარა მოდელი, n-gram lookup, ან გაწვრთნილი head-ები: EAGLE/MTP) k ტოკენს სთავაზობს; დიდი მოდელი k-ვეს ერთ პარალელურ გავლაში ამოწმებს; მიღებული პრეფიქსი რჩება, არასწორი პროგნოზები იჭრება — greedy რეჟიმში გამოსავალი დამტკიცებადად იდენტურია. იგებს, როცა მიღების მაჩვენებელი მაღალია (კოდი, შაბლონური ტექსტი) და batch პატარაა (latency-კრიტიკული); აგებს გაჯერებისას (ვერიფიკაციის FLOPs batch-ის throughput-ს ეჯიბრება). (<a href="https://docs.vllm.ai/en/latest/features/spec_decode/">docs</a>)</p>
+
+<h3>6. მეთოდი (ეს არის ნამდვილი გაკვეთილი)</h3>
+<pre><code>1. Fix a workload (input/output lens, concurrency) — bench is meaningless otherwise
+2. Baseline: vllm bench serve → save JSON
+3. ONE knob per run. Re-bench. Log: knob, TTFT P50/P90, TPOT, tok/s, KV usage
+4. Accept/revert against YOUR SLO (not "bigger number")
+5. Write the tuning report — the artifact that outlives the cluster</code></pre>
+
+<h2>ლაბორატორია (labs/lab-15): ნამდვილი ტიუნინგის კვლევა CPU-ზე</h2>
+<p>CPU-ის ციფრები GPU-ისგან განსხვავდება; მეთოდი კი იდენტურია — სწორედ მას ვარჯიშობ.</p>
+<div class="lab">
+<div class="step"><h3>Baseline</h3><p>ერთი ძრავა, ფიქსირებული დატვირთვა (128 in / 64 out, rate 0.5): გაუშვი bench, შეინახე JSON, ჩაწერე ცხრილის სტრიქონი.</p></div>
+<div class="step"><h3>სახელური 1: max-num-seqs-ის გადარბენა</h3><p>4 → 8 → 16. დააკვირდი, როგორ უარესდება TPOT batch-ის ზრდასთან ერთად, სანამ tok/s იზრდება — ფუნდამენტური კომპრომისი, საკუთარი ხელით გაზომილი.</p></div>
+<div class="step"><h3>სახელური 2: prefix caching</h3><p><code>--enable-prefix-caching</code> + საზიარო პრეფიქსის დატვირთვა (ერთი და იგივე 400-ტოკენიანი system prompt, სხვადასხვა კითხვები). შეადარე TTFT-ის განაწილებები ჩართულით/გამორთულით. harness-ისთვის გამოიყენე <code>vllm-prefix-cache-bench</code> skill-ი.</p></div>
+<div class="step"><h3>სახელური 3: max-model-len როგორც ტევადობის ბერკეტი</h3><p>4096 → 2048 მაღალ კონკურენტულობასთან ერთად; დააკვირდი, როგორ უმჯობესდება დაშვება (მომლოდინე რიგი უფრო სწრაფად იცლება) კონტექსტის ჭერის ხარჯზე.</p></div>
+<div class="step"><h3>ანგარიში</h3><p><code>docs/tuning-report.md</code>: დატვირთვის სპეციფიკაცია, გაშვებების ცხრილი, ერთი დიაგრამა (თუნდაც ASCII), 3 დასკვნა და სექცია „რას ვცდიდი H100-ებზე" (FP8, kv fp8, spec decode — ნავარაუდევი ეფექტებით და დასაბუთებით). GPU-ის სექცია ამტკიცებს, რომ თეორია გადმოიტანე.</p></div>
+</div>
+
+<h2>შეამოწმე თავი</h2>
+<div class="quiz" data-quiz>
+  <div class="q">
+    <p class="stem">TPOT ნახტომებს აკეთებს ყოველთვის, როცა გრძელპრომპტიანი მოთხოვნა შემოდის. ყველაზე შესაფერისი ფუნქცია?</p>
+    <button class="opt" data-correct>Chunked prefill, რომელიც ნაჭრებს decode-ს ურევს</button>
+    <button class="opt">Speculative decoding n-gram drafter-ით</button>
+    <button class="opt">KV cache-ის quantization fp8-ზე</button>
+    <p class="explain">ნახტომი prefill-ის მიერ ნაბიჯების მონოპოლიზაციაა. Chunking ზღუდავს prefill-ს თითო ნაბიჯზე, ასე რომ decode-ის ტოკენები დინებას აგრძელებენ. Spec decode და KV quantization prefill-ის ხელშეშლას არ ეხება.</p>
+  </div>
+  <div class="q">
+    <p class="stem">70B მოდელი ეტევა, მაგრამ batch პაწაწინა რჩება; რიგი იზრდება. პირველი ბერკეტი?</p>
+    <button class="opt" data-correct>KV cache-ის quantization, batch-ის მეხსიერების გასათავისუფლებლად</button>
+    <button class="opt">წონების უფრო აგრესიული quantization, 2-bit-მდე</button>
+    <button class="opt">max-num-seqs-ის აწევა მეხსიერების ლიმიტის მიღმა</button>
+    <p class="explain">წონები ეტევა — შეზღუდვა KV მეხსიერებაა თითო მიმდევრობაზე. fp8 KV ≈ აორმაგებს პარალელურ ტევადობას. max-num-seqs-ის აწევა მეხსიერების გარეშე არაფერს ცვლის (დაშვება KV-ით არის შეზღუდული); 2-bit წონები ხარისხს ანადგურებს.</p>
+  </div>
+  <div class="q">
+    <p class="stem">Speculative decoding ყველაზე ნაკლებად ეხმარება, როცა…</p>
+    <button class="opt" data-correct>ძრავა უკვე გაჯერებულია დიდი batch-ებით</button>
+    <button class="opt">გამოსავალი განმეორებადი შაბლონური JSON-ია</button>
+    <button class="opt">ტრაფიკი მეჩხერი ერთმომხმარებლიანი ჩატია</button>
+    <p class="explain">გაჯერებისას ის „უქმად მდგარი პარალელური FLOPs", რომელსაც spec decode იყენებს, აღარ არსებობს — ვერიფიკაცია batch-ის throughput-ს ეჯიბრება. შაბლონური გამოსავალი (მაღალი მიღება) და მეჩხერი ტრაფიკი მისი საუკეთესო შემთხვევებია.</p>
+  </div>
+</div>
+
+<h2>პირველწყარო</h2>
+<p><a href="https://docs.vllm.ai/en/latest/configuration/optimization.html">vLLM optimization guide</a> + <a href="https://docs.vllm.ai/en/latest/features/quantization/">quantization docs</a>. სიღრმისეული საკითხავი: EAGLE-ის სტატია, თუ spec decode-მა დაგაინტერესა.</p>
+
+<h2>შემდეგი</h2>
+<p><a href="0016-distributed-inference.html">გაკვეთილი 16</a>: ერთი მანქანის მიღმა — tensor/pipeline parallelism, disaggregated prefill და KV offloading.</p>
+
+<div class="lesson-footer"><p><a href="index.html">კურსის მთავარი</a> · ლაბორატორია: <code>labs/lab-15/</code></p></div>
+</div>
+<script src="../../assets/quiz.js"></script>
+</body>
+</html>

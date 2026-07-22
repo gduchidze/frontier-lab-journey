@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="ka">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>გაკვეთილი 9 — დატვირთვის ტესტირება: მიიღე რიცხვები</title>
+<link rel="stylesheet" href="../../assets/course.css">
+</head>
+<body>
+<div class="page">
+<p class="lang-switch"><a href="../0009-load-testing.html">🇬🇧 English</a></p>
+
+<p class="lesson-kicker">SLM Production Stack · გაკვეთილი 9 · ფაზა 9 · ~90 წთ</p>
+<h1>დატვირთვის ტესტირება: მიიღე რიცხვები</h1>
+<p class="lesson-lede">„მუშაობს" — ეს დემოა. „უძლებს 0.9 req/s-ს P90 TTFT-ით 4 წამზე ნაკლები და სატურაციას აღწევს 6 პარალელურ მოთხოვნაზე" — ეს ინჟინერიაა. დღეს შენს სტეკს ინდუსტრიის საკუთარი ხელსაწყოებით გაზომავ და შედეგებს სწორად წაიკითხავ.</p>
+
+<h2>ცოდნა: LLM serving-ის ოთხი რიცხვი</h2>
+<table>
+<tr><th>მეტრიკა</th><th>განმარტება</th><th>ვისთვის არის მნიშვნელოვანი</th></tr>
+<tr><td><strong>TTFT</strong></td><td>Time To First Token (დრო პირველ ტოკენამდე) — მოთხოვნა გაიგზავნა → პირველი ტოკენი დაბრუნდა</td><td>მომხმარებლებისთვის (აღიქმება როგორც „რეაგირების სისწრაფე")</td></tr>
+<tr><td><strong>TPOT / ITL</strong></td><td>Time Per Output Token (ტოკენთაშორისი დაყოვნება) პირველი ტოკენის შემდეგ</td><td>მომხმარებლებისთვის (აღიქმება როგორც „ბეჭდვის სიჩქარე")</td></tr>
+<tr><td><strong>Throughput</strong></td><td>ტოკენი/წმ (ან მოთხოვნა/წმ) მთელი სისტემის მასშტაბით (გამტარუნარიანობა)</td><td>მისთვის, ვინც აპარატურაში იხდის</td></tr>
+<tr><td><strong>Goodput</strong></td><td>Throughput, <em>რომელიც აკმაყოფილებს latency SLO-ებს</em></td><td>საბოლოოდ — ყველასთვის</td></tr>
+</table>
+<p>ფუნდამენტური კომპრომისი: უფრო აგრესიული batching ზრდის throughput-ს, მაგრამ აუარესებს თითოეული მოთხოვნის latency-ს (დაყოვნებას). დატვირთვის ტესტის ამოცანაა იპოვოს ამ მრუდის <em>შენი</em> გადატეხის წერტილი — სატურაციის წერტილი.</p>
+<p>ყოველთვის მოახსენე <strong>პროცენტილები და არა საშუალო</strong>: P50 ტიპურ სურათს გვიჩვენებს, P99 — on-call ინჟინრის რეალობას. ერთი 60-წამიანი გამონაკლისი საშუალო მნიშვნელობაში სრულიად იკარგება.</p>
+
+<h2>ლაბორატორია: ორი ხელსაწყო, ერთი სატურაციის მრუდი</h2>
+
+<div class="lab">
+
+<div class="step">
+<h3>ხელსაწყო 1 — vllm bench serve (ოფიციალური ბენჩმარკი)</h3>
+<p>ის შენს image-შივე მოდის, ამიტომ გაუშვი კონტეინერად იმავე ქსელურ გზაზე. ტერმინალი 1: <code>kubectl port-forward -n llm svc/vllm-router 8080:80</code>. ტერმინალი 2:</p>
+<pre><code>docker run --rm --network host --entrypoint vllm vllm-cpu:local \
+  bench serve \
+  --backend openai-chat \
+  --base-url http://host.docker.internal:8080 \
+  --endpoint /v1/chat/completions \
+  --model Qwen/Qwen3.5-0.8B \
+  --dataset-name random \
+  --random-input-len 128 --random-output-len 64 \
+  --num-prompts 30 \
+  --request-rate 0.5 \
+  --save-result --result-dir /tmp</code></pre>
+<p class="expect">მოსალოდნელია (რამდენიმე წუთის შემდეგ): შემაჯამებელი ცხრილი — Request throughput, Output token throughput, Mean/Median/P99 TTFT, TPOT, ITL</p>
+<div class="note"><strong>როგორ წავიკითხოთ</strong>
+<code>--request-rate 0.5</code> = Poisson-ის განაწილებით შემომავალი მოთხოვნები 0.5 req/s სიხშირით (open-loop, რეალური ტრაფიკის მსგავსად). <code>inf</code> ყველაფერს ერთდროულად გაისროდა (closed-loop სტრეს-ტესტი). ამ workspace-ის <code>vllm-bench-serve</code> skill-ში ყველა flag-ია დოკუმენტირებული.</div>
+</div>
+
+<div class="step">
+<h3>იპოვე სატურაციის წერტილი</h3>
+<p>გაიმეორე ბენჩმარკი <code>--request-rate</code> მნიშვნელობებით 0.25 → 0.5 → 1 → 2. შედეგები ჩაწერე ცხრილში (მოათავსე <code>NOTES.md</code>-ში ან capstone-ის README-ში):</p>
+<pre><code>rate   req/s achieved   P50 TTFT   P90 TTFT   output tok/s
+0.25   ____             ____       ____       ____
+0.5    ____             ____       ____       ____
+1      ____             ____       ____       ____
+2      ____             ____       ____       ____</code></pre>
+<p class="expect">მოსალოდნელია: მიღწეული req/s გარკვეულ წერტილში აღარ მიჰყვება შეთავაზებულ სიხშირეს, ხოლო P90 TTFT მკვეთრად ავარდება — ეს გადატეხის წერტილი შენი რეალური სიმძლავრეა (capacity)</p>
+<p>Grafana ღია დატოვე: <code>num_requests_waiting</code>-ის ნულიდან აწევა და შემდგომი ზრდა სატურაციაა შიგნიდან დანახული — იგივე გადატეხის წერტილი, ორი ხედი.</p>
+</div>
+
+<div class="step">
+<h3>ხელსაწყო 2 — k6 (SRE-ს დატვირთვის ხელსაწყო)</h3>
+<p>ამას იყენებს doronmak-ის რეპოზიტორია (<code>load_tests/load_test.js</code>). სხვა კუთხე: მომხმარებლის სცენარების სკრიპტინგი, SLO ზღვრები (thresholds), pass/fail კარიბჭეები CI-სთვის.</p>
+<pre><code>brew install k6</code></pre>
+<p>შეინახე როგორც <code>load_tests/chat.js</code>:</p>
+<pre><code>import http from 'k6/http';
+import { check } from 'k6';
+
+export const options = {
+  stages: [
+    { duration: '1m', target: 4 },   // ramp to 4 virtual users
+    { duration: '2m', target: 4 },   // hold
+    { duration: '30s', target: 0 },  // drain
+  ],
+  thresholds: {
+    http_req_failed: ['rate&lt;0.01'],        // &lt;1% errors
+    http_req_duration: ['p(90)&lt;30000'],    // P90 end-to-end &lt; 30s (CPU-realistic)
+  },
+};
+
+export default function () {
+  const res = http.post(
+    'http://localhost:8080/v1/chat/completions',
+    JSON.stringify({
+      model: 'Qwen/Qwen3.5-0.8B',
+      messages: [{ role: 'user', content: 'Reply with one short sentence.' }],
+      max_tokens: 32,
+    }),
+    { headers: { 'Content-Type': 'application/json' }, timeout: '120s' },
+  );
+  check(res, { 'status 200': (r) =&gt; r.status === 200 });
+}</code></pre>
+<pre><code>k6 run load_tests/chat.js</code></pre>
+<p class="expect">მოსალოდნელია: VU/RPS-ის ცოცხალი ჩვენება; საბოლოო ანგარიშში ჩანს გავლილი check-ები, ზღვრები ✓ ან ✗ — ✗ პროცესს არანულოვანი კოდით ასრულებს, სწორედ ასე აკეთებს CI performance-ზე კარიბჭეს</p>
+</div>
+
+<div class="step">
+<h3>დააკვირდი მთელ სისტემას დატვირთვის ქვეშ</h3>
+<p>გაუშვი k6 ტესტი კიდევ ერთხელ, გვერდით გახსნილი Grafana-თი. დაადასტურე ამბავი თავიდან ბოლომდე: k6-ის VU-ები იზრდება → router-ის QPS იზრდება → engine-ის აქტიური მოთხოვნები პლატოზე გადის → მომლოდინეთა რიგი იზრდება → TTFT P90 ადის → k6-ის P90 ზღვარი თავის ლიმიტს უახლოვდება. ერთი დატვირთვა, ხუთი ინსტრუმენტი, ერთი თანმიმდევრული ნარატივი.</p>
+<div class="win"><strong>მოგება</strong>
+შენ გაქვს რეალური რიცხვები: სიმძლავრე (req/s გადატეხის წერტილში), latency (P50/P90 TTFT და TPOT) და ავტომატიზებული SLO კარიბჭე. ცხრილი და დატვირთვის ქვეშ გადაღებული Grafana-ს სქრინშოტი მოათავსე capstone-ის README-ში — გაზომვადი შედეგები არის ის, რაც პორტფოლიო-პროექტს დამაჯერებელს ხდის.</div>
+</div>
+
+</div>
+
+<h2>შეამოწმე შენი თავი</h2>
+<div class="quiz" data-quiz>
+  <div class="q">
+    <p class="stem">რატომ უნდა მოვახსენოთ P90 TTFT და არა საშუალო TTFT?</p>
+    <button class="opt" data-correct>ბოლო პროცენტილების latency ავლენს იმას, რასაც საშუალო მალავს</button>
+    <button class="opt">პროცენტილების ონლაინ გამოთვლა უფრო იაფია</button>
+    <button class="opt">საშუალო ყველა ნედლი ნიმუშის შენახვას მოითხოვს</button>
+    <p class="explain">მომხმარებლები სწორედ „კუდს" გრძნობენ; რამდენიმე ნელი მოთხოვნა საშუალოში ქრება. SLO-ები ზუსტად ამ მიზეზით პროცენტილებზეა განსაზღვრული.</p>
+  </div>
+  <div class="q">
+    <p class="stem">შეთავაზებული სიხშირე 2/s, მიღწეული 0.9/s, მომლოდინეთა რიგი იზრდება. სისტემა…</p>
+    <button class="opt" data-correct>სატურაციაშია: სიმძლავრეს გადაცდა, ჩამორჩენა გროვდება</button>
+    <button class="opt">თბება: ქეშები ჯერ არ არის შევსებული</button>
+    <button class="opt">Rate limit-შია: router ჭარბ მოთხოვნებს უარყოფს</button>
+    <p class="explain">მიღწეული &lt; შეთავაზებულზე მზარდი რიგით — ეს სატურაციის განმარტებაა. გათბობა მთავრდება; ეს — არა. აქ არაფერი უარყოფს მოთხოვნებს — ისინი უბრალოდ ელოდებიან.</p>
+  </div>
+  <div class="q">
+    <p class="stem">მაქსიმალური batch-ის ზომის გაზრდა, როგორც წესი, ცვლის…</p>
+    <button class="opt" data-correct>უკეთეს throughput-ს უფრო ცუდი თითო-მოთხოვნის latency-ის სანაცვლოდ</button>
+    <button class="opt">უკეთეს latency-ს უფრო ცუდი მეხსიერების უსაფრთხოების სანაცვლოდ</button>
+    <button class="opt">უკეთეს სიზუსტეს უფრო ცუდი ტოკენების throughput-ის სანაცვლოდ</button>
+    <p class="explain">უფრო დიდი batch-ები აპარატურას მეტად დაკავებულს ინახავს (throughput ↑), მაგრამ თითოეული მოთხოვნა გამოთვლით რესურსს მეტ მეზობელს უზიარებს (TPOT ↑). სიზუსტეს არაფერი ეხება.</p>
+  </div>
+</div>
+
+<h2>პირველწყარო</h2>
+<p><a href="https://docs.vllm.ai/en/latest/benchmarking/">vLLM-ის ბენჩმარკინგის დოკუმენტაცია</a> (bench serve-ის flag-ები, მეტრიკების განმარტებები) და <a href="https://grafana.com/docs/k6/latest/">k6-ის დოკუმენტაცია</a> (thresholds, stages). შენი k6 სკრიპტი შეადარე <a href="https://github.com/doronmak/VLLM-Kubernetes-Deployment/blob/main/load_tests/load_test.js">doronmak-ის load_test.js-ს</a>.</p>
+
+<h2>შემდეგი</h2>
+<p><a href="0010-autoscaling-capstone.html">გაკვეთილი 10</a>: ციკლის ჩაკეტვა — autoscaling ზუსტად იმ მეტრიკებზე, რომელთა კითხვაც ახლახან ისწავლე, შემდეგ კი capstone-ის ჩანაწერი.</p>
+
+<div class="lesson-footer">
+<p>წყაროები: <a href="../../reference/observability-cheatsheet.html">observability-ის cheat sheet</a> · workspace-ის skill-ები <code>vllm-bench-serve</code>, <code>vllm-bench-random-synthetic</code>.</p>
+<p>რიცხვები უცნაურად გამოიყურება? გაუზიარე ბენჩმარკის შედეგების ცხრილი შენს მასწავლებელს — მისი ერთად ინტერპრეტაცია თავად გაკვეთილია.</p>
+</div>
+
+</div>
+<script src="../../assets/quiz.js"></script>
+</body>
+</html>

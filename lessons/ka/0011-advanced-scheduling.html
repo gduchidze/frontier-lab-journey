@@ -1,0 +1,93 @@
+<!DOCTYPE html>
+<html lang="ka">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>გაკვეთილი 11 — გაძლიერებული Scheduling და GPU-ფლოტი</title>
+<link rel="stylesheet" href="../../assets/course.css">
+</head>
+<body>
+<div class="page">
+<p class="lang-switch"><a href="../0011-advanced-scheduling.html">🇬🇧 English</a></p>
+
+<p class="lesson-kicker">SLM Production Stack · გაძლიერებული · გაკვეთილი 11 · ~2 სთ</p>
+<h1>გაძლიერებული Scheduling და GPU-ფლოტი</h1>
+<p class="lesson-lede">გაძლიერებული ტრეკი იწყება. Production-ში ის, თუ სად დაეშვება Pod, ღირებულებისა და საიმედოობის გადაწყვეტილებაა — მით უმეტეს, როცა node-ებზე $30k-იანი GPU-ებია. დღეს: როგორ წყვეტს scheduler-ი (განმთავსებელი) სინამდვილეში, და ყველა ბერკეტი, რომელიც მას გადაფარავს. შენს Mac-ზე GPU-ფლოტის სიმულაციას გააკეთებ.</p>
+
+<div class="note"><strong>გაძლიერებული ტრეკის ძირითადი წესები</strong>
+წინაპირობა: გაკვეთილები 1–10 დასრულებულია. მხოლოდ-GPU მექანიკა პატიოსნად ისწავლება: თეორია + სიმულაცია + სიმძლავრის მათემატიკა აქ; კონცეფციები 1:1 გადადის იმ დღეს, როცა რეალურ A100-ებს შეეხები. ლაბორატორია 11 შენს კლასტერს გაძლიერებული კონფიგურაციით აწყობს თავიდან (3 node, Cilium CNI, ingress-პორტები) — საკუთარი chart-იდან თავიდან აწყობა თავად პირველი სავარჯიშოა.</div>
+
+<h2>ცოდნა</h2>
+
+<h3>1. Scheduler-ი ორფაზიანი კონვეიერია</h3>
+<p>ყოველი მომლოდინე pod-ისთვის: <strong>Filter</strong> (გამორიცხე node-ები, რომლებიც მას ვერ დაიტევენ: არასაკმარისი რესურსები, taint-ები, affinity-ის აცდენები, volume-ის ზონა) → <strong>Score</strong> (დაალაგე გადარჩენილები: least/most-allocated, გაფანტვა, image-ის ლოკალურობა) → მიბმა. ყველაფერი, რაც ქვემოთაა, შენ მიერ ამ ფაზებში შეზღუდვების ჩადებაა. (<a href="https://kubernetes.io/docs/concepts/scheduling-eviction/kube-scheduler/">დოკუმენტაცია</a>)</p>
+
+<h3>2. Taint-ები აშორებენ, toleration-ები უშვებენ, affinity იზიდავს</h3>
+<table>
+<tr><th>მექანიზმი</th><th>მიმართულება</th><th>გამოყენება GPU-ფლოტში</th></tr>
+<tr><td>Taint + toleration</td><td>Node ამბობს: „არ მომეკარო, თუ არ მოგიწვევია"</td><td><code>nvidia.com/gpu:NoSchedule</code> GPU-node-ებზე, რომ web-pod-ებმა ისინი არასოდეს დაიკავონ</td></tr>
+<tr><td>Node affinity</td><td>Pod ამბობს: „მჭირდება ამნაირი node-ები"</td><td>მიამაგრე <code>gpu-type=h100</code> pool-ებზე; შეძლებისდაგვარად ამჯობინე უფრო იაფი A10-ის pool-ები</td></tr>
+<tr><td>Pod anti-affinity</td><td>Pod ამბობს: „იმ pod-ების გვერდით არა"</td><td>გაფანტე replica-ები node-ებზე/ზონებზე ავარიის იზოლაციისთვის</td></tr>
+<tr><td>Topology spread</td><td>„თანაბარი განაწილება ტოპოლოგიის key-ის მიხედვით"</td><td>უფრო იაფი და მოქნილი მემკვიდრე anti-affinity-სა გაფანტვისთვის</td></tr>
+<tr><td>PriorityClass + preemption</td><td>„გამოასახლე ნაკლებმნიშვნელოვანი pod-ები, თუ ვერ ვეტევი"</td><td>Prod-ინფერენსი GPU-pool-ზე batch/ექსპერიმენტულ job-ებს გამოდევნის (preemption)</td></tr>
+</table>
+
+<h3>3. GPU-ები გაფართოებული რესურსებია, რომლებსაც device plugin-ები ემსახურებიან</h3>
+<p><code>nvidia.com/gpu: 1</code> K8s-ში ჩაშენებული არ არის — <strong>NVIDIA device plugin</strong> (DaemonSet) აღმოაჩენს GPU-ებს და აცხადებს მათ node-ის status-ზე; scheduler-ი შემდეგ მათ ისე ეპყრობა, როგორც ნებისმიერ თვლად რესურსს: მხოლოდ მთელი რიცხვები, overcommit-ის გარეშე, request = limit. წილადური გაზიარება ერთი დონით ქვემოთ არსებობს:</p>
+<table>
+<tr><th>გაზიარების ტექნოლოგია</th><th>რა არის</th><th>კომპრომისი</th></tr>
+<tr><td><strong>MIG</strong></td><td>A100/H100-ის აპარატურული დაყოფა იზოლირებულ ნაჭრებად (მაგ. <code>nvidia.com/mig-3g.20gb</code>)</td><td>ნამდვილი იზოლაცია; ფიქსირებული ნაჭრის ზომები</td></tr>
+<tr><td><strong>Time-slicing</strong></td><td>Device plugin ერთ ფიზიკურ GPU-ზე N ვირტუალურს აცხადებს</td><td>იზოლაცია არ არის — „ხმაურიანი მეზობლები"; dev-ისთვის ვარგისია</td></tr>
+<tr><td><strong>MPS</strong></td><td>CUDA-დონის პარალელური პროცესების გაზიარება</td><td>უკეთესი უტილიზაცია, საერთო ავარიის დომენი</td></tr>
+</table>
+<p><code>requestGPUType: "nvidia.com/mig-4g.71gb"</code> production-stack-ის values.yaml-ში უკვე გინახავს — ახლა იცი, რას ნიშნავს. (<a href="https://docs.nvidia.com/datacenter/cloud-native/gpu-operator/latest/index.html">GPU Operator-ის დოკუმენტაცია</a>)</p>
+
+<h3>4. Bin-pack თუ გაფანტვა? დოლარების კითხვა</h3>
+<p>Web-დატვირთვები იფანტება (მდგრადობისთვის). GPU-ინფერენსი, როგორც წესი, <strong>bin-pack-დება</strong> (მჭიდროდ ილაგება): ჯერ node 1 ბოლომდე შეავსე და მერე გააღვიძე node 2, რომ cluster autoscaler-მა / <a href="https://karpenter.sh/">Karpenter-მა</a> ცარიელი $30/სთ-იანი node-ები ნულამდე დაიყვანოს. არასწორი default = ხუთი node, თითო 20%-ით დაკავებული = 5-ჯერ დიდი გადასახადი. Senior-ის პასუხი: bin-pack-ი ფლოტებისთვის თითო pool-ში, anti-affinity — მხოლოდ იმ ავარიის დომენებზე, რომელთა დაცვაშიც რეალურად იხდი.</p>
+
+<h2>ლაბორატორია (labs/lab-11): ფლოტის სიმულაცია</h2>
+<p>სრული სამუშაო ფურცელი + verify: <code>labs/lab-11/</code>. მონახაზი:</p>
+<div class="lab">
+<div class="step"><h3>თავიდან აწყობა: გაძლიერებული კლასტერი</h3><p><code>kind delete cluster --name llm-stack</code> → შექმენი <code>k8s/kind-advanced.yaml</code>-იდან (1 control-plane + 2 worker, default CNI გამორთული, პორტები 80/443/30080) → დააყენე <a href="https://docs.cilium.io/">Cilium</a> CNI-ად → ხელახლა გაშალე მთელი შენი სტეკი chart-იდან. რეპროდუცირებადობის გამოცდა: რამდენ დროს გახარჯავს? ჩაინიშნე.</p></div>
+<div class="step"><h3>გააყალბე GPU-pool</h3><p>დაადე worker2-ს label + taint (<code>gpu=true:NoSchedule</code>), შემდეგ გამოაცხადე ყალბი გაფართოებული რესურსი <code>example.com/gpu: 2</code> node-ის status-ის PATCH-ით <code>kubectl proxy</code>-ის გავლით. Scheduler-ი მას ზუსტად ისე ეპყრობა, როგორც ნამდვილ GPU-ებს.</p></div>
+<div class="step"><h3>დაგეგმე მასზე</h3><p>გაშალე „gpu" pod-ები, რომლებიც ითხოვენ <code>example.com/gpu: 1</code>-ს toleration + affinity-ით → ორივე worker2-ზე დაეშვება → მესამე რჩება <code>Pending: Insufficient example.com/gpu</code>. ზუსტად ის ავარია, რომელსაც ყველა GPU-კლასტერში გაარჩევ.</p></div>
+<div class="step"><h3>Preemption</h3><p>PriorityClass-ები: <code>prod-inference</code> &gt; <code>batch-experiment</code>; შეავსე „GPU" node batch-pod-ებით; გაშალე prod-pod → უყურე გამოსახლებას Events-ში.</p></div>
+<div class="step"><h3>გაფანტე engine-ები</h3><p>დაამატე <code>topologySpreadConstraints</code> (ზონის key აქ = hostname) შენს vLLM chart-ის template-ს; 2 replica სხვადასხვა worker-ზე დაეშვება; გადაამოწმე <code>-o wide</code>-ით.</p></div>
+</div>
+
+<h2>შეამოწმე შენი თავი</h2>
+<div class="quiz" data-quiz>
+  <div class="q">
+    <p class="stem">GPU-pod-ები ითხოვენ nvidia.com/gpu-ს, მაგრამ Pending-ში სხედან node-ზე, რომელსაც თავისუფალი GPU-ები აქვს. კლასიკური მიზეზი?</p>
+    <button class="opt" data-correct>აკლიათ toleration GPU-ს taint-ისთვის</button>
+    <button class="opt">GPU-ს მეხსიერება წინა pod-ებმა დაფრაგმენტეს</button>
+    <button class="opt">Scheduler-ი გაფართოებული რესურსების მოთხოვნებს უგულებელყოფს</button>
+    <p class="explain">GPU-pool-ები თითქმის ყოველთვის taint-დადებულია; pod შესაბამისი toleration-ის გარეშე Score-ის ფაზამდე ვერ აღწევს — Filter-ი გამორიცხავს. გაფართოებული რესურსები ვერ ფრაგმენტირდება — ისინი მთელი რიცხვებია.</p>
+  </div>
+  <div class="q">
+    <p class="stem">რატომ ვამჯობინებთ GPU-ინფერენსისთვის bin-pack-ს გაფანტვას?</p>
+    <button class="opt" data-correct>ცარიელი node-ები ნულამდე მასშტაბირდება</button>
+    <button class="opt">ერთად განთავსებული pod-ები მოდელის წონების მეხსიერებას იზიარებენ</button>
+    <button class="opt">გაფანტვა tensor parallel-ის კომუნიკაციას აფუჭებს</button>
+    <p class="explain">მჭიდროდ დალაგებული = მთლიანად უქმე node-ები = autoscaler-ი მათ იბრუნებს = ფული. Pod-ები კონტეინერებს შორის წონებს არასოდეს იზიარებენ, TP კი ერთი pod-ის GPU-ების შიგნით ხდება.</p>
+  </div>
+  <div class="q">
+    <p class="stem">MIG თუ time-slicing ორი გადამხდელი tenant-ისთვის ერთ A100-ზე?</p>
+    <button class="opt" data-correct>MIG: აპარატურული იზოლაცია tenant-ებს შორის</button>
+    <button class="opt">Time-slicing: უფრო მაღალი ჯამური GPU throughput</button>
+    <button class="opt">ნებისმიერი: ორივე ეკვივალენტურ გარანტიებს იძლევა</button>
+    <p class="explain">Tenant-ებს იზოლაცია სჭირდებათ — MIG მეხსიერებას/SM-ებს აპარატურულად ყოფს. Time-slicing ყველაფერს აზიარებს: ერთი tenant-ის OOM ან პიკური დატვირთვა მეორეს ურტყამს.</p>
+  </div>
+</div>
+
+<h2>პირველწყარო</h2>
+<p><a href="https://kubernetes.io/docs/concepts/scheduling-eviction/">K8s-ის დოკუმენტაცია — Scheduling and Eviction</a> (მთელი სექცია — ეს senior-ის სილაბუსია) + <a href="https://docs.nvidia.com/datacenter/cloud-native/gpu-operator/latest/index.html">NVIDIA GPU Operator-ის მიმოხილვა</a>.</p>
+
+<h2>შემდეგი</h2>
+<p><a href="0012-production-edge.html">გაკვეთილი 12</a>: ზღვარი (edge) — Ingress, Gateway API, TLS და რატომ ამტვრევს LLM-ის სტრიმინგი default proxy-ებს.</p>
+
+<div class="lesson-footer"><p><a href="index.html">კურსის მთავარი გვერდი</a> · ლაბორატორია: <code>labs/lab-11/</code></p></div>
+</div>
+<script src="../../assets/quiz.js"></script>
+</body>
+</html>

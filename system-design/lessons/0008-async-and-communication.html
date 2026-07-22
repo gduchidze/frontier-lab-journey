@@ -1,0 +1,222 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lesson 8 · Queues, Backpressure, and Communication</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<div class="lesson">
+  <header class="lesson-header">
+    <p class="kicker">Lesson 0008 · Phase 1 — Distributed Systems Core</p>
+    <h1>Queues, Backpressure, and Communication</h1>
+    <p class="dek">Why every system hides a queue somewhere — and why the queue must be allowed to say no.</p>
+  </header>
+
+  <div class="mission-tie">
+    <strong>Mission tie.</strong> The reported Anthropic system-design prompt about batching has a nasty detail: <em>synchronous callers are waiting</em> while the batch fills. That makes the request queue the real protagonist — how deep may it grow, whom do you reject, and what do you tell them? Admission control is the heart of that question, and this lesson is admission control — taught on classic systems (checkouts, payments, feeds) because the physics is identical everywhere. (<a href="https://www.tryexponent.com/blog/anthropic-system-design-interview">Exponent's 2026 Anthropic guide</a>)
+  </div>
+
+  <h2>1 · Why async: the queue as shock absorber</h2>
+  <p>A synchronous call chains your fate to the callee: if the email service is slow, your checkout is slow. Putting a <strong>queue</strong> between producer and consumer <em>decouples</em> them — the producer returns immediately, the consumer drains at its own pace, and short bursts get absorbed instead of toppling the service. That is the entire pitch for asynchronism. (<a href="https://github.com/donnemartin/system-design-primer#asynchronism">Primer §14: asynchronism</a>)</p>
+  <p>The canonical example is an e-commerce order. The only thing that must happen <em>synchronously</em> when a customer clicks "buy" is recording the order and reserving payment. Everything else — confirmation email, invoice PDF, warehouse pick ticket, loyalty points, analytics, fraud re-scoring — goes onto a queue and happens seconds later. The user sees a 200 ms confirmation instead of waiting on six downstream systems, and a two-minute outage in the invoice generator loses nothing: the messages wait.</p>
+  <p>Now the dark side: <strong>a queue is a place where latency hides.</strong> Nothing errors, dashboards stay green, throughput looks fine — while every enqueued item quietly waits longer. Run the numbers on a flash sale: your order pipeline drains 500 orders/s; the sale spikes arrivals to 2,000/s for 60 seconds. The queue absorbs 90,000 excess orders — heroic! — but at 500/s it takes <em>another 180 seconds</em> to drain, so the last "instantly confirmed" customer gets their pick ticket 3+ minutes late. A queue buys you time to survive a burst; it does not create capacity. If arrivals exceed the drain rate <em>on average</em>, no queue is big enough — you have only chosen where the failure appears: in wait time instead of error rate.</p>
+
+  <h2>2 · The queueing zoo: message queues vs task queues</h2>
+  <p>Two families, one idea at different altitudes (<a href="https://github.com/donnemartin/system-design-primer#message-queues">Primer: message &amp; task queues</a>):</p>
+  <table>
+    <tr><th>System</th><th>Kind</th><th>Model</th><th>Typical use</th></tr>
+    <tr><td>Kafka</td><td>Message queue (log)</td><td>Append-only partitioned log; consumers track offsets; messages retained for days</td><td>Event streams, feed fan-out, analytics pipelines, replayable history</td></tr>
+    <tr><td>RabbitMQ</td><td>Message queue (broker)</td><td>Smart broker routes to queues; message deleted on ack</td><td>Work distribution, RPC-over-queue, per-message routing</td></tr>
+    <tr><td>SQS</td><td>Message queue (managed)</td><td>Hosted queue with visibility timeouts and redelivery</td><td>Decoupling AWS services without operating a broker</td></tr>
+    <tr><td>Celery / Sidekiq</td><td>Task queue</td><td>Wraps a broker to run <em>jobs</em>: workers, retries, schedules, results</td><td>"Resize this image", "send this email", cron-like background work</td></tr>
+  </table>
+  <p>The distinction that matters in interviews: a <strong>message queue</strong> moves and buffers <em>data</em> between services; a <strong>task queue</strong> is one level up — it manages the <em>execution</em> of background jobs (worker pools, retry policy, result storage) on top of a broker. Kafka's log model adds a second superpower: because messages are retained rather than deleted, new consumers can <em>replay</em> history — which is why it was born at LinkedIn to feed the same activity events to many independent systems.</p>
+  <p>Also know the failure mode of the whole category: an async pipeline turns "user sees an error" into "work silently piles up." You must monitor <strong>queue depth and consumer lag</strong> as first-class health metrics (section 6 explains why depth is the best early-warning signal you have).</p>
+
+  <h2>3 · Delivery semantics: pick your poison</h2>
+  <p>Whenever a broker (or any network) sits in the middle, delivery is a bet, and you must pick which way to lose:</p>
+  <table>
+    <tr><th>Semantic</th><th>Guarantee</th><th>Failure mode</th><th>Standard fix</th></tr>
+    <tr><td>At-most-once</td><td>Delivered 0 or 1 times</td><td>Messages silently lost</td><td>Accept it — only for tolerable loss (metrics, logs, presence pings)</td></tr>
+    <tr><td>At-least-once</td><td>Delivered 1+ times</td><td>Duplicates on retry/redelivery</td><td><strong>Idempotency keys</strong> — duplicates become no-ops</td></tr>
+    <tr><td>Exactly-once</td><td>Delivered exactly 1 time</td><td>Mostly a lie above the transport</td><td>At-least-once + idempotent consumer</td></tr>
+  </table>
+  <p>Why at-least-once is the default: the ambiguous case is unavoidable. A worker takes "charge the card $99", the charge succeeds, and the worker crashes <em>before acknowledging</em>. The broker cannot distinguish "processed but didn't ack" from "never processed", so it redelivers — and a naive consumer charges twice. The industry-standard fix is the <strong>idempotency key</strong>: the client attaches a unique key per <em>logical</em> operation, the server records processed keys, and a duplicate returns the stored result instead of re-executing. This is literally how the Stripe API makes payment retries safe. (<a href="https://stripe.com/blog/idempotency">Stripe: designing robust and predictable APIs with idempotency</a>)</p>
+  <p><strong>Exactly-once</strong> claims deserve suspicion. Kafka transactions genuinely provide it <em>within Kafka's own boundary</em> (consume-process-produce between topics). But the moment your consumer touches the outside world — a payment API, an email, a row in someone else's database — you are back to at-least-once plus idempotency. In an interview, the winning sentence is: <em>"I'll take at-least-once delivery and make the consumer idempotent with an idempotency key."</em></p>
+
+  <h2>4 · Backpressure: teach the system to say no</h2>
+  <p><strong>Backpressure</strong> is the discipline of pushing overload back toward the source instead of absorbing it into an unbounded queue. Without it, overload has two endings, both bad:</p>
+  <ul>
+    <li><strong>The unbounded queue ending.</strong> Depth grows until memory runs out (the worker OOMs and now you've lost the queue too) or until wait times exceed all client timeouts — at which point the server is burning 100% of its capacity completing requests <em>whose callers already gave up</em>. This zombie work is the signature of a queue-collapse outage: full utilization, zero goodput. (<a href="https://sre.google/sre-book/addressing-cascading-failures/">Google SRE book: addressing cascading failures</a>)</li>
+    <li><strong>The blocking ending.</strong> If instead the server blocks callers when busy, the queue doesn't vanish — it relocates into the callers' threads, filling <em>their</em> thread pools, and the overload climbs the call graph one tier at a time. That is a cascading failure in slow motion.</li>
+  </ul>
+  <p>The fix is a three-part contract:</p>
+  <ul>
+    <li><strong>Bound every queue.</strong> A bound converts "invisible latency growth" into an explicit, handleable event: the queue is full. Choosing the bound is a latency decision, not a memory decision — section 6 gives you the formula.</li>
+    <li><strong>Reject early and cheaply.</strong> When full, fail fast with <code>503 Service Unavailable</code> (service saturated) or <code>429 Too Many Requests</code> (this client over quota), plus a <code>Retry-After</code> header. A rejection in 1 ms is kinder than a success in 40 s: the caller can retry, use a fallback, or degrade gracefully — a checkout that says "try again in a few seconds" beats one that spins forever.</li>
+    <li><strong>Tell clients how to come back.</strong> Rejection without retry guidance just converts overload into an uncoordinated retry mob — which is section 5.</li>
+  </ul>
+
+  <h2>5 · Retries: the cure that causes the disease</h2>
+  <p>Retries are the standard response to transient failure, and they are also how systems commit suicide. Two mechanisms to know cold:</p>
+  <p><strong>The thundering herd.</strong> A service blips for 2 seconds and rejects 10,000 in-flight clients. If every client retries after exactly 1 s, the service — just recovering — is hit by a synchronized 10,000-request wave, falls over again, rejects again, and the wave repeats forever. The fix has two halves: <strong>exponential backoff</strong> (wait 1 s, 2 s, 4 s… so pressure decays) and — the half people forget — <strong>jitter</strong>. With <em>full jitter</em> each client sleeps a uniformly random time in [0, cap], which smears the wave flat. AWS's classic analysis showed backoff-with-full-jitter dramatically cuts both total calls and time-to-recovery versus backoff alone. (<a href="https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/">AWS: exponential backoff and jitter</a>)</p>
+  <p><strong>Retry amplification.</strong> Retries multiply <em>through layers</em>. If the mobile app retries 3×, the API gateway retries 3×, and the backend client library retries 3×, one user tap can become 3 × 3 × 3 = <strong>27 requests</strong> to the bottom service — precisely when it is least able to serve them. Google's rules from production: retry at <em>one</em> layer only, cap attempts (~3), and enforce a per-service <strong>retry budget</strong> — e.g., retries may add at most 10% extra load; beyond that, fail the request through to the user. (<a href="https://sre.google/sre-book/handling-overload/">Google SRE book: handling overload</a>)</p>
+  <p>The lab makes this visceral: the same overload that a jittered-backoff client population absorbs gracefully becomes a self-sustaining storm under naive immediate retries.</p>
+
+  <h2>6 · Little's law and the utilization hockey stick</h2>
+  <p>One formula governs every queue, from checkout pipelines to supermarket lines: <strong>L = λW</strong> — average items in the system equals arrival rate times average time in the system. It is distribution-free and shockingly useful in three directions:</p>
+  <ul>
+    <li><strong>Forecast the wait.</strong> Rearranged, <code>W = L/λ</code>. Your payment worker pool drains λ = 500 jobs/s and the queue shows L = 3,000 jobs: every newly enqueued job will wait ≈ 6 s. No percentile dashboard needed — <strong>current depth ÷ drain rate is next-minute latency.</strong> Depth is the <em>leading</em> indicator (latency percentiles report the past), which is why mature systems alert and autoscale on it.</li>
+    <li><strong>Size the bound.</strong> If your SLO tolerates at most 2 s of queueing and you drain 500/s, the queue bound is λW = 500 × 2 = 1,000. Deeper than that, and you are storing requests you have already decided to serve too late — reject them instead.</li>
+    <li><strong>Size the pool.</strong> Need to hold W = 200 ms of processing at λ = 500/s with single-threaded workers averaging 50 ms/job? L = λ × 0.05 = 25 jobs in service → ~25 workers minimum, before headroom.</li>
+  </ul>
+  <p>And headroom matters brutally, because waiting explodes near saturation. For a single-server queue with random arrivals (M/M/1), mean queueing delay scales like <code>ρ/(1−ρ)</code> times the service time, where ρ is utilization:</p>
+  <table>
+    <tr><th>Utilization ρ</th><th class="num">Queue wait (× service time)</th></tr>
+    <tr><td>50%</td><td class="num">1×</td></tr>
+    <tr><td>80%</td><td class="num">4×</td></tr>
+    <tr><td>90%</td><td class="num">9×</td></tr>
+    <tr><td>95%</td><td class="num">19×</td></tr>
+    <tr><td>99%</td><td class="num">99×</td></tr>
+  </table>
+  <p>Nearly flat until ~70–80%, then a <strong>hockey stick</strong>: going from 90% to 95% utilization <em>doubles</em> the wait. This is lesson 0001's saturation cliff, now with a mechanism — the queue in front of the busy resource is where the cliff lives. Practical rules: plan capacity so hot paths sit below ~70–80% utilization, treat "we're at 95% and fine" as a lit fuse, and treat rising depth as the fire alarm.</p>
+
+  <h2>7 · Load shedding: choosing whom to fail</h2>
+  <p>When overload arrives anyway, rejecting <em>uniformly</em> is leaving money on the table — traffic is not equally valuable. <strong>Load shedding</strong> is dropping the cheapest-to-lose work first, by explicit priority:</p>
+  <ul>
+    <li><strong>Criticality tiers.</strong> An e-commerce site under stress sheds recommendation widgets and "customers also bought" before search, and search before checkout and payment. Netflix formalized this as request taxonomies (user-initiated vs prefetch vs telemetry) and sheds low-criticality traffic first, keeping play-button presses alive through regional incidents. (<a href="https://netflixtechblog.com/keeping-netflix-reliable-using-prioritized-load-shedding-6cc827b02f94">Netflix: prioritized load shedding</a>)</li>
+    <li><strong>Batch behind interactive.</strong> Background reprocessing, report generation, and bulk imports should yield instantly to human-facing requests — they have hours of deadline slack; a browsing user has ~1 s of patience.</li>
+    <li><strong>Graceful degradation.</strong> Shedding a <em>feature</em> beats shedding a <em>user</em>: serve the cached-but-stale product page, skip the personalization pass, show the feed without ranking. Partial answers keep revenue flowing while full answers are unaffordable.</li>
+  </ul>
+  <p>The design smell to avoid: priorities discovered <em>during</em> the incident. The tier of every endpoint — and what gets shed first — should be written down before the traffic arrives (your project step below does exactly this).</p>
+
+  <h2>8 · Communication: the protocol choices behind all of it</h2>
+  <p><strong>TCP vs UDP.</strong> TCP gives ordered, reliable, congestion-controlled, retransmitted bytes — at the cost of <em>waiting</em> for late packets (one lost packet stalls everything behind it until retransmission). UDP just sends datagrams. The decision rule: choose UDP when <strong>late data is worse than lost data</strong> — live video and voice calls, multiplayer game state, high-volume telemetry. A video frame from 2 seconds ago is garbage; skip it and render the next one. Choose TCP when every byte matters and order matters: APIs, storage replication, payments. (<a href="https://github.com/donnemartin/system-design-primer#communication">Primer §15: communication</a>)</p>
+  <p><strong>REST vs gRPC.</strong> Two defaults for two audiences:</p>
+  <table>
+    <tr><th></th><th>REST (HTTP + JSON)</th><th>gRPC (HTTP/2 + protobuf)</th></tr>
+    <tr><td>Best for</td><td>Public APIs, loose coupling</td><td>Internal service-to-service traffic</td></tr>
+    <tr><td>Contract</td><td>Convention + OpenAPI (optional)</td><td>Enforced .proto schema, generated clients</td></tr>
+    <tr><td>Payload</td><td>Human-readable text, larger</td><td>Compact binary, faster to parse</td></tr>
+    <tr><td>Streaming</td><td>Bolted on (SSE, WebSockets)</td><td>First-class: client, server, bidirectional</td></tr>
+    <tr><td>Debugging</td><td>curl and eyeballs</td><td>Needs tooling (grpcurl, reflection)</td></tr>
+    <tr><td>Coupling</td><td>Loose — clients evolve freely</td><td>Tighter — schema shared, versioned carefully</td></tr>
+  </table>
+  <p>The standard production answer: REST at the public edge (partners and browsers need loose coupling and debuggability), gRPC inside the datacenter (you own both ends, so take the performance, type safety, and streaming).</p>
+  <p><strong>Idempotency is a design property, not an afterthought.</strong> Look back at this lesson: brokers redeliver (§3), clients back off and retry (§5), gateways retry, TCP retransmits. A distributed system is a machine for generating duplicates, so every state-changing operation must be designed to survive being applied twice. HTTP encodes this in its verbs — <code>GET</code>, <code>PUT</code>, <code>DELETE</code> are defined as idempotent; <code>POST</code> is not, which is exactly why payment APIs layer idempotency keys onto POST. Bolting idempotency on later means auditing every write path in the company; designing it in means one key column and one uniqueness check.</p>
+
+  <h2>9 · One paragraph of AI flavor</h2>
+  <p>Everything above transfers verbatim to serving models: an inference gateway is a bounded admission queue in front of expensive workers — <code>429/503</code> with <code>Retry-After</code> on overload, interactive requests prioritized over batch jobs, and autoscaling driven by queue depth because (per §6) depth is the earliest overload signal available. When Phase 4 builds this gateway for real, it will be this lesson wearing a GPU costume; nothing new will need to be invented.</p>
+
+  <h2>10 · Interview talking points</h2>
+  <p>How to <em>deploy</em> this lesson in a live design round:</p>
+  <ul>
+    <li><strong>Introduce a queue with both halves of the trade.</strong> "I'll decouple X from Y with a queue to absorb bursts — and I'll bound it, because a queue is where latency hides." Naming the downside unprompted is a strong senior signal.</li>
+    <li><strong>Volunteer delivery semantics.</strong> The moment a broker appears, say: "At-least-once delivery, consumers idempotent via idempotency keys. I won't claim exactly-once across external side effects." That single sentence closes off an entire class of follow-up traps.</li>
+    <li><strong>State the admission policy as numbers.</strong> "Queue bound = drain rate × queueing budget from the SLO (Little's law); when full, 503 + Retry-After; clients retry with exponential backoff and full jitter, capped at 3 attempts." Concrete beats hand-wavy "we'd add rate limiting."</li>
+    <li><strong>Use depth as your observability answer.</strong> When asked "how do you know it's healthy?", lead with queue depth / consumer lag as the leading indicator, then latency percentiles as the lagging one.</li>
+    <li><strong>Pre-declare shed order.</strong> "Under overload we shed in this order: telemetry, recommendations, search, never checkout." Shows you've thought about failure before being asked.</li>
+    <li><strong>Justify protocol picks in one clause each.</strong> "REST at the edge for loose coupling; gRPC internally for streaming and typed contracts; UDP only where late is worse than lost."</li>
+    <li><strong>Beware the utilization trap.</strong> If the interviewer offers "the service runs at 95% utilization, isn't that efficient?", the answer is the hockey stick: at 95%, waits are ~19× service time and one small burst tips you over; healthy hot paths run at 60–80%.</li>
+  </ul>
+
+  <h2>11 · Lab — watch a queue run away, then bound it</h2>
+  <div class="callout"><span class="label">Hands-on (do this before the quiz)</span>
+    Everything above is measurable in <code>labs/lab-0008-backpressure/</code>:
+    <code>python3 backpressure_lab.py</code> runs three experiments — the utilization–latency
+    hockey stick with an <em>unbounded</em> queue (watch depth run away past 100% load), the same
+    sweep with a <em>bounded</em> queue + 503s (latency flat, rejections absorb the overload), and
+    naive retries vs exponential backoff + full jitter (retry storm vs graceful recovery).
+    Then do exercises E1–E4 in the lab README: <em>predict, edit CONFIG, re-run, compare.</em>
+  </div>
+
+  <h2>12 · Project step</h2>
+  <p>Give the spine project — the <strong>LLM inference gateway</strong> — its <strong>admission policy</strong>: one short document, four decisions. (1) The <strong>queue bound</strong>, derived via Little's law from your lesson-0001 SLO: if TTFT p99 &lt; 1 s at λ = 1,000 RPS and you budget ~0.5 s of that for queueing, the depth cap is L = λW = 1,000 × 0.5 = 500. (2) The <strong>rejection code</strong>: <code>429</code> when one client exceeds its quota, <code>503</code> when the service itself is saturated. (3) <strong>Retry guidance</strong> in the response: <code>Retry-After</code> header plus "exponential backoff with jitter, max 3 attempts" in the error body. (4) <strong>Priority tiers</strong>: which traffic classes exist (interactive, batch), the admission order, and which tier is shed first. Bring it to the next session for critique — defending the numbers matters more than the numbers.</p>
+
+  <h2>Check yourself</h2>
+  <div class="quiz" id="quiz"></div>
+
+  <h2>Primary source</h2>
+  <p>Read the <strong>System Design Primer, sections 14–15</strong>: <a href="https://github.com/donnemartin/system-design-primer#asynchronism">asynchronism</a> (message queues, task queues, backpressure) and <a href="https://github.com/donnemartin/system-design-primer#communication">communication</a> (TCP/UDP, REST/RPC). Then the three production classics cited above: AWS's <a href="https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/">Exponential Backoff and Jitter</a>, the Google SRE book's <a href="https://sre.google/sre-book/handling-overload/">Handling Overload</a> and <a href="https://sre.google/sre-book/addressing-cascading-failures/">Addressing Cascading Failures</a>, and Stripe's <a href="https://stripe.com/blog/idempotency">idempotency</a> post.</p>
+
+  <footer class="lesson-footer">
+    <p><strong>Stuck or curious?</strong> Ask your teacher (the agent) anything — "why does queue depth predict latency better than latency predicts latency?" is an excellent follow-up question.</p>
+    <nav class="lesson-nav">
+      <span>◀ <a href="0007-caching-deep.html">0007 · Caching Deep Dive</a></span>
+      <span>Next: <a href="0009-interview-os.html">0009 · The Interview OS</a> ▶</span>
+    </nav>
+  </footer>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+renderQuiz(document.getElementById('quiz'), {
+  title: 'Check yourself',
+  questions: [
+    {
+      q: 'Your async pipeline shows zero errors and steady throughput, yet users complain results arrive minutes late. What does "a queue is a place where latency hides" mean here?',
+      options: [
+        'The queue drops requests silently during sustained overload',
+        'The queue converts overload into invisible growing waits',
+        'The queue duplicates requests whenever a consumer crashes',
+      ],
+      answer: 1,
+      explain: 'An unbounded queue absorbs excess arrivals without any error signal — the cost appears as ever-growing wait time. Dashboards tracking errors and throughput stay green while W = L/λ climbs.',
+    },
+    {
+      q: 'Your broker guarantees at-least-once delivery, so a "charge the card" message may arrive twice. What is the standard fix?',
+      options: [
+        'Switch every broker to exactly-once transport delivery',
+        'Retry faster so duplicates overwrite each other',
+        'Attach idempotency keys so duplicates become no-ops',
+      ],
+      answer: 2,
+      explain: 'The consumer records each processed idempotency key and ignores repeats, so redelivery charges once. "Exactly-once" holds only within one system\'s boundary — end-to-end, idempotency is your job. This is how Stripe makes payment retries safe.',
+    },
+    {
+      q: 'A bounded request queue in front of your service is full. What should the service do with the next arrival?',
+      options: [
+        'Reject early with 503 plus Retry-After',
+        'Grow the queue to hold everything',
+        'Block callers until queue space appears',
+      ],
+      answer: 0,
+      explain: 'Failing fast pushes the overload back to clients, who can back off or degrade. Growing the queue hides latency; blocking just relocates the queue into the callers\' thread pools — a cascading failure in slow motion.',
+    },
+    {
+      q: 'Why must exponential backoff include jitter?',
+      options: [
+        'It makes each individual retry finish faster',
+        'It spreads synchronized retry waves over time',
+        'It reduces the total number of retries',
+      ],
+      answer: 1,
+      explain: 'Without jitter, all clients rejected at the same moment retry at the same moment — a thundering herd that re-creates the overload. Randomizing the delay smears the wave flat, which is why AWS recommends backoff with full jitter.',
+    },
+    {
+      q: 'A service receives a steady λ = 100 requests/second and each request spends W = 0.2 s in the system on average. By Little\'s law, how many requests are inside the system?',
+      options: [
+        'About 200 requests inside the system',
+        'About 2 requests inside the system',
+        'About 20 requests inside the system',
+      ],
+      answer: 2,
+      explain: 'L = λW = 100 × 0.2 = 20. Run it backwards for the leading indicator: observed depth ÷ drain rate forecasts the wait a newly arriving request will suffer.',
+    },
+    {
+      q: 'For which workload is UDP a better fit than TCP?',
+      options: [
+        'Live audio where late packets are useless',
+        'Bank transfers where every byte must arrive',
+        'File downloads where ordering guarantees really matter',
+      ],
+      answer: 0,
+      explain: 'TCP retransmits and reorders, which means waiting for late data. For live media, a late packet is worthless — better to lose it and play the next one. When late is worse than lost, choose UDP.',
+    },
+  ],
+});
+</script>
+</body>
+</html>

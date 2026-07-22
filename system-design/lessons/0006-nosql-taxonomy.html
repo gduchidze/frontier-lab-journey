@@ -1,0 +1,208 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lesson 6 · NoSQL Taxonomy &amp; Consistent Hashing</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<div class="lesson">
+  <header class="lesson-header">
+    <p class="kicker">Lesson 0006 · Phase 1 — Distributed Systems Core</p>
+    <h1>NoSQL Taxonomy &amp; Consistent Hashing</h1>
+    <p class="dek">Four data-store families, one decision table, and the hashing trick that makes distributed KV stores possible at all.</p>
+  </header>
+
+  <div class="mission-tie">
+    <strong>Mission tie.</strong> A reported Anthropic warm-up prompt is <em>"design a distributed key-value store."</em> The very first fork in that answer is: which family of store is this, and how do keys find their node? If you say <code>hash(key) % N</code>, the follow-up question — "now add a node" — sinks you. This lesson gives you the taxonomy, the decision framework, and the ring. (<a href="https://www.tryexponent.com/blog/anthropic-system-design-interview">Exponent's 2026 Anthropic guide</a>)
+  </div>
+
+  <h2>1 · ACID vs BASE: two contracts, not good vs bad</h2>
+  <p>Relational databases sell <strong>ACID</strong>: a transaction is <em>Atomic</em> (all-or-nothing), <em>Consistent</em> (invariants hold — a transfer never leaves money in zero or two accounts), <em>Isolated</em> (concurrent transactions don't see each other's half-done work), <em>Durable</em> (committed means survived a crash). NoSQL systems typically relax that to <strong>BASE</strong>: <em>Basically Available</em> (the system answers even during partial failure), <em>Soft state</em> (replicas may briefly disagree), <em>Eventually consistent</em> (if writes stop, replicas converge to the same value). (<a href="https://github.com/donnemartin/system-design-primer#nosql">Primer §12: NoSQL</a>)</p>
+  <p>BASE is not "no guarantees" — it is a <em>different contract</em>. You give up read-your-writes certainty on every replica and buy availability plus horizontal scale. The classic illustration is Amazon's shopping cart: it is built on a BASE store (Dynamo) because an unavailable cart loses a sale <em>right now</em>, while a cart that briefly shows a stale item merely annoys — and add/remove operations can be merged when replicas reconcile. Payments at the same company run ACID, because "eventually the charge appears" is not a contract anyone signs. (<a href="https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf">Dynamo paper, SOSP 2007</a>)</p>
+  <p>The interview skill is naming <strong>which anomalies your application tolerates</strong> — stale reads? lost update? out-of-order timeline entries? — not reciting acronyms. DDIA's framing: "eventual consistency" is a very weak promise; always ask <em>how</em> eventual and <em>what happens meanwhile</em>. (<a href="https://www.oreilly.com/library/view/designing-data-intensive-applications/9781098119058/">DDIA</a>)</p>
+
+  <h2>2 · The four NoSQL families</h2>
+  <p>Every "NoSQL" product is one of four shapes. Learn one canonical system and one killer use case per family — that is what interviewers listen for.</p>
+  <table>
+    <tr><th>Family</th><th>Canonical system</th><th>Killer use case</th><th>Why it wins there</th></tr>
+    <tr><td><strong>Key-value</strong></td><td>Redis</td><td>Cache &amp; session store</td><td>O(1) get/put by key, sub-millisecond, no query planner in the way</td></tr>
+    <tr><td><strong>Document</strong></td><td>MongoDB / DynamoDB</td><td>Flexible entities (user profiles, product catalogs)</td><td>Whole aggregate in one document; schema evolves per document, no migrations</td></tr>
+    <tr><td><strong>Wide-column</strong></td><td>Cassandra / Bigtable</td><td>Write-heavy time series at scale (metrics, IoT, messages)</td><td>Append-friendly LSM storage; partition key spreads writes, clustering key sorts within</td></tr>
+    <tr><td><strong>Graph</strong></td><td>Neo4j</td><td>Many-to-many traversals (social graphs, fraud rings)</td><td>"Friends of friends of friends" is a walk, not N self-joins</td></tr>
+  </table>
+  <p><strong>Key-value</strong> is the simplest possible API — <code>get(k)</code>, <code>put(k, v)</code>, <code>delete(k)</code> — and that austerity is the point: nothing between you and the hash table means microsecond-to-millisecond latencies. Twitter caches timelines in Redis; virtually every large web property keeps sessions in Redis or Memcached rather than paying a SQL round trip on every authenticated request. The value is opaque to the store: no secondary indexes, no queries by value. (<a href="https://github.com/donnemartin/system-design-primer#key-value-store">Primer: key-value store</a>)</p>
+  <p><strong>Document</strong> stores keep the KV access pattern but make the value a structured document (JSON/BSON) you can index and query into. The unit of design is the <em>aggregate</em>: an e-commerce order with its line items, shipping address, and payment status lives in one document, so the common read ("show order 12345") is one fetch with no joins. The cost: cross-document queries and multi-document transactions are weak or bolted on — if you constantly join, you chose wrong. (<a href="https://github.com/donnemartin/system-design-primer#document-store">Primer: document store</a>)</p>
+  <p><strong>Wide-column</strong> stores (Bigtable lineage) are physically sorted maps: a <em>partition key</em> routes a row to a node, a <em>clustering key</em> sorts rows within the partition. Writes append to an LSM tree — sequential I/O — which is why Cassandra swallows write-heavy firehoses that would melt a B-tree: Discord stores trillions of messages keyed by <code>(channel_id, bucket)</code> with messages clustered by time; Netflix pushes viewing history through Cassandra; Google built Bigtable for crawl and indexing data. The catch: you must know your query patterns up front, because the primary key <em>is</em> the query plan. (<a href="https://github.com/donnemartin/system-design-primer#wide-column-store">Primer: wide-column store</a>, <a href="https://discord.com/blog/how-discord-stores-trillions-of-messages">Discord engineering</a>)</p>
+  <p><strong>Graph</strong> databases store nodes and edges as first-class citizens with direct pointers, so traversal cost is proportional to the subgraph you touch, not to the total table size. Fraud detection is the killer demo: "does this new account share a device, card, or address with any known-fraud account within 3 hops?" is milliseconds in Neo4j and a self-join catastrophe in SQL. Use only when relationship traversal <em>is</em> the workload — for everything else a graph DB is an exotic liability. (<a href="https://github.com/donnemartin/system-design-primer#graph-database">Primer: graph database</a>)</p>
+
+  <h2>3 · SQL vs NoSQL: the decision table</h2>
+  <p>Default answer: <strong>start SQL, leave when a specific pressure forces you</strong> — and name the pressure out loud. Postgres with read replicas (lesson 0005) carries you astonishingly far: it gives you ACID, ad-hoc queries, decades of tooling, and one system to operate. NoSQL is a targeted response to a named pressure, not a lifestyle. (<a href="https://github.com/donnemartin/system-design-primer#sql-or-nosql">Primer: SQL or NoSQL</a>)</p>
+  <table>
+    <tr><th>Pressure</th><th>Stay SQL when…</th><th>Move when…</th><th>…to</th></tr>
+    <tr><td>Structure</td><td>data is relational, normalized</td><td>each entity is a self-contained blob</td><td>Document</td></tr>
+    <tr><td>Joins</td><td>ad-hoc joins across tables matter</td><td>access is always by primary key</td><td>Key-value / Document</td></tr>
+    <tr><td>Transactions</td><td>multi-row ACID is required (money!)</td><td>single-key atomicity is enough</td><td>KV / Wide-column</td></tr>
+    <tr><td>Scale</td><td>one big box + replicas suffices</td><td>writes must shard across many nodes</td><td>Wide-column / Dynamo-style KV</td></tr>
+    <tr><td>Schema velocity</td><td>schema is stable, shared by teams</td><td>fields change weekly per feature</td><td>Document</td></tr>
+  </table>
+  <p>Two traps to call out in an interview. First, <em>read scale is not a reason to leave SQL</em> — replicas and caches solve reads; it is <strong>write</strong> scale that forces sharding. Second, polyglot persistence is normal: a real e-commerce platform keeps orders and payments in Postgres, sessions and carts in Redis, the product catalog in a document store, clickstream events in Cassandra, and a fraud graph in Neo4j. Each store earned its place through a named pressure.</p>
+
+  <h2>4 · Worked example: splitting an e-commerce monolith</h2>
+  <p>Concrete numbers make this real. Say your marketplace has grown to <strong>50M users, 2M orders/day, 500M clickstream events/day</strong>, all in one Postgres:</p>
+  <ul>
+    <li><strong>Sessions</strong>: 50M users × ~1 auth check per page view. At 20k page views/sec, that is 20k point reads/sec of a 200-byte blob — pure key lookup, zero joins. Pressure: latency and connection pressure on Postgres. Move to <strong>Redis</strong>: sub-ms, and the SQL box breathes again.</li>
+    <li><strong>Clickstream</strong>: 500M events/day ≈ 5,800 writes/sec sustained, 3–5× at peak, append-only, queried by <code>(user, time-range)</code>. Pressure: write throughput and table bloat. Move to <strong>Cassandra</strong>, partition key <code>user_id</code>, clustering key <code>event_time</code>.</li>
+    <li><strong>Product catalog</strong>: 10M products, each category with different attributes (shoes have sizes, laptops have RAM). Pressure: schema velocity — a new attribute per merchant onboarding. Move to a <strong>document store</strong>, one product per document.</li>
+    <li><strong>Orders &amp; payments</strong>: 2M orders/day ≈ 23 writes/sec. No scale pressure at all — and they need multi-row ACID (order + inventory decrement + payment record, atomically). <strong>Stay in Postgres.</strong></li>
+  </ul>
+  <p>Notice the shape of the reasoning: throughput estimate → named pressure → family. The order table staying put is as important an answer as anything that moved.</p>
+
+  <h2>5 · The routing problem: why hash(key) % N fails</h2>
+  <p>The moment you shard a KV store (or a cache tier) across machines, every key needs an owner, and every client must compute the same owner. The naive rule <code>node = hash(key) % N</code> is correct, fast, coordination-free — and catastrophic the day N changes. Going from 5 nodes to 6, a key keeps its owner only if <code>hash % 5 == hash % 6</code>, which holds for roughly 1 key in 6. <strong>About 83% of all keys change owner because you added one machine.</strong> Going 5 → 4 is just as bad: ~80% move. (<a href="https://www.oreilly.com/library/view/designing-data-intensive-applications/9781098119058/">DDIA ch. 6, partitioning</a>)</p>
+  <p>Work the blast radius for a cache tier: 100M sessions cached at a 95% hit rate, backing database serving the 5% of misses. Add a sixth cache node under mod-N: 83% of keys now hash to a node that doesn't have them, so the hit rate collapses toward ~17% until the cache re-warms. Misses jump from 5% to ~83% of traffic — a <strong>~17× read surge</strong> hits the database with zero warning. That is a self-inflicted outage caused by <em>adding capacity</em>. For a storage tier it's worse still: rebalancing physically moves data, and mod-N moves nearly the whole dataset across the network.</p>
+
+  <h2>6 · The consistent hashing ring</h2>
+  <p>Consistent hashing (Karger et al., 1997 — built for early web caches, immortalized by Dynamo) fixes the coupling between "where keys live" and "how many nodes exist." Hash <em>both</em> nodes and keys into the same circular space (0 … 2<sup>64</sup>, wrapping around). <strong>A key is owned by the first node clockwise from its position.</strong> (<a href="https://en.wikipedia.org/wiki/Consistent_hashing">Karger et al., consistent hashing</a>)</p>
+  <p>Now membership changes are local:</p>
+  <ul>
+    <li><strong>Add a node</strong>: it lands somewhere on the circle and takes over only the arc between itself and its counter-clockwise neighbor — about <code>1/(N+1)</code> of keys (~17% going 5 → 6), and every moved key moves <em>to the new node</em>. Nothing else shifts.</li>
+    <li><strong>Remove a node</strong> (deliberately, or by crashing): only its arc moves, to its clockwise successor — about <code>1/N</code> of keys (~20% at N=5). The other 80% of keys never notice. Since node failure is the <em>common case</em> at scale, this property is not optional.</li>
+  </ul>
+  <p>Lookup is cheap and coordination-free: keep the node positions in a sorted array, binary-search the key's hash, take the next entry (O(log M)). No central router required — every client with the member list computes the same answer, which is exactly how Memcached client libraries do it.</p>
+
+  <h2>7 · Virtual nodes: smoothing the luck</h2>
+  <p>One point per physical node makes arc sizes a lottery. With 5 nodes, the unlucky draw gives one machine an arc several times its fair share — the lab measures a <strong>3.2× overload with 1 vnode</strong>. The fix: give each physical node not one position but 100–500 positions ("virtual nodes" / "tokens"). Each physical node then owns many small scattered arcs, and the law of large numbers averages its total share toward 1/N — the same lab run drops to <strong>1.08× of fair share at 100 vnodes</strong>.</p>
+  <p>Virtual nodes buy three things beyond smoothing. <em>Heterogeneity</em>: a machine with 2× the RAM takes 2× the vnodes and thus 2× the keyspace. <em>Failure dispersion</em>: a dead node's many small arcs are inherited by many different successors, so its load spreads across the cluster instead of doubling one neighbor's — which is what turns "one failure" into "cascading failure" in the 1-vnode design. <em>Gradual rebalancing</em>: moving one vnode at a time throttles data movement. Costs: the ring's memory and lookup table grow M-fold, and range scans fragment — which is why Cassandra ships with <code>num_tokens</code> (256 historically, 16 in newer versions as tradeoffs shifted). (<a href="https://cassandra.apache.org/doc/latest/cassandra/architecture/dynamo.html">Cassandra architecture docs</a>)</p>
+
+  <h2>8 · Who uses it, and what the alternatives are</h2>
+  <table>
+    <tr><th>System</th><th>Where the ring lives</th><th>Detail</th></tr>
+    <tr><td>Amazon Dynamo / DynamoDB lineage</td><td>Server side</td><td>Ring + vnodes + replication to the next R distinct nodes clockwise (<a href="https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf">Dynamo paper</a>)</td></tr>
+    <tr><td>Cassandra</td><td>Server side</td><td>Token ring, gossip membership, every node can route any request</td></tr>
+    <tr><td>Memcached clients (Ketama, mcrouter)</td><td><strong>Client side</strong></td><td>The servers are dumb; clients hash consistently so a pool resize doesn't flush the cache fleet</td></tr>
+    <tr><td>CDNs &amp; load balancers (e.g. Envoy)</td><td>Edge/proxy</td><td>Ring hash / Maglev policies pin a user or object to a backend for cache affinity</td></tr>
+  </table>
+  <p>Two honest alternatives to name before the interviewer does. <strong>Range partitioning</strong> (Bigtable, HBase, MongoDB, TiDB): split the keyspace into contiguous sorted ranges managed by a coordinator; you gain efficient range scans, you risk hot ranges from sequential keys (timestamps!) and you now operate a coordinator. <strong>Rendezvous (HRW) hashing</strong>: for each key, score every node with <code>hash(key, node)</code> and pick the max — same minimal-movement property, no ring to store, O(N) per lookup; great for small N like proxy pools. Consistent hashing wins when N is large and lookups are hot. (<a href="https://www.oreilly.com/library/view/designing-data-intensive-applications/9781098119058/">DDIA ch. 6</a> covers both hash and range rebalancing.)</p>
+
+  <h2>9 · Failure modes: what the ring does NOT fix</h2>
+  <ul>
+    <li><strong>Hot keys.</strong> Consistent hashing balances key <em>count</em>, not key <em>load</em>. Real access is zipf-distributed: one flash-sale SKU, one celebrity's profile, one viral post can be 10%+ of all traffic, and it lands on exactly one node no matter how many vnodes you add. Mitigations: replicate the hot key to R nodes and spread reads; put a small local cache in front of the ring (a few hundred hottest keys in each client absorbs the head of the zipf curve); or <em>salt</em> the key (<code>key#1…key#R</code>) and fan reads across the copies. The lab's experiment 4 makes this vivid.</li>
+    <li><strong>Rebalance stampedes.</strong> Even 17% key movement re-warms caches and copies data. Production systems throttle vnode handoff and warm new nodes before serving.</li>
+    <li><strong>Membership disagreement.</strong> If two clients briefly disagree about the member list (gossip lag), the same key maps to two owners — reads miss, writes fork. This is why Dynamo pairs the ring with versioning (vector clocks) and read-repair; the ring solves <em>placement</em>, not <em>consistency</em>.</li>
+    <li><strong>Fan-out amplification still applies.</strong> A request touching 50 shards inherits the worst shard's tail (lesson 0001). Partitioning multiplies your exposure to p99s.</li>
+  </ul>
+
+  <div class="callout"><span class="label">One AI note</span>
+    The same machinery reappears in AI infrastructure twice: vector databases (Pinecone, pgvector, Qdrant) are best understood as a fifth, specialized NoSQL family — key → embedding, queried by nearest-neighbor instead of equality (Phase 5) — and LLM serving gateways consistent-hash <em>prompt-prefix hashes</em> so requests sharing a prefix land on the worker already holding that prefix's KV-cache (Phase 4). Same ring, new payloads.
+  </div>
+
+  <h2>10 · Lab — break mod-N with your own hands</h2>
+  <div class="callout"><span class="label">Hands-on (do this before the quiz)</span>
+    In <code>labs/lab-0006-consistent-hashing/</code>: <code>python3 hash_ring_lab.py</code> maps 100k keys
+    under both mod-N and a real vnode ring, then adds a 6th node — watch ~83% vs ~17% of keys move.
+    It also removes a node, sweeps vnodes ∈ {1, 10, 100, 500} to show load smoothing, and finishes with
+    a zipf hot-key experiment proving §9's first bullet. Then do exercises E1–E4 in the README:
+    <em>predict, edit config, re-run, compare.</em>
+  </div>
+
+  <h2>11 · Project step</h2>
+  <p>Back to the spine project, the <strong>LLM inference gateway</strong>. Assume today it keeps everything in one Postgres: user accounts &amp; billing, API-key auth lookups, rate-limit counters, and per-request usage logs (tokens in/out, latency, model — millions of rows/day). In a scratch note, decide: <em>which store would you move off SQL first, and to which family?</em> A defensible answer, using §4's method: rate-limit counters and API-key lookups → Redis (key-value; read on every single request with a sub-ms budget); usage logs → wide-column (append-only time series, no joins at write time); accounts &amp; billing → <strong>stay in Postgres</strong> (multi-row ACID, money). Name the pressure for each move, estimate the write rate that forced it, and bring the note to the next session for critique.</p>
+
+  <h2>12 · Interview talking points</h2>
+  <ul>
+    <li><strong>Open with the family, justified by access pattern.</strong> "Reads are always by key with a sub-ms budget — that's a key-value store" beats naming a product first.</li>
+    <li><strong>Say the default out loud.</strong> "I'd start with Postgres and move the sessions/events off it when <em>this</em> pressure appears" signals judgment; reflexive NoSQL signals fashion.</li>
+    <li><strong>Own the mod-N number.</strong> When sharding comes up, volunteer: "naive mod-N remaps ~83% of keys going 5→6 nodes; a consistent-hash ring moves ~17%, all onto the new node." Interviewers reward the quantified version.</li>
+    <li><strong>Bring up vnodes before imbalance is asked.</strong> "With one token per node someone owns 3× their share; a few hundred vnodes flattens that to ~1.1×, and it also disperses a dead node's load."</li>
+    <li><strong>Name the ring's limit yourself.</strong> "This balances key count, not load — a zipf-hot key still needs replication or a front cache." Pre-empting the hot-key follow-up is a senior move.</li>
+    <li><strong>Treat node removal as the design case, not the edge case.</strong> Failures are routine at scale; a placement scheme is judged by its behavior on the worst day.</li>
+    <li><strong>Know the who's-who.</strong> Dynamo and Cassandra (server-side ring), Memcached clients / Ketama (client-side ring), range partitioning as the deliberate alternative when scans matter.</li>
+  </ul>
+
+  <h2>Check yourself</h2>
+  <div class="quiz" id="quiz"></div>
+
+  <h2>Primary source</h2>
+  <p>Read <strong>DDIA, chapter 6 — Partitioning</strong>, especially "Partitioning by Hash of Key" and the rebalancing discussion (<a href="https://www.oreilly.com/library/view/designing-data-intensive-applications/9781098119058/">2nd ed., O'Reilly</a>). Free alternative covering the taxonomy: the Primer's <a href="https://github.com/donnemartin/system-design-primer#nosql">NoSQL section</a> (key-value, document, wide-column, graph, BASE). Ambitious follow-up: the <a href="https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf">Dynamo paper</a>, sections 4.1–4.3 — the ring, vnodes, and replication in ten readable pages.</p>
+
+  <footer class="lesson-footer">
+    <p><strong>Stuck or curious?</strong> Ask your teacher (the agent) anything — "why does Cassandra use a token ring but MongoDB uses range-based sharding with a config server?" is an excellent follow-up question.</p>
+    <nav class="lesson-nav">
+      <a href="0005-rdbms-scaling.html">◀ Prev: 0005 · RDBMS Scaling</a>
+      <a href="0007-caching-deep.html">Next: 0007 · Caching Deep Dive ▶</a>
+    </nav>
+  </footer>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+renderQuiz(document.getElementById('quiz'), {
+  title: 'Check yourself',
+  questions: [
+    {
+      q: 'A 5-node cluster maps keys with hash(key) % N. You add a 6th node. Roughly what fraction of keys change owner?',
+      options: [
+        'About one sixth of keys move',
+        'About five sixths of keys move',
+        'About one half of keys move',
+      ],
+      answer: 1,
+      explain: 'A key stays only if hash % 5 == hash % 6 — true for ~1 in 6 keys. So ~83% move. A consistent-hash ring moves only ~1/(N+1) ≈ 17%, and only onto the new node.',
+    },
+    {
+      q: "In a BASE system, what does 'eventually consistent' actually promise?",
+      options: [
+        'Replicas converge if writes stop arriving',
+        'Replicas always agree after every write',
+        'Replicas never diverge during network partitions',
+      ],
+      answer: 0,
+      explain: 'Eventual consistency is a liveness promise: given no new writes, all replicas converge to the same value. It says nothing about how stale a read can be meanwhile.',
+    },
+    {
+      q: 'You must serve "friends of friends of friends" queries over a social network with heavy many-to-many links. Best-fit family?',
+      options: [
+        'A document store',
+        'A graph database',
+        'A key-value store',
+      ],
+      answer: 1,
+      explain: 'Depth-3 traversals are walks along edges in a graph DB (Neo4j); in SQL they become N self-joins, and in document/KV stores you would hand-roll the traversal with many round trips.',
+    },
+    {
+      q: 'Why do consistent-hash rings assign each physical node hundreds of virtual nodes?',
+      options: [
+        "They shrink the ring's total memory footprint",
+        'They speed up lookups by caching hashes',
+        'They smooth load by spreading each node',
+      ],
+      answer: 2,
+      explain: 'One point per node gives lumpy, random arc sizes — one machine can own several times its fair share. Hundreds of vnodes average the arcs out, let bigger machines take proportionally more, and disperse a dead node\'s load across many successors.',
+    },
+    {
+      q: 'According to this lesson, when should a design move a workload off SQL?',
+      options: [
+        'When any new greenfield project kicks off',
+        'When a specific pressure forces the move',
+        'When the team simply prefers NoSQL tooling',
+      ],
+      answer: 1,
+      explain: 'Start SQL, leave under a named pressure: shard-scale writes, per-key access with no joins, weekly schema churn. In an interview, saying the pressure out loud is the answer.',
+    },
+    {
+      q: 'A ring with 500 vnodes per node shows near-perfect key counts. What can still overload a single node?',
+      options: [
+        'A zipf-hot key drawing most traffic',
+        'A ring rebuild after adding nodes',
+        'A slow hash function on lookups',
+      ],
+      answer: 0,
+      explain: 'Consistent hashing balances key count, not request load. One flash-sale SKU or celebrity key still lands on exactly one node. Fixes: replicate the hot key, cache it in front, or salt it across nodes.',
+    },
+  ],
+});
+</script>
+</body>
+</html>

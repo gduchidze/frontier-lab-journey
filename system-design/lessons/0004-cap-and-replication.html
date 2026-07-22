@@ -1,0 +1,226 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lesson 4 · CAP, Consistency, and Replication</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<div class="lesson">
+  <header class="lesson-header">
+    <p class="kicker">Lesson 0004 · Phase 1 — Distributed Systems Core · <a href="0004-cap-and-replication.ka.html">ქართული ვერსია</a></p>
+    <h1>CAP, Consistency, and Replication</h1>
+    <p class="dek">What you actually choose during a partition — and what replication lag does to your users the rest of the time.</p>
+  </header>
+
+  <div class="mission-tie">
+    <strong>Mission tie.</strong> Anthropic's design rounds probe distributed-systems fundamentals hard: any prompt with more than one datacenter in it — <em>"design a multi-region API,"</em> <em>"design a chat-history store"</em> — gets the same follow-up: <em>"a region goes dark; what do your users see?"</em> Strong candidates answer per component: this store is CP, that one is AP with read-your-writes, here is the lag budget, here is the failover story. This lesson gives you that entire answer. (<a href="https://www.tryexponent.com/blog/anthropic-system-design-interview">Exponent's 2026 Anthropic guide</a>)
+  </div>
+
+  <h2>1 · CAP, stated correctly</h2>
+  <p>The popular reading — "pick two of Consistency, Availability, Partition tolerance" — is wrong, and interviewers use it as a filter. On a real network, partitions are not optional: cables get cut, switches die, a garbage-collecting node looks dead for 20 seconds. Since P is forced on you, the theorem's real content is narrower and sharper: <strong>while a partition is happening, each request must choose Consistency or Availability.</strong> When the network is healthy, you can have both. (<a href="https://github.com/donnemartin/system-design-primer#cap-theorem">Primer: CAP theorem</a>; Eric Brewer's own retrospective, <a href="https://www.infoq.com/articles/cap-twelve-years-later-how-the-rules-have-changed/">"CAP Twelve Years Later"</a>)</p>
+  <ul>
+    <li><strong>CP — refuse rather than lie.</strong> The minority side of a partition stops answering (errors or timeouts) so it can never serve stale data. Products: ZooKeeper and etcd (cluster coordination, lock services), HBase, most bank ledgers. If two nodes can disagree about an account balance, "available" is worse than "down" — a double-spent balance is corruption, not a UX bug.</li>
+    <li><strong>AP — answer, reconcile later.</strong> Every node keeps serving its possibly-stale copy and conflicts are merged after the partition heals. Products: DNS (the canonical AP system — stale records for hours, by design), Cassandra and Riak, Amazon's Dynamo. The motivating example in the <a href="https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf">Dynamo paper</a> is the shopping cart: Amazon decided a cart that briefly shows a re-added deleted item costs less than a cart that refuses writes during an outage — rejecting an "add to cart" is rejecting revenue.</li>
+  </ul>
+  <p>Note the granularity: <em>systems</em> aren't CP or AP — <em>operations</em> are. A payment system can be CP on the ledger and AP on the "recently viewed items" widget. Saying that sentence in an interview is worth more than a paragraph of theory.</p>
+
+  <h2>2 · PACELC: the trade you make every day</h2>
+  <p>CAP only speaks about partitions, which are rare. <strong>PACELC</strong> (Abadi, 2012) covers the other 99.99% of the time: <em>if Partitioned, trade Availability vs Consistency; Else, trade Latency vs Consistency.</em> To be strongly consistent, a write must wait for confirmation from other replicas — a synchronous round trip (500 µs same-DC, 150 ms cross-ocean, per Lesson 0001) added to <em>every single write</em>. Refuse to wait and you are inconsistent for the length of the replication lag.</p>
+  <table>
+    <tr><th>System</th><th>During partition</th><th>Else (normal operation)</th></tr>
+    <tr><td>Dynamo / Cassandra / Riak</td><td>PA — stay available</td><td>EL — answer fast, tolerate staleness</td></tr>
+    <tr><td>ZooKeeper / etcd / HBase</td><td>PC — refuse minority side</td><td>EC — pay latency for consistency</td></tr>
+    <tr><td>Google Spanner</td><td>PC — quorum required</td><td>EC — commit waits out clock uncertainty</td></tr>
+  </table>
+  <p>Spanner is the instructive extreme: Google pays for GPS and atomic clocks in every datacenter precisely so the "wait for consistency" penalty is small enough to afford globally. Consistency is never free — the rich just buy it in bulk.</p>
+
+  <h2>3 · The consistency spectrum</h2>
+  <p>"Consistency" is a dial, not a switch. From cheapest to most expensive (<a href="https://github.com/donnemartin/system-design-primer#consistency-patterns">Primer: consistency patterns</a>):</p>
+  <table>
+    <tr><th>Level</th><th>Promise</th><th>Typical home</th></tr>
+    <tr><td><strong>Weak</strong></td><td>Reads may or may not see the write; best effort, no promise of convergence</td><td>Live video, VoIP, multiplayer game position — a lost update is <em>better</em> than a late one</td></tr>
+    <tr><td><strong>Eventual</strong></td><td>Stop writing and all replicas converge, on no particular deadline</td><td>DNS, search indexes, S3 metadata propagation, email delivery, like-counters</td></tr>
+    <tr><td><strong>Strong</strong> (linearizable)</td><td>Every read sees the latest write, as if one copy existed</td><td>Payments, inventory decrement, unique-username claims, coordination/locks</td></tr>
+  </table>
+  <p>Worked failure mode, e-commerce flavor: a warehouse has 1 unit left. Two buyers hit "purchase" through two replicas that haven't converged. Eventual consistency happily sells the unit twice; you discover it at pick-and-pack and one customer gets an apology email. That's why <strong>inventory decrement is strong</strong> even at companies whose catalogs, reviews, and recommendations are all eventual. The dial is set <em>per operation, by the cost of its worst anomaly</em>.</p>
+
+  <h2>4 · Session guarantees: the practical middle ground</h2>
+  <p>Full strong consistency is usually overkill; raw eventual consistency produces anomalies users actually notice. Between them sit <strong>session guarantees</strong> — promises scoped to one user's session (<a href="https://www.oreilly.com/library/view/designing-data-intensive-applications/9781098119058/">DDIA ch. 5</a>, "Problems with Replication Lag"):</p>
+  <ul>
+    <li><strong>Read-your-writes.</strong> You always see your own writes; other people's reads may lag. The classic bug: a user posts a comment, the page reloads in 200 ms, the read hits a follower that's 500 ms behind — their comment has "vanished." They repost. Now it's there twice. Implementations: route a user's reads to the leader for N seconds after their write; or remember the user's last-write timestamp and only read from replicas that have caught up to it; or sticky-route each user to one region.</li>
+    <li><strong>Monotonic reads.</strong> Time never runs backwards across your reads. Anomaly: refresh a social feed and a comment appears; refresh again — routed to a <em>more</em> stale replica — and it's gone. Fix: pin each session to one replica (e.g., hash of user ID → replica), so a user may lag but never time-travels.</li>
+  </ul>
+  <p>These cost almost nothing in latency compared to global strong consistency, and they eliminate the anomalies humans actually complain about. "Read-your-writes via session pinning, and here's what it costs the leader" is a precise, senior-sounding answer; the lab makes you measure that cost.</p>
+
+  <h2>5 · Leader–follower replication and the perils of failover</h2>
+  <p>The default topology for almost every RDBMS deployment (MySQL, Postgres): all writes go to one <strong>leader</strong>; <strong>followers</strong> replicate the change stream and serve reads. The key decision is how the leader acknowledges (<a href="https://www.oreilly.com/library/view/designing-data-intensive-applications/9781098119058/">DDIA ch. 5</a>):</p>
+  <ul>
+    <li><strong>Asynchronous</strong> (common): ack the client immediately, replicate in the background. Fast writes — but every follower read races the <strong>replication lag</strong>, and a leader crash loses the writes still in flight.</li>
+    <li><strong>Synchronous</strong>: ack only after a follower confirms. No loss — but one slow follower stalls all writes; fully synchronous to many followers is impractical.</li>
+    <li><strong>Semi-synchronous</strong>: at least one follower confirms, the rest replicate async. The production compromise (MySQL semi-sync).</li>
+  </ul>
+  <p><strong>Failover</strong> is where this topology bites. The leader dies; a follower is promoted. Three classic wounds:</p>
+  <ul>
+    <li><strong>Lost writes.</strong> If the promoted follower was behind, writes the old leader acknowledged are simply gone. GitHub's <a href="https://github.blog/2018-10-30-oct21-post-incident-analysis/">October 2018 incident</a> is the canonical case study: a 43-second network blip triggered a cross-country MySQL failover, seconds of writes existed only on the demoted side, and full reconciliation took over 24 hours of degraded service.</li>
+    <li><strong>Premature promotion.</strong> The "dead" leader was just slow (GC pause, network blip). It comes back still believing it's the leader — see split-brain, section 8.</li>
+    <li><strong>Wrong timeout.</strong> Fail over too eagerly and you churn leaders during load spikes (which is when lag — and thus data loss — is largest); too lazily and you extend the outage. There is no correct constant, only a tuned one.</li>
+  </ul>
+
+  <h2>6 · Multi-leader replication and conflict pain</h2>
+  <p><strong>Leader–leader</strong> (multi-leader): several nodes accept writes and replicate to each other. Nearly mandatory for multi-region products — a European buyer should not push every cart update across an ocean (150 ms each way) — and for offline-capable clients (calendar apps: your phone and laptop are both "leaders" while offline). The price: two leaders can accept <strong>conflicting writes to the same key</strong>, and something must resolve them:</p>
+  <ul>
+    <li><strong>Last-write-wins (LWW)</strong>: compare timestamps, discard the loser. Simple, and it <em>silently destroys data</em> — with clock skew between datacenters, "last" doesn't even mean last. Fine for a view-counter cache; unforgivable for orders.</li>
+    <li><strong>Application-level merge</strong>: keep both versions, let code or the user reconcile (version-vector "siblings" in Riak/early Dynamo — the twice-re-added cart item comes from a cart <em>merge</em>).</li>
+    <li><strong>CRDTs</strong>: data structures (counters, sets, collaborative-text sequences) that mathematically guarantee all replicas converge regardless of delivery order — the machinery under collaborative editors like Figma and Google Docs-style apps.</li>
+  </ul>
+  <p>Rule of thumb for interviews: don't volunteer multi-leader unless the prompt demands multi-region active-active writes or offline clients — then immediately name your conflict story. Proposing multi-leader without one is a red flag.</p>
+
+  <h2>7 · Quorums: R + W > N</h2>
+  <p>The leaderless (Dynamo-style) alternative drops the leader entirely: write to all <strong>N</strong> replicas, acknowledge once <strong>W</strong> confirm; read from <strong>R</strong> replicas and keep the freshest version. The guarantee is pure pigeonhole arithmetic: if <code>R + W &gt; N</code>, any read set must overlap any acknowledged write set in at least one replica, so the read cannot miss the latest write. Not probability — arithmetic.</p>
+  <table>
+    <tr><th>N = 3</th><th>Overlap guaranteed?</th><th>Character</th></tr>
+    <tr><td>W = 1, R = 1</td><td>No (sum 2)</td><td>Fastest, stale reads common — cache-like</td></tr>
+    <tr><td>W = 2, R = 2</td><td>Yes (sum 4)</td><td>The classic balanced default</td></tr>
+    <tr><td>W = 3, R = 1</td><td>Yes (sum 4)</td><td>Slow, fragile writes; cheap fast reads</td></tr>
+    <tr><td>W = 1, R = 3</td><td>Yes (sum 4)</td><td>Cheap fast writes; expensive reads</td></tr>
+  </table>
+  <p>Tuning is workload-driven: a write-heavy ingest (logistics tracking events) leans W low / R high; a read-heavy catalog leans the opposite. Two honest caveats worth saying aloud: quorum overlap alone is <em>not</em> full linearizability (concurrent writes still need version resolution), and "sloppy quorums" — where, during a partition, writes land on stand-in nodes for availability — deliberately break the overlap guarantee until hinted handoff repairs it. Cassandra exposes all of this as per-query <em>tunable consistency</em>: <code>ONE</code>, <code>QUORUM</code>, <code>ALL</code>.</p>
+
+  <h2>8 · Failover patterns and split-brain</h2>
+  <p>Two standard shapes for redundancy (<a href="https://github.com/donnemartin/system-design-primer#availability-patterns">Primer: availability patterns</a>):</p>
+  <ul>
+    <li><strong>Active-passive</strong>: a standby takes over when heartbeats stop. Simple to reason about; costs idle hardware plus a promotion gap (seconds to minutes of writes refused). Interviewers may ask for your <strong>RTO</strong> (how long until recovered) and <strong>RPO</strong> (how much data you may lose — for async replication, the lag at crash time).</li>
+    <li><strong>Active-active</strong>: all nodes serve traffic behind a load balancer. Better utilization and instant "failover" (the LB just stops routing to the dead node) — but if both sides accept <em>writes</em>, you have bought multi-leader's conflict problems (section 6).</li>
+  </ul>
+  <p>The nightmare shared by both: <strong>split-brain</strong>. The "dead" node wasn't dead — just partitioned or pausing — and now two leaders accept conflicting writes for the same data. Both believe they're right; both are corrupting state. Defenses: <strong>quorum-based election</strong> (a node may only lead while a majority acknowledges it — the minority side of any partition therefore cannot elect a leader; this is why coordination clusters have 3 or 5 nodes, never 2 or 4) and <strong>fencing</strong> (make the demoted leader physically unable to write: revoke its storage token, or STONITH — "shoot the other node in the head" — cut its power). A monotonically increasing fencing token attached to every write lets storage reject the stale leader outright.</p>
+
+  <h2>9 · Availability math: what nines cost and buy</h2>
+  <p>Availability targets translated into clock time (525,600 minutes/year):</p>
+  <table>
+    <tr><th>Availability</th><th class="num">Downtime / year</th><th class="num">Downtime / month</th></tr>
+    <tr><td>99.9% ("three nines")</td><td class="num">8.8 hours</td><td class="num">43.8 min</td></tr>
+    <tr><td>99.99% ("four nines")</td><td class="num">52.6 minutes</td><td class="num">4.4 min</td></tr>
+    <tr><td>99.999% ("five nines")</td><td class="num">5.3 minutes</td><td class="num">26 s</td></tr>
+  </table>
+  <p>Composition is where designs quietly die. <strong>In series</strong> — the request needs every component — availabilities <em>multiply</em>. A checkout path of load balancer (99.99%) → web tier (99.95%) → payment service (99.9%) → database (99.9%):</p>
+  <pre><code>0.9999 × 0.9995 × 0.999 × 0.999 ≈ 0.9974  →  99.74%  ≈  22.8 hours down/year</code></pre>
+  <p>Four individually respectable components compose into something that would embarrass an SLA page. Every dependency you add to the request path subtracts nines — say this sentence whenever anyone (including you) proposes inserting a new synchronous service.</p>
+  <p><strong>In parallel</strong> — any one replica suffices — <em>failure probabilities</em> multiply instead: <code>availability = 1 − Π(1 − aᵢ)</code>. Two independent 99.9% payment providers with failover between them:</p>
+  <pre><code>1 − (0.001)² = 0.999999  →  99.9999%  ≈  32 seconds down/year</code></pre>
+  <p>Redundancy is how you buy nines back; the caveat that earns senior points is <em>independence</em> — two replicas in the same rack share a power supply, two "providers" sharing an upstream bank share its outages, and correlated failures make the formula optimistic.</p>
+
+  <h2>10 · One subsection for AI infrastructure</h2>
+  <p>Everything above transfers directly to this course's spine project (the LLM inference gateway) — the dial is still set per store, by worst anomaly: a <strong>KV-cache-aware routing table</strong> can be eventual/weak, because a stale routing hint costs a cache miss (latency), never a wrong answer; a <strong>chat-history store</strong> needs read-your-writes, because a user must see the message they just sent while strangers' replicas may lag; a <strong>model-weights registry</strong> must be strong/CP, because two replicas disagreeing about "current production weights" means silently serving different models to different users — the inventory-double-sell of ML platforms. Same spectrum, same reasoning, new nouns.</p>
+
+  <h2>11 · Lab — watch the lag yourself</h2>
+  <div class="callout"><span class="label">Hands-on (do this before the quiz)</span>
+    Everything above is now verifiable in <code>labs/lab-0004-replication-lag/</code>:
+    <code>python3 replication_lab.py</code> runs four experiments — stale-read % vs
+    read-after-write delay on a leader + 3 followers, read-your-writes via leader
+    pinning (staleness hits zero; watch what happens to leader load), the
+    <code>R + W &gt; N</code> quorum sweep (guaranteed rows show exactly 0.000%), and the
+    nines/serial/parallel arithmetic. Then do exercises E1–E4 in the lab README:
+    <em>predict, edit config, re-run, compare.</em>
+  </div>
+
+  <h2>12 · Project step</h2>
+  <p>Back to the <strong>LLM inference gateway</strong>. It has (at least) three stateful stores; give each a consistency level, a replication topology, and a one-sentence justification: the <strong>request queue</strong> (in-flight generation jobs — losing one silently is bad, processing one twice must be safe: think availability plus idempotent consumers), the <strong>chat-history store</strong> (section 10 argued read-your-writes — now pick the topology from sections 5–7 that actually delivers it), and the <strong>model registry</strong> (strong/CP — name the system you'd really use, e.g. etcd, and state what happens to deploys, but <em>not</em> to inference, during a partition). Three rows, three sentences. Bring the table to the next session and your teacher will attack it.</p>
+
+  <h2>13 · Interview talking points</h2>
+  <p>How this lesson deploys in a live design round:</p>
+  <ul>
+    <li><strong>Set consistency per operation, out loud.</strong> "Orders and inventory are CP; catalog, reviews, and feed are AP with eventual consistency" — one sentence, drawn as two colors on the whiteboard, signals more than any definition of CAP.</li>
+    <li><strong>Never say "eventual consistency" bare.</strong> Immediately name the anomaly you're accepting and its mitigation: "…so we need read-your-writes for the author, via leader pinning for 10 s after a write."</li>
+    <li><strong>Preempt the partition question.</strong> Before the interviewer asks, state it: "if the region partitions, checkout degrades to read-only (CP), browsing continues stale (AP)." You choosing the degraded mode is the entire point of the question.</li>
+    <li><strong>Do the nines math when the path grows.</strong> Someone adds a synchronous service to the request path? "Each 99.9% dependency in series costs us ~9 hours/year" — then propose a cache, a queue, or a fallback to take it off the critical path.</li>
+    <li><strong>Quote R + W &gt; N precisely.</strong> And add one caveat (sloppy quorums, or "overlap isn't full linearizability") to show it's knowledge, not a flashcard.</li>
+    <li><strong>For any failover story, volunteer RPO/RTO.</strong> "Async replication, so RPO = replication lag at crash, roughly seconds; RTO = detection timeout + promotion, under a minute" — and mention fencing so split-brain is handled before it's asked.</li>
+  </ul>
+
+  <h2>Check yourself</h2>
+  <div class="quiz" id="quiz"></div>
+
+  <h2>Primary source</h2>
+  <p>Read <strong>DDIA, chapter 5 — Replication</strong> (<a href="https://www.oreilly.com/library/view/designing-data-intensive-applications/9781098119058/">2nd ed., O'Reilly</a>) — leader-follower lag, the "Problems with Replication Lag" section, multi-leader conflicts, and quorums. Free alternatives covering the same ground: the Primer's <a href="https://github.com/donnemartin/system-design-primer#cap-theorem">CAP theorem</a>, <a href="https://github.com/donnemartin/system-design-primer#consistency-patterns">consistency patterns</a>, and <a href="https://github.com/donnemartin/system-design-primer#availability-patterns">availability patterns</a> sections; Brewer's <a href="https://www.infoq.com/articles/cap-twelve-years-later-how-the-rules-have-changed/">"CAP Twelve Years Later"</a>; and the <a href="https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf">Dynamo paper</a> for quorums in the wild.</p>
+
+  <footer class="lesson-footer">
+    <p><strong>Stuck or curious?</strong> Ask your teacher (the agent) anything — "why does a 3-node quorum survive one failure but a 2-node 'quorum' survives none?" is an excellent follow-up question.</p>
+    <nav class="lesson-nav">
+      <a href="0003-traffic-edge.html">◀ Prev: 0003 · Traffic &amp; the Edge</a>
+      <a href="0005-rdbms-scaling.html">Next: 0005 · RDBMS Scaling ▶</a>
+    </nav>
+  </footer>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+renderQuiz(document.getElementById('quiz'), {
+  title: 'Check yourself',
+  questions: [
+    {
+      q: 'A network partition splits your two datacenters. What does the CAP theorem actually force each request to choose between?',
+      options: [
+        'Pick between consistency, availability, and partition tolerance',
+        'Serve consistent answers or keep accepting requests',
+        'Pick between higher throughput and lower latency',
+      ],
+      answer: 1,
+      explain: 'CAP is not a pick-2-of-3 menu — partitions happen whether you like them or not. During one, you either refuse some requests (CP) or answer with possibly stale data (AP).',
+    },
+    {
+      q: 'Your system is running normally — no partition anywhere. Which trade-off does PACELC say you are still making?',
+      options: [
+        'Durability versus write throughput',
+        'Availability versus partition tolerance',
+        'Latency versus data consistency',
+      ],
+      answer: 2,
+      explain: 'The ELC in PACELC: Else (no partition), choose Latency or Consistency. Waiting for replicas to confirm each write costs milliseconds; not waiting costs freshness.',
+    },
+    {
+      q: 'A shopper posts a product review, the page refreshes, and the review is gone. Which guarantee was missing?',
+      options: [
+        'Read-your-writes guarantee for that user session',
+        'Strong linearizable consistency across all replicas',
+        'Monotonic reads guarantee across all replicas',
+      ],
+      answer: 0,
+      explain: 'Their read hit a follower that had not yet applied their own write. Read-your-writes (pin the session to the leader or a caught-up replica) fixes exactly this, far cheaper than full strong consistency.',
+    },
+    {
+      q: 'N = 3 replicas. Which (W, R) pair guarantees a read overlaps the latest acknowledged write?',
+      options: [
+        'W = 1, R = 2',
+        'W = 2, R = 1',
+        'W = 2, R = 2',
+      ],
+      answer: 2,
+      explain: 'The guarantee is R + W > N. With N = 3, (2, 2) gives 4 > 3, so the read set must share a replica with the write set. The other pairs sum to 3, which permits disjoint sets — the lab shows them leaking stale reads.',
+    },
+    {
+      q: 'Two services are each 99.9% available and a request must pass through both in series. Combined availability is roughly what?',
+      options: [
+        'About 99.95 percent',
+        'About 99.8 percent',
+        'About 99.99 percent',
+      ],
+      answer: 1,
+      explain: 'Serial composition multiplies: 0.999 × 0.999 ≈ 0.998, roughly 17.5 hours of downtime a year. Parallel redundancy is the inverse move: 1 − 0.001² ≈ 99.9999%.',
+    },
+    {
+      q: 'During failover the old leader never actually died, and it keeps accepting writes alongside the newly promoted one. What is this failure called?',
+      options: [
+        'Split brain',
+        'Cascading failure',
+        'Thundering herd',
+      ],
+      answer: 0,
+      explain: 'Two nodes each believe they are the leader and accept conflicting writes — split-brain. Quorum-based leader election and fencing (making the old leader unable to write) exist to prevent it.',
+    },
+  ],
+});
+</script>
+</body>
+</html>

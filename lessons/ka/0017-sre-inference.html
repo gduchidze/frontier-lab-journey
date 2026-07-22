@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="ka">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>გაკვეთილი 17 — SRE Inference-ისთვის: SLO-ები, ალერტები, Chaos</title>
+<link rel="stylesheet" href="../../assets/course.css">
+</head>
+<body>
+<div class="page">
+<p class="lang-switch"><a href="../0017-sre-inference.html">🇬🇧 English</a></p>
+
+<p class="lesson-kicker">SLM Production Stack · გაძლიერებული · გაკვეთილი 17 · ~2.5 სთ</p>
+<h1>SRE Inference-ისთვის: SLO-ები, ალერტები, Chaos</h1>
+<p class="lesson-lede">სტეკის აშენება ინჟინერია იყო; მისი ექსპლუატაცია ღამის 3 საათზე სხვა დისციპლინაა. დღეს რიცხობრივად განსაზღვრავ, რას ნიშნავს „მუშაობს", ააწყობ ალერტებს ისე, რომ პეიჯერმა არ მოგკლას, დაწერ runbook-ს (საოპერაციო ინსტრუქციას), რომლისთვისაც მომავალი შენ მადლობას გეტყვის, და შემდეგ ყველაფერს განზრახ დაამტვრევ.</p>
+
+<h2>ცოდნა</h2>
+
+<h3>1. SLI → SLO → error budget</h3>
+<p><strong>SLI</strong> (მომსახურების დონის ინდიკატორი): კარგი მოვლენების გაზომილი წილი („ჩატის მოთხოვნები TTFT &lt; 4s-ით"). <strong>SLO</strong> (მომსახურების დონის მიზანი): სამიზნე მაჩვენებელი დროის ფანჯარაში („99% 30 დღეში"). <strong>Error budget</strong> (შეცდომების ბიუჯეტი): 100% − SLO — ის ოდენობა „ცუდისა", რომელიც <em>დაშვებული</em> გაქვს, და სწორედ ეს აქცევს დეპლოებს, chaos ტესტებსა და რისკზე წასვლას რაციონალურად და არა აკრძალულად. ამ სტეკისთვის:</p>
+<table>
+<tr><th>SLI</th><th>SLO (ლოკალურად რეალისტური)</th><th>წყარო</th></tr>
+<tr><td>ხელმისაწვდომობა (არა-5xx router-ის გავლით)</td><td>99.5% / 30d</td><td>router-ის მეტრიკები</td></tr>
+<tr><td>TTFT &lt; 10s (CPU-სთვის რეალისტური)</td><td>მოთხოვნების 95%</td><td><code>vllm:time_to_first_token_seconds_bucket</code></td></tr>
+<tr><td>რიგის ჯანსაღობა</td><td>waiting &lt; 10 წუთების 99%-ისთვის</td><td><code>vllm:num_requests_waiting</code></td></tr>
+</table>
+<p>სენიორული სვლა: SLO-ები <em>მომხმარებლის გამოცდილების</em> განაცხადებია, ამიტომ TTFT/ხელმისაწვდომობა — არასდროს „CPU 80%-ზე დაბლა" (ეს მიზეზია და არა გამოცდილება).</p>
+
+<h3>2. ალერტი სიმპტომებზე, პეიჯი burn rate-ზე</h3>
+<p>ზღვრული ალერტები („TTFT &gt; 4s 5 წუთის განმავლობაში") ან განუწყვეტლივ გაღვიძებენ, ან ძალიან გვიან. <strong>Multi-window burn rate</strong> (ბიუჯეტის წვის ტემპის მრავალფანჯრიანი) ალერტები მაშინ ირთვება, როცა error budget ანომალიურად სწრაფად იხარჯება:</p>
+<pre><code># page: burning 30d budget 14.4× too fast, confirmed on two windows
+(error_rate_1h  > 14.4 × (1 − SLO))
+and
+(error_rate_5m  > 14.4 × (1 − SLO))</code></pre>
+<p>Fast-burn (1h/5m, 14.4×) ადამიანს აღვიძებს; slow-burn (6h/30m, 6×) ტიკეტს ხსნის. ორი ფანჯარა ციმციმს (flapping) კლავს. ეს Google SRE Workbook-ის რეცეპტია და ინტერვიუებზე სახელით კითხულობენ.</p>
+<p>ალერტების ტაქსონომია ამ სტეკისთვის — მიზეზ-ალერტები რჩება <em>დიაგნოსტიკად</em> და არა პეიჯებად: ძრავები გამორთულია (<code>up == 0</code>), რიგი იზრდება, KV-ის გამოყენება გაჩერებულია &gt; 0.95-ზე, HPA maxReplicas-ზეა &gt; 15 წუთი.</p>
+
+<h3>3. Runbook-ები: დაწერილი ინციდენტამდე, მიბმული ალერტზე</h3>
+<p>ალერტი runbook-ის გარეშე ღამის 3 საათზე დავალებული საშინაო დავალებაა. მუშა ჩონჩხი:</p>
+<pre><code>ALERT: HighTTFTBurnRate
+1. CONFIRM   dashboards X, Y — real or metric artifact?
+2. SCOPE     one engine or all? one tenant? started when? deploy nearby? (Argo history!)
+3. MITIGATE  scale out | shed load (rate-limit at edge) | rollback last change
+4. VERIFY    burn rate falling on the 5m window
+5. FOLLOW-UP file postmortem; link evidence</code></pre>
+<p>ჯერ შერბილება, მერე დიაგნოზი. სერვისის აღდგენა მის გაგებაზე მაღლა დგას — გაგება postmortem-ში (ინციდენტის შემდგომ ანალიზში) ხდება, რომელიც <strong>ბრალდაუდებელია (blameless)</strong>: მარცხდებიან სისტემები და პროცესები, არა ადამიანები.</p>
+
+<h3>4. Chaos engineering: ჰიპოთეზა და არა ვანდალიზმი</h3>
+<p>ფორმატი: „მოცემულობით [სტაბილური დატვირთვა], როცა [engine pod-ი კვდება], ველოდებით [router-ი აგდებს მას &lt; 5s-ში, ნული 5xx, TTFT-ის ნახტომი &lt; 30s]." გაუშვი, დააკვირდი, შეადარე, გამოასწორე უფსკრული. „საბავშვო" chaos-ი უკვე გაკეთებული გაქვს (გაკვეთილი 8); დღეს ის სისტემურია, დატვირთვის ქვეშ, ჩამწერი dashboard-ით და წინასწარ დაწერილი მოლოდინებით.</p>
+
+<h2>ლაბორატორია (labs/lab-17): ops-ის დღე</h2>
+<div class="lab">
+<div class="step"><h3>ჩაწერე SLO-ები</h3><p><code>docs/slo.md</code>: ზემოთ მოცემული 3 SLI, სამიზნეები, გაზომვის query-ები. 15 წუთი, ზედმეტი გაპრიალების გარეშე.</p></div>
+<div class="step"><h3>PrometheusRule</h3><p><code>k8s/alerts.yaml</code>: fast-burn TTFT ალერტი (ორი ფანჯარა), პლუს დიაგნოსტიკა: <code>VLLMEngineDown</code>, <code>QueueBacklog</code> (waiting &gt; 10 5 წუთის განმავლობაში). გამოიყენე; ნახე ისინი Inactive მდგომარეობაში Prometheus → Alerts-ში.</p></div>
+<div class="step"><h3>ერთი ნამდვილად აანთე</h3><p>k6-ის დატვირთვა მე-9 გაკვეთილის მუხლის წერტილს მიღმა → უყურე, როგორ გადადის <code>QueueBacklog</code> Pending → Firing-ში. გადაუღე სქრინშოტი. (Alertmanager-ის მარშრუტიზაცია Slack/ელფოსტაზე = დამატებითი გამოწვევა.)</p></div>
+<div class="step"><h3>Runbook-ები</h3><p><code>runbooks/high-ttft.md</code> და <code>runbooks/engine-down.md</code> ჩონჩხის ფორმატში, შენი სტეკის ნამდვილი ბრძანებებით (scale-ის ბრძანება, Argo rollback-ი, edge-ის rate-limit ანოტაცია).</p></div>
+<div class="step"><h3>Chaos day (ყველაზე სახალისო)</h3><p>სტაბილური k6 დატვირთვის ქვეშ, ჰიპოთეზები ჯერ დაწერე: მოკალი ძრავა → მოკალი router-ი → <code>docker pause llm-stack-worker</code> („გაჭედილი კვანძი" — მკვდარზე უფრო ვერაგი) → წაშალე Prometheus pod-ი (ვინ უყურებს მეთვალყურეს?). თითოეულისთვის: მოსალოდნელი vs დაკვირვებული, <code>docs/chaos-day.md</code>-ში.</p></div>
+<div class="step"><h3>Postmortem</h3><p>აირჩიე ყველაზე ცუდი სიურპრიზი. სრული blameless postmortem <code>docs/postmortems/0001-…md</code>-ში: ქრონოლოგია, ზეგავლენა, ძირეული მიზეზი (5 whys), რამ გვიშველა, სამოქმედო პუნქტები. ამ დოკუმენტის ფორმატი თავისთავად დაქირავების სიგნალია.</p></div>
+</div>
+
+<h2>შეამოწმე თავი</h2>
+<div class="quiz" data-quiz>
+  <div class="q">
+    <p class="stem">რატომ burn rate ალერტები და არა „P90 TTFT &gt; 4s 5 წუთის განმავლობაში"?</p>
+    <button class="opt" data-correct>ისინი ბიუჯეტის ხარჯვის პროპორციულად აღვიძებენ</button>
+    <button class="opt">ისინი ჰისტოგრამებზე უფრო სწრაფად ითვლება</button>
+    <button class="opt">მათ წინასწარ SLO-ის განსაზღვრა არ სჭირდებათ</button>
+    <p class="explain">Burn rate პეიჯინგს იმას აბამს, თუ რამდენად სწრაფად იხარჯება მომხმარებლისთვის დაპირებული საიმედოობა — მოკლე ციმციმები არ აღვიძებს, ნელი გაჟონვები კი საბოლოოდ აღვიძებს. ზღვრულ ალერტებს არც ერთი შეუძლია. (მათ მეტი წინასწარი SLO-ის სამუშაო სჭირდებათ და არა ნაკლები.)</p>
+  </div>
+  <div class="q">
+    <p class="stem">ინციდენტის შუაგულში, მიზეზი უცნობია, მომხმარებლები იტანჯებიან. სწორი შემდეგი ნაბიჯი?</p>
+    <button class="opt" data-correct>ჯერ შეარბილე, დიაგნოზი სერვისის დაბრუნების შემდეგ</button>
+    <button class="opt">ბოლომდე დასვი დიაგნოზი, რომ გამოსწორება სწორი იყოს</button>
+    <button class="opt">გაყინე ყველაფერი მტკიცებულებების შესანარჩუნებლად</button>
+    <p class="explain">Scale out / დატვირთვის მოხსნა / rollback — აღადგინე გამოცდილება და მერე გამოიძიე. მეტრიკები და ლოგები მტკიცებულებას შენს მაგივრად ინახავს; მომხმარებლები ძირეულ მიზეზს არ ელოდებიან.</p>
+  </div>
+  <div class="q">
+    <p class="stem">დაპაუზებული (გაჭედილი) კვანძი მოკლულზე უფრო ვერაგია, რადგან…</p>
+    <button class="opt" data-correct>დეტექცია ჩამორჩება: კვანძი უფრო დიდხანს ჩანს ცოცხლად</button>
+    <button class="opt">მასზე მყოფი pod-ები ორმაგ რესურსს მოიხმარენ</button>
+    <button class="opt">Kubelet-ის გადატვირთვები pod-ის ლოგებს შლის</button>
+    <p class="explain">მკვდარი კვანძები სწრაფად და სუფთად მარცხდებიან. გაჭედილი კვანძები მოძველებულ heartbeat-ებზე მიცურავენ (~40s+ NotReady-მდე, წუთები eviction-მდე), სანამ იქ გაგზავნილ მოთხოვნებს ვადა ეწურება. Gray failure-ები (ნაცრისფერი მტყუნებები) ყველაზე ძვირია.</p>
+  </div>
+</div>
+
+<h2>პირველწყარო</h2>
+<p><a href="https://sre.google/workbook/alerting-on-slos/">Google SRE Workbook — Alerting on SLOs</a> (burn rate-ის თავი, უფასოდ ონლაინ). გადახედე <a href="https://sre.google/sre-book/postmortem-culture/">Postmortem Culture</a>-ს.</p>
+
+<h2>შემდეგი</h2>
+<p><a href="0018-cost-capstone.html">გაკვეთილი 18</a>: ფულის გაკვეთილი — GPU-ის ეკონომიკა, ტევადობის დაგეგმვა, build-vs-buy — და სენიორის capstone დიზაინის დოკუმენტი.</p>
+
+<div class="lesson-footer"><p><a href="index.html">კურსის მთავარი</a> · ლაბორატორია: <code>labs/lab-17/</code></p></div>
+</div>
+<script src="../../assets/quiz.js"></script>
+</body>
+</html>

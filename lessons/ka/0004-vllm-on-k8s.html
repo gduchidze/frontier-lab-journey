@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="ka">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>გაკვეთილი 4 — vLLM ხვდება Kubernetes-ს</title>
+<link rel="stylesheet" href="../../assets/course.css">
+</head>
+<body>
+<div class="page">
+<p class="lang-switch"><a href="../0004-vllm-on-k8s.html">🇬🇧 English</a></p>
+
+<p class="lesson-kicker">SLM Production Stack · გაკვეთილი 4 · ფაზა 4 · ~90 წთ</p>
+<h1>vLLM ხვდება Kubernetes-ს</h1>
+<p class="lesson-lede">შერწყმის გაკვეთილი. შენი ძრავის image გაკვეთილ 3-დან, დაპლოებული გაკვეთილ 2-ის production პატერნებით: namespace, PVC (PersistentVolumeClaim — მუდმივი საცავის მოთხოვნა) მოდელის წონებისთვის, ნელი ჩატვირთვისთვის მორგებული probe-ები და Service, რომელსაც მთელი სტეკი დაელაპარაკება.</p>
+
+<div class="note"><strong>წინაპირობები</strong>
+Cluster გაშვებულია · image <code>vllm-cpu:local</code> აშენებულია (გაკვეთილი 3) · namespace <code>llm</code> არსებობს (გაკვეთილი 2).</div>
+
+<h2>ცოდნა: სამი ახალი ნაწილი</h2>
+
+<h3>1. ლოკალური image-ის შეტანა kind-ში</h3>
+<p>შენი cluster-ის node-ები კონტეინერებია — ისინი ვერ ხედავენ შენი Mac-ის Docker image-ებს. <code>kind load docker-image</code> image-ს ყველა node-ში აკოპირებს. რეალურ კლასტერებში ეს ნაბიჯი არის "push to a registry" (ECR, GCR, Artifact Registry); kind სწავლისას registry-ის გამოტოვების საშუალებას გაძლევს:</p>
+<pre><code>kind load docker-image vllm-cpu:local --name llm-stack</code></pre>
+<p>ამის შემდეგ მანიფესტში უნდა ეწეროს <code>imagePullPolicy: IfNotPresent</code> — წინააღმდეგ შემთხვევაში K8s შეეცდება <code>vllm-cpu:local</code>-ის Docker Hub-იდან ჩამოტვირთვას და ჩავარდება <code>ImagePullBackOff</code>-ით.</p>
+
+<h3>2. PersistentVolumeClaim-ები: წონები Pod-ებზე დიდხანს ცოცხლობენ</h3>
+<p>Persistence-ის გარეშე ყოველი Pod-ის გადატვირთვა ~2 GB წონებს ხელახლა ტვირთავს. <strong>PVC</strong> ითხოვს საცავს, რომელიც Pod-ებზე მეტხანს ცოცხლობს (<a href="https://kubernetes.io/docs/concepts/storage/persistent-volumes/">დოკუმენტაცია</a>). დაამაუნთე ის <code>/root/.cache/huggingface</code>-ზე — HF cache-ის path — და გადატვირთვები სწრაფი გახდება. ორივე reference რეპო ზუსტად ამას აკეთებს (doronmak: <code>vllm-models</code> PVC; production-stack: <code>pvcStorage</code> თითო მოდელზე). kind-ს მოჰყვება default <code>standard</code> StorageClass, ამიტომ უბრალო PVC "უბრალოდ მუშაობს".</p>
+
+<h3>3. Probe-ების timing LLM ძრავებისთვის</h3>
+<p>vLLM გამოაქვეყნებს <code>/health</code>-ს (200 = engine მუშაობს). ხაფანგი: მოდელის ჩატვირთვას CPU-ზე შესაძლოა წუთები დასჭირდეს. ამიტომ: <strong>startup probe</strong> უზარმაზარი ფანჯრით (<code>failureThreshold: 60 × periodSeconds: 10</code> = 10 წთ ვადა), შემდეგ მჭიდრო readiness/liveness. შეადარე <code>vllm-deploy-k8s</code> skill-ის შაბლონებსა და doronmak-ის chart-ს — სამივე ამ ფორმას იყენებს.</p>
+
+<h2>ლაბორატორია: ძრავის deploy</h2>
+
+<div class="lab">
+
+<div class="step">
+<h3>ჩატვირთე image კლასტერში</h3>
+<pre><code>kind load docker-image vllm-cpu:local --name llm-stack
+# verify it landed on a node:
+docker exec llm-stack-worker crictl images | grep vllm-cpu</code></pre>
+<p class="expect">მოსალოდნელია: vllm-cpu local სიაშია</p>
+</div>
+
+<div class="step">
+<h3>დაწერე მანიფესტები</h3>
+<p>შეინახე როგორც <code>k8s/vllm.yaml</code>:</p>
+<pre><code>apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: hf-cache
+  namespace: llm
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 10Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm
+  namespace: llm
+  labels: { app: vllm }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: vllm }
+  template:
+    metadata:
+      labels: { app: vllm }
+    spec:
+      containers:
+      - name: vllm
+        image: vllm-cpu:local
+        imagePullPolicy: IfNotPresent
+        args:
+          - "--model"
+          - "Qwen/Qwen3.5-0.8B"
+          - "--max-model-len"
+          - "4096"
+          - "--dtype"
+          - "bfloat16"
+        env:
+        - name: VLLM_CPU_KVCACHE_SPACE
+          value: "4"
+        ports:
+        - containerPort: 8000
+          name: http
+        resources:
+          requests: { cpu: "4", memory: 6Gi }
+          limits:   { cpu: "6", memory: 8Gi }
+        startupProbe:
+          httpGet: { path: /health, port: 8000 }
+          periodSeconds: 10
+          failureThreshold: 60
+        readinessProbe:
+          httpGet: { path: /health, port: 8000 }
+          periodSeconds: 10
+        livenessProbe:
+          httpGet: { path: /health, port: 8000 }
+          periodSeconds: 20
+          failureThreshold: 3
+        volumeMounts:
+        - name: hf-cache
+          mountPath: /root/.cache/huggingface
+        - name: dshm
+          mountPath: /dev/shm
+      volumes:
+      - name: hf-cache
+        persistentVolumeClaim: { claimName: hf-cache }
+      - name: dshm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 2Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm
+  namespace: llm
+spec:
+  selector: { app: vllm }
+  ports:
+  - port: 8000
+    targetPort: 8000</code></pre>
+<div class="note"><strong>რატომ /dev/shm?</strong>
+PyTorch shared memory-ს იყენებს პროცესთაშორისი ტენზორებისთვის; კონტეინერის default /dev/shm 64 MB-ია. ორივე reference რეპო Memory-backed emptyDir-ს ამაუნთებს. ზედმეტად პატარა shm = გაუგებარი კრაშები.</div>
+</div>
+
+<div class="step">
+<h3>Deploy და უყურე, როგორ ამართლებს startup probe თავის არსებობას</h3>
+<pre><code>kubectl apply -f k8s/vllm.yaml
+kubectl get pods -n llm -w</code></pre>
+<p>Pod რამდენიმე წუთი READY 0/1-ზე იჯდება (ჩამოტვირთვა + ჩატვირთვა). ეს startup probe-ია, რომელიც liveness-ს აკავებს. უყურე ძრავის მუშაობას:</p>
+<pre><code>kubectl logs -n llm -l app=vllm -f</code></pre>
+<p class="expect">მოსალოდნელია: საბოლოოდ "Application startup complete" → pod გადადის READY 1/1-ზე</p>
+</div>
+
+<div class="step">
+<h3>ჩატი კლასტერის გავლით</h3>
+<pre><code>kubectl port-forward -n llm svc/vllm 8000:8000</code></pre>
+<p>მეორე ტერმინალი:</p>
+<pre><code>curl -s localhost:8000/v1/chat/completions -H "Content-Type: application/json" \
+  -d '{"model":"Qwen/Qwen3.5-0.8B","messages":[{"role":"user","content":"You are running inside Kubernetes. How does that feel?"}],"max_tokens":80}' \
+  | python3 -m json.tool</code></pre>
+<p class="expect">მოსალოდნელია: Qwen პასუხობს — Pod-ის მიერ, Service-ის გავლით</p>
+</div>
+
+<div class="step">
+<h3>დაამტკიცე, რომ PVC მუშაობს</h3>
+<pre><code>kubectl delete pod -n llm -l app=vllm
+kubectl get pods -n llm -w</code></pre>
+<p class="expect">მოსალოდნელია: ახალი pod ბევრად სწრაფად ხდება READY — წონები PVC-დან იკითხება, ხელახლა ჩამოტვირთვა აღარ არის</p>
+<div class="win"><strong>მოგება</strong>
+Production-ის ფორმის inference სერვისი: დეკლარაციული, თვითაღდგენადი, persistent, probe-ებით დაცული. ეს YAML ფაილი შენი პორტფოლიო-რეპოს გულია — კურსში ყველაფერი დანარჩენი მის გარშემო ეწყობა.</div>
+</div>
+
+</div>
+
+<h2>შეამოწმე საკუთარი თავი</h2>
+<div class="quiz" data-quiz>
+  <div class="q">
+    <p class="stem">Pod აჩვენებს ImagePullBackOff-ს vllm-cpu:local-ისთვის. ყველაზე სავარაუდო მიზეზი?</p>
+    <button class="opt" data-correct>Image არასდროს ჩატვირთულა kind-ის node-ებში</button>
+    <button class="opt">Registry image-ის ჩამოტვირთვამდე ავტორიზაციას ითხოვს</button>
+    <button class="opt">PVC აკლია და კონტეინერი ვერ იწყება</button>
+    <p class="explain">მხოლოდ ლოკალური image-ები <code>kind load</code>-ით უნდა ჩაიტვირთოს. K8s გადადის registry-დან ჩამოტვირთვაზე, სადაც image არ არსებობს. PVC-ის პრობლემები სხვაგვარად ვლინდება (Pending / CreateContainerError).</p>
+  </div>
+  <div class="q">
+    <p class="stem">რატომ ვამაუნთებთ PVC-ს ზუსტად /root/.cache/huggingface-ზე?</p>
+    <button class="opt" data-correct>HF ბიბლიოთეკები ჩამოტვირთულ წონებს იქ ინახავენ cache-ში</button>
+    <button class="opt">vLLM-ს ჩაწერადი root home დირექტორია სჭირდება</button>
+    <button class="opt">K8s ერთ სტანდარტულ cache path-ს ავალდებულებს</button>
+    <p class="explain">ეს Hugging Face-ის cache-ის კონვენციაა. შეინახე ის მუდმივად და ნებისმიერი გადატვირთვა ან ახალი რეპლიკა ჩამოტვირთულ წონებს ხელახლა გამოიყენებს.</p>
+  </div>
+</div>
+
+<h2>პირველადი წყარო</h2>
+<p><a href="https://docs.vllm.ai/en/latest/deployment/k8s.html">vLLM docs — Using Kubernetes</a>, პლუს tutorial <a href="https://github.com/vllm-project/production-stack/blob/main/tutorials/03-load-model-from-pv.md">03-load-model-from-pv</a> production-stack-იდან (იგივე PVC პატერნი production მასშტაბზე).</p>
+
+<h2>შემდეგი</h2>
+<p><a href="0005-helm-package.html">გაკვეთილი 5</a>: ეს YAML უკვე 100 ხაზია და ფაზა 6-ს მისი ორი მოდელის ვარიანტი უნდა. Helm-ის დროა — templating და შეფუთვა.</p>
+
+<div class="lesson-footer">
+<p>Reference მასალები: <a href="../../reference/k8s-manifest-anatomy.html">manifest anatomy</a> · <a href="../../reference/vllm-cheatsheet.html">vLLM cheat sheet</a>.</p>
+<p>Pod გაიჭედა? <code>kubectl describe</code> + <code>kubectl logs</code>, შემდეგ output-ით მიმართე შენს მასწავლებელს.</p>
+</div>
+
+</div>
+<script src="../../assets/quiz.js"></script>
+</body>
+</html>

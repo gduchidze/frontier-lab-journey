@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="ka">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>გაკვეთილი 3 · ტრაფიკის კიდე: DNS, CDN, Load Balancing</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<div class="lesson">
+  <header class="lesson-header">
+    <p class="kicker">გაკვეთილი 0003 · ფაზა 1 — განაწილებული სისტემების საფუძვლები · <a href="0003-traffic-edge.html">English version</a></p>
+    <h1>ტრაფიკის კიდე: DNS, CDN, Load Balancing</h1>
+    <p class="dek">ყოველი მოთხოვნა სამ კარიბჭეს გადის, სანამ შენი კოდი გაეშვება — იცოდე, რას ხედავს თითოეული და რას ვერა.</p>
+  </header>
+
+  <div class="mission-tie">
+    <strong>მისიასთან კავშირი.</strong> Anthropic-ის ამოცანა <em>„დააპროექტე token-generation სერვისი, რომელიც უმკლავდება 100,000 მოთხოვნას წამში"</em> იწყება ბევრად ადრე, ვიდრე რომელიმე GPU გამოჩნდება: 100k RPS <em>ბევრ</em> მანქანაზე უნდა დაჯდეს, რაც ნიშნავს, რომ load balancer (დატვირთვის გამანაწილებელი) არის პირველი უჯრა, რომელსაც კლიენტის შემდეგ ხატავ. ინტერვიუერები ზუსტად აქ გსინჯავენ — L4 თუ L7? რომელი ალგორითმი? რა ხდება, როცა backend კვდება? ეს გაკვეთილი დასაცავ პასუხებს გაძლევს. (<a href="https://www.tryexponent.com/blog/anthropic-system-design-interview">Exponent-ის 2026 Anthropic გზამკვლევი</a>)
+  </div>
+
+  <h2>1 · მოგზაურობა: DNS წყვეტს, სად არის „იქ"</h2>
+  <p>სანამ შენი API-ის ერთი ბაიტიც გაეშვება, მოთხოვნა ამ გზას გადის:</p>
+  <pre><code>client → DNS (name → IP) → CDN edge (სტატიკურია? აქვე პასუხობს, მორჩა)
+                          → load balancer (VIP) → reverse proxy → app server</code></pre>
+  <p><strong>DNS</strong> თარგმნის <code>api.example.com</code>-ს IP მისამართად. ჩანაწერის (record) ტიპები, რომლებიც უნდა იცნო (<a href="https://github.com/donnemartin/system-design-primer#domain-name-system">Primer §7</a>):</p>
+  <table>
+    <tr><th>ჩანაწერი</th><th>ასახავს</th><th>ტიპური გამოყენება</th></tr>
+    <tr><td><strong>A</strong></td><td>სახელი → IPv4 მისამართი</td><td>მთავარი მუშახელი</td></tr>
+    <tr><td><strong>CNAME</strong></td><td>სახელი → სხვა სახელი</td><td>ალიასი <code>www</code>-სთვის ან CDN hostname-ისთვის</td></tr>
+    <tr><td><strong>NS</strong></td><td>ზონა → name server</td><td>განსაზღვრავს, ვინ პასუხობს დომენზე</td></tr>
+    <tr><td><strong>MX</strong></td><td>დომენი → mail server</td><td>ელფოსტის მარშრუტიზაცია</td></tr>
+  </table>
+  <p>მართული DNS (Route 53, Cloudflare) <em>მარშრუტიზაციასაც</em> აკეთებს და არა მხოლოდ ამოხსნას: <strong>weighted round-robin</strong> (გაუგზავნე 5% canary-ს), <strong>latency-based</strong> (უპასუხე RTT-ით ყველაზე ახლო რეგიონით), <strong>geolocation</strong> (EU მომხმარებლები → EU დატაცენტრი, კანონის ან სიახლოვის გამო). ერთი გაფრთხილება ყველას ეხება: DNS პასუხები <strong>TTL-ით იქეშება</strong>, ამიტომ DNS-დონის failover წუთებით ნელია — არასდროს იყოს შენი დაცვის პირველი ხაზი.</p>
+
+  <h2>2 · CDN: საერთოდ ნუ ამგზავრებ მოთხოვნას</h2>
+  <p>გაკვეთილი 0001-ის ცხრილი ამბობდა: ოკეანის round trip ~150 ms ღირს. <strong>CDN</strong> ამ რიცხვს იმით ჯობნის, რომ ოკეანეს საერთოდ არ კვეთს: სტატიკური კონტენტი (JS, სურათები, ვიდეო) მომხმარებელთან ახლო <strong>edge სერვერიდან</strong> მიეწოდება. კონტენტი edge-ზე ორი გზით ხვდება (<a href="https://github.com/donnemartin/system-design-primer#content-delivery-network">Primer §8</a>):</p>
+  <ul>
+    <li><strong>Push CDN</strong> — ფაილებს რელიზისას შენ ტვირთავ. სრული კონტროლი, პირველი მოთხოვნის აცდენა (miss) არ არსებობს; ერგება მცირე, იშვიათად ცვალებად ნაკრებებს. იხდი ყველგან შენახვაში — იმ ფაილებზეც, რომლებიც იმ რეგიონში არავის სჭირდება.</li>
+    <li><strong>Pull CDN</strong> — edge პირველ აცდენაზე origin-იდან იღებს კონტენტს და TTL-ით იქეშებს. ერგება კონტენტის გრძელ კუდებს; ფასი — ნელი პირველი მოთხოვნა და ვადის გასვლამდე მოძველებული (stale) კონტენტი.</li>
+  </ul>
+  <p>რა ეკუთვნის CDN-ს: ყველაფერი სტატიკური და საზიარო. რა არა: პერსონალიზებული ან სწრაფად ცვალებადი პასუხები. და CDN უფასო არ არის — იხდი გატანილ (egress) GB-ებში, ხოლო ქეშის <strong>ინვალიდაცია</strong> (გასწორებული JS bundle-ის <em>ახლავე</em> მიწოდება) კლასიკური საოპერაციო თავის ტკივილია: ფაილების URL-ებს ვერსია დაურთე, purge-ს ნუ ენდობი.</p>
+
+  <h2>3 · Load balancer: L4 vs L7 და ალგორითმები</h2>
+  <p><strong>Load balancer</strong> შემომავალ მოთხოვნებს იდენტურ app სერვერებზე ანაწილებს. პირველი გადაწყვეტილება — რომელ ფენაზე (layer) მუშაობს (<a href="https://github.com/donnemartin/system-design-primer#load-balancer">Primer §9</a>):</p>
+  <table>
+    <tr><th></th><th>L4 (transport)</th><th>L7 (application)</th></tr>
+    <tr><td>ხედავს</td><td>მხოლოდ IP-ებს და პორტებს</td><td>სრულ HTTP-ს: path, headers, cookies</td></tr>
+    <tr><td>ფასი</td><td>იაფი, მილიონობით კავშირი</td><td>TLS-ს ხსნის, HTTP-ს არჩევს — მეტი CPU</td></tr>
+    <tr><td>გაძლევს</td><td>სუფთა სიჩქარეს</td><td><code>/video</code> და <code>/api</code> სხვადასხვა pool-ში</td></tr>
+  </table>
+  <p>რომელი backend მიიღებს მოთხოვნას:</p>
+  <ul>
+    <li><strong>Round-robin</strong> — რიგში შემდეგი სერვერი. სამართლიანი <em>რაოდენობით</em>.</li>
+    <li><strong>Weighted</strong> — დიდი მანქანები პროპორციულად მეტს იღებენ.</li>
+    <li><strong>Least-connections</strong> — აირჩიე სერვერი ყველაზე ცოტა მიმდინარე (in-flight) მოთხოვნით. სამართლიანი <em>მიმდინარე დატვირთვით</em>.</li>
+    <li><strong>IP-hash / sticky sessions</strong> — ერთი კლიენტი ყოველთვის ერთსა და იმავე სერვერს ხვდება, ამიტომ მეხსიერებაში ჩარჩენილი სესია ცოცხლობს.</li>
+  </ul>
+  <p>Stickiness (მიწებება) ხაფანგია: სერვერებს „ფიფქებად" აქცევს — ერთი მოკვდება და მისი მომხმარებლების სესიებიც მასთან ერთად კვდება, ცხელი კლიენტები კი ცხელ სერვერებს ქმნიან. მოწიფული ნაბიჯი არის <strong>stateless</strong> სერვისი Redis-ში გატანილი სესიებით: ნებისმიერ სერვერს შეუძლია ნებისმიერი მოთხოვნის მომსახურება. ეს statelessness (პლუს <strong>shared-nothing</strong> — არავითარი ლოკალური მდგომარეობა, რომელიც მეზობელს დასჭირდებოდა) საერთოდაც ჰორიზონტალური მასშტაბირების წინაპირობაა: „კიდევ სერვერების დამატება" მხოლოდ მაშინ მუშაობს, თუ სერვერები ურთიერთჩანაცვლებადია.</p>
+
+  <h2>4 · ჩავარდნა კიდეზე: health checks და LB წყვილი</h2>
+  <p>Balancer-ი თავის ფასს მაშინ ამართლებს, როცა backend კვდება. ის ყოველ სერვერს სინჯავს (<strong>health checks</strong>: HTTP <code>GET /health</code> რამდენიმე წამში ერთხელ); <em>N</em> ზედიზედ ჩავარდნის შემდეგ backend როტაციიდან გადის, ერთი გავლილი შემოწმება კი უკან აბრუნებს. აღმოჩენის დრო ≈ <code>interval × N</code> — დაამოკლებ და failover აჩქარდება, მაგრამ ჯანმრთელი-მაგრამ-წამიერად-ნელი სერვერის გაგდებას რისკავ; გაზრდი და მომხმარებლები შეცდომებს უფრო დიდხანს ჭამენ. უფასო პარამეტრი არ არსებობს — მხოლოდ არჩეული გაცვლა.</p>
+  <p>მაგრამ ახლა თავად load balancer-ია <strong>single point of failure</strong> (ჩავარდნის ერთი წერტილი). სტანდარტული პასუხი: LB-ები <strong>წყვილში</strong> — active–passive heartbeat-ით და მოძრავი (floating) IP-ით, რომელსაც გადარჩენილი იჩემებს, ან active–active DNS-ის უკან. ინტერვიუზე წინადადება „და LB წყვილშია, ასე რომ SPOF აღარ არის" ერთი წინადადებაა, რომელიც აჩვენებს, რომ ჩავარდნაზე ავტომატურად ფიქრობ.</p>
+
+  <h2>5 · რატომ ამტვრევს LLM serving-ი round-robin-ს</h2>
+  <p>აქ არის AI შემობრუნება, რომელზეც ფაზა 4 აშენდება. ვებ-მოთხოვნები დაახლოებით ერთგვაროვანია; LLM მოთხოვნები — არა: ერთი 100 ტოკენს ითხოვს, მეორე 10,000-ს — <strong>100× განსხვავება სამუშაოში</strong>, რომელიც იდენტურად გამომზირალ HTTP გამოძახებებს უკან იმალება. Round-robin მოთხოვნების <em>რაოდენობას</em> ათანაბრებს, ამიტომ ერთი უიღბლო GPU გრძელ გენერაციებს აგროვებს, მისი რიგი იზრდება და TTFT p99 ფეთქდება, სანამ მეზობლები უსაქმოდ დგანან. Inference gateway-ები ამიტომ ამარშრუტებენ <strong>least outstanding requests</strong>-ით (least-connections-ის ბიძაშვილი) ან serving engine-იდან წამოსული უფრო ღრმა <strong>queue-depth-aware</strong> სიგნალებით — მოგვიანებით კი prefix-cache-aware მარშრუტიზაციითაც. ამ ინტუიციას ქვემოთ, ლაბში, საკუთარი ხელით ააწყობ, ნამდვილს კი ფაზა 4-ში დააპროექტებ.</p>
+
+  <h2>6 · ლაბი — გაუშვი შენი საკუთარი load balancer</h2>
+  <div class="callout"><span class="label">პრაქტიკა (ქვიზამდე გააკეთე)</span>
+    <code>labs/lab-0003-toy-load-balancer/</code>-ში: <code>python3 toy_lb.py --demo</code> უშვებს სამ
+    ნამდვილ HTTP backend-ს პლუს balancer-ს health check-ებით, აგზავნის 30 მოთხოვნას, ბეჭდავს
+    განაწილებას backend-ების მიხედვით — შემდეგ კი შუა პროცესში კლავს ერთ backend-ს, რომ failover
+    შენი თვალით ნახო. შემდეგ README-ს E1–E4 სავარჯიშოები: <em>იწინასწარმეტყველე, შეცვალე კონფიგი,
+    გაუშვი თავიდან, შეადარე.</em> E1/E2 მე-5 სექციის round-robin-vs-least-connections ისტორიას
+    შენივე რიცხვებით იმეორებს.
+  </div>
+
+  <h2>7 · პროექტის ნაბიჯი</h2>
+  <p>ვუბრუნდებით ხერხემალ-პროექტს — <strong>LLM inference gateway</strong>-ს. გადაწყვიტე მისი load-balancing სტრატეგია — L4 თუ L7 და რომელი ალგორითმი — და დაწერე <em>ერთი წინადადება</em>, რომელიც არჩევანს მე-5 სექციის შერეული 100-ტოკენიანი/10k-ტოკენიანი დატვირთვის წინააღმდეგ დაიცავს. (დასაცავი მაგალითი: „L7 least-outstanding-requests-ით, რადგან ტოკენების რაოდენობა მოთხოვნების რაოდენობას აზრს უკარგავს და <code>/v1/messages</code> vs <code>/health</code>-სთვის path-ზე დაფუძნებული მარშრუტიზაცია გვჭირდება.") მოიტანე შენი წინადადება შემდეგ სესიაზე; მასწავლებელი მას შეუტევს.</p>
+
+  <h2>შეამოწმე შენი თავი</h2>
+  <div class="quiz" id="quiz"></div>
+
+  <h2>ძირითადი წყარო</h2>
+  <p>წაიკითხე <strong>System Design Primer, სექციები 7–10</strong>: <a href="https://github.com/donnemartin/system-design-primer#domain-name-system">DNS</a>, <a href="https://github.com/donnemartin/system-design-primer#content-delivery-network">CDN</a>, <a href="https://github.com/donnemartin/system-design-primer#load-balancer">Load balancer</a> და <a href="https://github.com/donnemartin/system-design-primer#reverse-proxy-web-server">Reverse proxy</a>. ყოველი სექცია „disadvantages" სიით მთავრდება — ეს სიები საინტერვიუო ოქროა.</p>
+
+  <footer class="lesson-footer">
+    <p><strong>გაიჭედე ან გაინტერესებს?</strong> ჰკითხე მასწავლებელს (აგენტს) ნებისმიერი რამ — „როდის დავაყენებდი L4 balancer-ს L7-ის <em>წინ</em>?" შესანიშნავი დამატებითი კითხვაა.</p>
+    <nav class="lesson-nav">
+      <a href="0002-back-of-envelope.html">◀ წინა: 0002 · Back-of-Envelope სავარჯიშოები</a>
+      <a href="0004-cap-and-replication.html">შემდეგი: 0004 · CAP და რეპლიკაცია ▶</a>
+    </nav>
+  </footer>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+renderQuiz(document.getElementById('quiz'), {
+  title: 'შეამოწმე შენი თავი',
+  questions: [
+    {
+      q: 'api.example.com ყოველთვის იქ უნდა იხსნებოდეს, სადაც example.com მიუთითებს — IP-ის კოპირების გარეშე. რომელი ჩანაწერი?',
+      options: [
+        'A ჩანაწერი, რომელიც იმეორებს IPv4 მისამართს',
+        'CNAME ჩანაწერი, რომელიც api-ს example.com-ზე ამისამართებს',
+        'NS ჩანაწერი, რომელიც api ქვედომენს გადასცემს',
+      ],
+      answer: 1,
+      explain: 'CNAME ასახავს სახელს → სახელზე, ამიტომ api ავტომატურად მიჰყვება example.com-ს, როცა მისი IP იცვლება. დუბლირებული A ჩანაწერი დროთა განმავლობაში მოძველდება; NS უფლებამოსილებას გადასცემს და არა ალიასს.',
+    },
+    {
+      q: 'საიტი ემსახურება იშვიათად მოთხოვნადი სურათების უზარმაზარ გრძელ კუდს. რომელი CDN რეჟიმი ერგება საუკეთესოდ?',
+      options: [
+        'Pull CDN, რომელიც კონტენტს პირველ მოთხოვნაზე ეზიდება',
+        'Push CDN, რომელიც ყველა ფაილს წინასწარ ტვირთავს',
+        'CDN-ის გარეშე, ყველა სურათი პირდაპირ origin-იდან მოდის',
+      ],
+      answer: 0,
+      explain: 'Pull მხოლოდ იმას იქეშებს, რასაც მომხმარებლები რეალურად ითხოვენ, ცივ ობიექტებს კი TTL-ები აძევებენ. Push მთელი გრძელი კუდის შენახვაში გადაიხდიდა ყოველ edge-ზე — უმეტესად ტყუილად.',
+    },
+    {
+      q: 'რისი დათვალიერება შეუძლია L7 load balancer-ს, რაც L4 balancer-ს არ შეუძლია?',
+      options: [
+        'მხოლოდ წყაროს IP მისამართი და დანიშნულების პორტი',
+        'არაფერი ზედმეტი; ორივე ფენა იდენტურ მონაცემებს ხედავს',
+        'HTTP ჰედერები, URL გზები და cookie-ების შიგთავსი',
+      ],
+      answer: 2,
+      explain: 'L4 პაკეტებს ხედავს: IP-ებს და პორტებს. L7 კავშირს ხსნის და თავად HTTP მოთხოვნას კითხულობს — კონტენტზე დაფუძნებულ მარშრუტიზაციას ყიდულობს მოთხოვნაზე მეტი CPU-ს ფასად.',
+    },
+    {
+      q: 'რატომ ჯობს stateless სერვისები Redis-ში სესიებით sticky sessions-ს?',
+      options: [
+        'ნებისმიერი სერვერი ემსახურება ნებისმიერ მოთხოვნას, ამიტომ მასშტაბირება მუშაობს',
+        'Redis ყოველთვის უფრო სწრაფია, ვიდრე სერვერის ლოკალური მეხსიერება',
+        'Sticky sessions ტრაფიკს უფრო ცუდად შიფრავს, ვიდრე stateless',
+      ],
+      answer: 0,
+      explain: 'მოგება ურთიერთჩანაცვლებადობაა: სერვერების დამატება, მოხსნა ან სიკვდილი სესიებს აღარ კარგავს. Redis სინამდვილეში ქსელური hop-ია — ლოკალურ მეხსიერებაზე ნელი — ასე რომ სარგებელი ელასტიურობაა და არა სიჩქარე.',
+    },
+    {
+      q: 'Backend-მა N ზედიზედ health check ჩააგდო. რას აკეთებს balancer-ი?',
+      options: [
+        'დაუყოვნებლივ გადატვირთავს ჩავარდნილ backend პროცესს SSH-ის მეშვეობით',
+        'აგდებს მას როტაციიდან, სანამ შემოწმებები ისევ გაივლის',
+        'აგრძელებს ტრაფიკის გაგზავნას და კლიენტებს შეცდომებს უბრუნებს',
+      ],
+      answer: 1,
+      explain: 'Health check-ები მხოლოდ როტაციის წევრობას მართავს: LB ჩავარდნილ backend-თან მარშრუტიზაციას წყვეტს და უკან იღებს, როცა შემოწმება გაივლის. პროცესის შეკეთება სხვისი საქმეა.',
+    },
+    {
+      q: 'რატომ უშვებს naive round-robin შეცდომას LLM inference backend-ებზე?',
+      options: [
+        'GPU სერვერებს მხოლოდ ერთი მოთხოვნის დამუშავება შეუძლიათ',
+        'Round-robin ვერ ხედავს DNS ქეშირებას კლიენტის მხარეს',
+        'მოთხოვნები ღირებულებით ძალიან განსხვავდება, ამიტომ რაოდენობა გვატყუებს',
+      ],
+      answer: 2,
+      explain: '10,000-ტოკენიანი გენერაცია GPU-ს ~100-ჯერ დიდხანს იკავებს, ვიდრე 100-ტოკენიანი. მოთხოვნების თანაბარი რაოდენობა თანაბარი სამუშაო არ არის — აქედან least-outstanding-requests და queue-depth-aware მარშრუტიზაცია.',
+    },
+  ],
+});
+</script>
+</body>
+</html>

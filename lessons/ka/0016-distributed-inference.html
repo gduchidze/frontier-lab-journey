@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="ka">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>გაკვეთილი 16 — განაწილებული და დისაგრეგირებული Inference</title>
+<link rel="stylesheet" href="../../assets/course.css">
+</head>
+<body>
+<div class="page">
+<p class="lang-switch"><a href="../0016-distributed-inference.html">🇬🇧 English</a></p>
+
+<p class="lesson-kicker">SLM Production Stack · გაძლიერებული · გაკვეთილი 16 · ~2 სთ (თეორია + დიზაინის ლაბორატორია)</p>
+<h1>განაწილებული და დისაგრეგირებული Inference</h1>
+<p class="lesson-lede">როცა მოდელი ერთ GPU-ს გადააჭარბებს — ან დატვირთვა ერთ არქიტექტურას — serving განაწილებული სისტემების პრობლემად იქცევა. ეს ის გაკვეთილია, რომელსაც ინტერვიუერები მაშინ იშველიებენ, როცა ვაკანსიაში „senior" წერია. ძირითადად თეორია + ტევადობის მათემატიკა; შენი შედეგი დიზაინის დოკუმენტია.</p>
+
+<h2>ცოდნა</h2>
+
+<h3>1. მეხსიერების მათემატიკა, რომელიც ამ ყველაფერს გვაიძულებს</h3>
+<pre><code>weights ≈ params × bytes/param        70B @ bf16 ≈ 140 GB   → no single GPU
+KV/token ≈ 2 × layers × kv_heads × head_dim × bytes
+   Llama-70B bf16 ≈ ~320 KB/token → 8k-ctx request ≈ ~2.6 GB of KV — EACH</code></pre>
+<p>წონები არ ეტევა → გაყავი მოდელი. KV cache მასშტაბზე დომინირებს → cache პირველი რანგის განაწილებულ რესურსად იქცევა. ქვემოთ მოცემული ყველა არქიტექტურა ამ ორი ძალიდან ერთ-ერთია.</p>
+
+<h3>2. Parallelism-ის ზოოპარკი</h3>
+<table>
+<tr><th>ტიპი</th><th>რა იყოფა</th><th>კომუნიკაციის ნიმუში</th><th>როდის გამოიყენო</th></tr>
+<tr><td><strong>TP</strong> tensor</td><td>თითოეული ფენის შიგნით (attn heads, matmul shards)</td><td>All-reduce ყოველ ფენაზე → სჭირდება NVLink; მხოლოდ კვანძის შიგნით</td><td>მოდელი &gt; 1 GPU; ნაგულისხმევი (<code>--tensor-parallel-size</code> = GPUs/node)</td></tr>
+<tr><td><strong>PP</strong> pipeline</td><td>ფენების დიაპაზონები → საფეხურები</td><td>აქტივაციები საფეხურების საზღვრებზე — იაფი, კვანძებს შორისაც მუშაობს</td><td>მოდელი &gt; 1 კვანძი: TP კვანძის შიგნით × PP კვანძებს შორის</td></tr>
+<tr><td><strong>DP</strong> data</td><td>არაფერი — სრული რეპლიკები</td><td>არავითარი (router-ი)</td><td>Throughput. მე-6 გაკვეთილის შენი სტეკი სწორედ DP-ია</td></tr>
+<tr><td><strong>EP</strong> expert</td><td>MoE ექსპერტები GPU-ებზე</td><td>All-to-all ტოკენების მარშრუტიზაცია</td><td>Mixtral/DeepSeek-ის კლასის MoE</td></tr>
+</table>
+<p>კომბინირების ემპირიული წესი: TP 8-მდე (ერთი კვანძი), შემდეგ PP კვანძებს შორის, შემდეგ DP რეპლიკები throughput-ისთვის. მრავალკვანძიან კოორდინაციას Ray უზრუნველყოფს. PP-ის გადასახადი: pipeline-ის <em>ბუშტები</em> (bubbles) — საფეხურები უქმად დგანან ლოდინისას; microbatching ამცირებს მათ, მაგრამ ვერასდროს აქრობს. (<a href="https://docs.vllm.ai/en/latest/serving/parallelism_scaling.html">docs</a>)</p>
+
+<h3>3. Disaggregated prefill: გაყავი ორი დატვირთვა სხვადასხვა რკინაზე</h3>
+<p>მე-15 გაკვეთილის დაძაბულობა (prefill ხელს უშლის decode-ს) არქიტექტურად იზრდება: <strong>prefill ინსტანსები</strong> (გამოთვლებზე ოპტიმიზებული) ამუშავებენ პრომპტებს, შემდეგ KV-ს გზავნიან <strong>decode ინსტანსებზე</strong> (გამტარუნარიანობაზე ოპტიმიზებული) KV-transfer კონექტორით (NIXL, Mooncake, LMCache). მოგება: ორი ფაზის დამოუკიდებელი მასშტაბირება, მკაცრი TPOT SLO-ები prefill-ის რყევის გარეშე, სწორი აპარატურა თითო ფაზაზე. ფასი: KV-ის გადაზიდვის latency + scheduler-ი, რომელმაც ორივე ნახევარი უნდა განათავსოს. ეს არის production-stack-ის „disaggregated prefill" roadmap-ის ხაზი და DeepSeek/Mooncake-ის სტილის serving-ის უკან მდგარი არქიტექტურა. (<a href="https://docs.vllm.ai/en/latest/features/disagg_prefill/">docs</a>)</p>
+
+<h3>4. KV იერარქია: cache როგორც ინფრასტრუქტურა</h3>
+<p><a href="https://github.com/LMCache/LMCache">LMCache</a> (production-stack-ის და-პროექტი) KV-ს იარუსებად ალაგებს: GPU HBM → CPU RAM → ლოკალური დისკი → დაშორებული საცავი. გრძელი system prompt-ები, RAG კონტექსტები და მრავალსვლიანი ისტორიები ერთხელ ითვლება და ნებისმიერ ადგილას ხელახლა ერთვება. დაუმატე router-ის session/prefix ცნობიერება (გაკვეთილი 6) და კლასტერი გამოთვლილი attention-ის CDN-ივით იწყებს ქცევას. production-stack-ის Tutorial 05 ზუსტად ამას აწყობს.</p>
+
+<h3>5. მტყუნების დომენები ტოპოლოგიასთან ერთად იზრდება</h3>
+<p>DP რეპლიკა კვდება → router-ი აგდებს მას, ტევადობა −1/N (ეს მე-8 გაკვეთილში აჩვენე). TP shard-ი კვდება → მთელი ის რეპლიკა კვდება (all-reduce-ს ყველა rank-ი სჭირდება). PP საფეხური კვდება → pipeline მკვდარია. Disagg prefill კვდება → TTFT უარესდება, მაგრამ decode ბოლომდე მიდის. სენიორული დიზაინი = აფეთქების რადიუსის (blast radius) ჩამოყალიბება თითო მტყუნებაზე მანამ, სანამ ის მოხდება.</p>
+
+<h2>ლაბორატორია (labs/lab-16): ტევადობის მათემატიკა + დიზაინის დოკუმენტი</h2>
+<p>ქაღალდის ლაბორატორია — შედეგები არის ის, რაც „წაკითხული მაქვს"-ს „დაპროექტება შემიძლია"-სგან განასხვავებს.</p>
+<div class="lab">
+<div class="step"><h3>სამუშაო ფურცელი: სამი ზომის ამოცანა</h3><p><code>docs/distributed-design.md</code>-ში აჩვენე შენი არითმეტიკა: (a) Llama-3.1-70B bf16 H100-80GB-ზე — მინიმალური TP წონებისთვის + KV-ის თავისუფალი ადგილი 8k ctx × 32 კონკურენტულზე; (b) იგივე fp8 წონებით + fp8 KV-ით — რა მცირდება, რა არის ახლა შემზღუდავი ფაქტორი; (c) 405B კვანძებზე — TP×PP განლაგება და სად გვტკივა ბუშტები.</p></div>
+<div class="step"><h3>წაიკითხე ნამდვილი</h3><p>production-stack-ის <a href="https://github.com/vllm-project/production-stack/blob/main/tutorials/05-offload-kv-cache.md">tutorial 05 (KV offloading)</a> + router-ის KV-aware routing-ის ჩანაწერები. შენს დოკუმენტში თითოეული config ბლოკი ამ გაკვეთილის ცნებას შეუსაბამე.</p></div>
+<div class="step"><h3>დიზაინი: ინტერვიუს კითხვა</h3><p>იმავე დოკუმენტში, ბოლო სექცია: „ჩატის პროდუქტი, 30k კონკურენტული მომხმარებელი, 8k საშუალო კონტექსტი, მკაცრი TPOT SLO, H100-ის ბიუჯეტი არსებობს. მონოლითური DP ფლოტი vs დისაგრეგირებული P/D — აირჩიე, დაასაბუთე, ჩამოაყალიბე blast radius-ები და ის მეტრიკები, რომლებიც გეტყოდა, რომ არასწორად აირჩიე." ერთი გვერდი, მკაფიო პოზიციით.</p></div>
+<div class="step"><h3>დაიცავი</h3><p>სთხოვე მასწავლებელს, შეუტიოს დოკუმენტს. ერთხელ გადაამუშავე. (არასავალდებულო cloud სესია: იქირავე 2×A10 ერთი საათით, გაუშვი ნამდვილი TP=2 — დაგეგმვა მასწავლებელს სთხოვე.)</p></div>
+</div>
+
+<h2>შეამოწმე თავი</h2>
+<div class="quiz" data-quiz>
+  <div class="q">
+    <p class="stem">რატომ რჩება TP ერთი კვანძის შიგნით, სანამ PP კვანძებს კვეთს?</p>
+    <button class="opt" data-correct>TP ყოველ ფენაზე აკეთებს all-reduce-ს და NVLink სჭირდება</button>
+    <button class="opt">PP წონებს TP-ზე წვრილად ანაწილებს</button>
+    <button class="opt">Ray TP-ს მხოლოდ ერთეულ ჰოსტებზე გეგმავს</button>
+    <p class="explain">TP ყოველ ფენაზე სინქრონდება — ჭერი interconnect-ის გამტარუნარიანობაა, ამიტომ NVLink-ის კლასის ბმულები ან არაფერი. PP აქტივაციებს მხოლოდ საფეხურების საზღვრებზე გადასცემს; ამას Ethernet-იც უძლებს.</p>
+  </div>
+  <div class="q">
+    <p class="stem">Disaggregated prefill-ის მთავარი ეკონომიკური მოგება?</p>
+    <button class="opt" data-correct>პრომპტისა და ტოკენების ტევადობის დამოუკიდებელი მასშტაბირება</button>
+    <button class="opt">ჯამური მეხსიერების განახევრება KV-ის გაზიარებით</button>
+    <button class="opt">Router-ის ამოღება ცხელი გზიდან</button>
+    <p class="explain">Prefill-ის მოთხოვნა (prompt tokens/s) და decode-ის მოთხოვნა (კონკურენტული ნაკადები) დამოუკიდებლად მოძრაობს; ცალკეული პულები საშუალებას გაძლევს, თითოეულისთვის სწორი აპარატურა იყიდო და ურთიერთხელშეშლა შეწყვიტო.</p>
+  </div>
+  <div class="q">
+    <p class="stem">TP=8 რეპლიკაში ერთი GPU კვდება. მყისიერი ეფექტი?</p>
+    <button class="opt" data-correct>მთელი რეპლიკა გამორთულია გადაგეგმვამდე</button>
+    <button class="opt">შვიდი GPU აგრძელებს შემცირებული throughput-ით</button>
+    <button class="opt">მოთხოვნები გენერაციის შუაში მეზობლებზე გადამისამართდება</button>
+    <p class="explain">All-reduce-ს ყველა rank-ი სჭირდება — TP ერთი მტყუნების დომენია. მასზე მიმდინარე გენერაციები იკარგება (router-ი ახლებს სხვაგან ცდის). ტევადობა N-1 რეპლიკის გათვალისწინებით დააპროექტე.</p>
+  </div>
+</div>
+
+<h2>პირველწყარო</h2>
+<p><a href="https://docs.vllm.ai/en/latest/serving/parallelism_scaling.html">vLLM — Parallelism and Scaling</a> + <a href="https://docs.vllm.ai/en/latest/features/disagg_prefill/">disaggregated prefill</a>. ამბიციურთათვის: Mooncake-ის სტატია (prefill/decode-ის გაყოფა ინდუსტრიულ მასშტაბზე).</p>
+
+<h2>შემდეგი</h2>
+<p><a href="0017-sre-inference.html">გაკვეთილი 17</a>: ექსპლუატაცია — SLO-ები, burn rate ალერტები, runbook-ები და chaos day საკუთარი სტეკის წინააღმდეგ.</p>
+
+<div class="lesson-footer"><p><a href="index.html">კურსის მთავარი</a> · ლაბორატორია: <code>labs/lab-16/</code></p></div>
+</div>
+<script src="../../assets/quiz.js"></script>
+</body>
+</html>

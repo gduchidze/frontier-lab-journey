@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="ka">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>გაკვეთილი 5 — Helm: შეფუთე სტეკი</title>
+<link rel="stylesheet" href="../../assets/course.css">
+</head>
+<body>
+<div class="page">
+<p class="lang-switch"><a href="../0005-helm-package.html">🇬🇧 English</a></p>
+
+<p class="lesson-kicker">SLM Production Stack · გაკვეთილი 5 · ფაზა 5 · ~90 წთ</p>
+<h1>Helm: შეფუთე სტეკი</h1>
+<p class="lesson-lede">შენი vLLM YAML მუშაობს, მაგრამ ეს copy-paste ინფრასტრუქტურაა. Helm მანიფესტებს აქცევს პარამეტრიზებულ, ვერსიონირებულ, დაინსტალირებად პაკეტად — ზუსტად ისე, როგორც ორივე საორიენტაციო რეპოზიტორია ვრცელდება, და ისე, როგორც შემდეგ გაკვეთილზე Prometheus-სა და Grafana-ს დააინსტალირებ.</p>
+
+<h2>ცოდნა: Helm ოთხ იდეაში</h2>
+
+<h3>1. Chart = templates + values</h3>
+<p><strong>chart</strong> (ჩარტი — Helm-ის პაკეტი) არის დირექტორია: <code>Chart.yaml</code> (სახელი, ვერსია), <code>values.yaml</code> (სამართავი პარამეტრები), <code>templates/</code> (მანიფესტები <code>{{ .Values.* }}</code> ჩასასმელი ადგილებით). <code>helm install</code> ახდენს template-ების რენდერს values-ით და შედეგს იყენებს კლასტერზე. (<a href="https://helm.sh/docs/topics/charts/">დოკუმენტაცია</a>)</p>
+
+<h3>2. Values შენი ინფრასტრუქტურის საჯარო API-ა</h3>
+<p>ნახე, როგორ ააშკარავებენ პროფესიონალები სამართავ პარამეტრებს — doronmak-ის <code>values.yaml</code>:</p>
+<pre><code>vllm:
+  replicaCount: 1
+  image: { repository: doronmak/vllm-cpu-image, tag: latest }
+  model: { name: facebook/opt-125m, dtype: auto }
+  resources: { limits: { memory: 10Gi, cpu: "4" } }
+  env:
+    VLLM_TARGET_DEVICE: "cpu"
+    VLLM_CPU_KVCACHE_SPACE: "5"</code></pre>
+<p>და production-stack-ის <code>modelSpec</code> სია — თითო ჩანაწერი თითო მოდელზე, თითოეულს აქვს <code>replicaCount</code>, <code>requestCPU/GPU</code>, <code>pvcStorage</code>. იგივე იდეაა, ინდუსტრიული მასშტაბით. კარგი <code>values.yaml</code> არის სწორედ ის, რაც სადემონსტრაციო chart-ს საწარმოო chart-ისგან განასხვავებს.</p>
+
+<h3>3. Release-ები მდგომარეობის მქონე ინსტალაციებია</h3>
+<p><strong>release</strong> (რელიზი — დაინსტალირებული ჩარტის ეგზემპლარი) = chart + values, დაინსტალირებული კონკრეტული სახელით. <code>helm upgrade</code> ადარებს განსხვავებებს და იყენებს მათ; <code>helm rollback</code> აბრუნებს უკან; <code>helm history</code> აჩვენებს ყველა რევიზიას. ვერსიონირებული ინფრასტრუქტურული ცვლილებები — ოქროს თემა გასაუბრებაზე.</p>
+
+<h3>4. რენდერი გამოყენებამდე — დებაგინგის სუპერძალა</h3>
+<p><code>helm template .</code> ლოკალურად ახდენს რენდერს კლასტერზე შეხების გარეშე. chart გატყდა? ნახე, რას <em>რეალურად აგენერირებს</em>. ამას მუდმივად გამოიყენებ.</p>
+
+<h2>ლაბორატორია: გადაიყვანე შენი vLLM სტეკი chart-ში</h2>
+
+<div class="lab">
+
+<div class="step">
+<h3>დააგენერირე კარკასი და გაასუფთავე</h3>
+<pre><code>cd ~/PycharmProjects/AI/llm-infra-playground
+helm create charts/slm-stack
+rm -rf charts/slm-stack/templates/*        # keep the scaffold structure, write our own templates
+ls charts/slm-stack</code></pre>
+<p class="expect">მოსალოდნელია: Chart.yaml  charts/  templates/  values.yaml</p>
+</div>
+
+<div class="step">
+<h3>განსაზღვრე values</h3>
+<p>ჩაანაცვლე <code>charts/slm-stack/values.yaml</code>:</p>
+<pre><code>namespace: llm
+
+vllm:
+  replicaCount: 1
+  image:
+    repository: vllm-cpu
+    tag: local
+    pullPolicy: IfNotPresent
+  model:
+    name: Qwen/Qwen3.5-0.8B
+    maxModelLen: 4096
+    dtype: bfloat16
+  kvCacheSpaceGiB: 4
+  resources:
+    requests: { cpu: "4", memory: 6Gi }
+    limits:   { cpu: "6", memory: 8Gi }
+  pvc:
+    size: 10Gi
+  service:
+    port: 8000</code></pre>
+</div>
+
+<div class="step">
+<h3>გადაიყვანე Deployment template-ად</h3>
+<p>შექმენი <code>charts/slm-stack/templates/vllm-deployment.yaml</code> შენი <code>k8s/vllm.yaml</code>-ის კონვერტაციით. პატერნი ასეთია — ყოველი მყარად ჩაწერილი მნიშვნელობა ხდება მითითება:</p>
+<pre><code>apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm
+  namespace: {{ .Values.namespace }}
+  labels: { app: vllm }
+spec:
+  replicas: {{ .Values.vllm.replicaCount }}
+  selector:
+    matchLabels: { app: vllm }
+  template:
+    metadata:
+      labels: { app: vllm }
+    spec:
+      containers:
+      - name: vllm
+        image: "{{ .Values.vllm.image.repository }}:{{ .Values.vllm.image.tag }}"
+        imagePullPolicy: {{ .Values.vllm.image.pullPolicy }}
+        args:
+          - "--model"
+          - {{ .Values.vllm.model.name | quote }}
+          - "--max-model-len"
+          - {{ .Values.vllm.model.maxModelLen | quote }}
+          - "--dtype"
+          - {{ .Values.vllm.model.dtype | quote }}
+        env:
+        - name: VLLM_CPU_KVCACHE_SPACE
+          value: {{ .Values.vllm.kvCacheSpaceGiB | quote }}
+        ports:
+        - containerPort: 8000
+        resources:
+          {{- toYaml .Values.vllm.resources | nindent 10 }}
+        startupProbe:
+          httpGet: { path: /health, port: 8000 }
+          periodSeconds: 10
+          failureThreshold: 60
+        readinessProbe:
+          httpGet: { path: /health, port: 8000 }
+          periodSeconds: 10
+        livenessProbe:
+          httpGet: { path: /health, port: 8000 }
+          periodSeconds: 20
+          failureThreshold: 3
+        volumeMounts:
+        - { name: hf-cache, mountPath: /root/.cache/huggingface }
+        - { name: dshm, mountPath: /dev/shm }
+      volumes:
+      - name: hf-cache
+        persistentVolumeClaim: { claimName: hf-cache }
+      - name: dshm
+        emptyDir: { medium: Memory, sizeLimit: 2Gi }</code></pre>
+<p>შემდეგ იმავე პრინციპით შექმენი <code>templates/vllm-service.yaml</code> და <code>templates/vllm-pvc.yaml</code> (პორტი და ზომა values-იდან). თუ დაეჭვდები, ჩახედე <a href="https://github.com/doronmak/VLLM-Kubernetes-Deployment/tree/main/charts/vllm-demo/templates">doronmak-ის template-ებს</a> — ეს იგივე კონვერტაციაა.</p>
+</div>
+
+<div class="step">
+<h3>ჯერ ლოკალური რენდერი, მერე ინსტალაცია</h3>
+<pre><code>helm template charts/slm-stack | less     # inspect generated YAML — find your values in it
+
+# replace the raw-YAML deploy with the chart-managed release:
+kubectl delete -f k8s/vllm.yaml
+helm install slm charts/slm-stack
+helm list
+kubectl get pods -n llm -w</code></pre>
+<p class="expect">მოსალოდნელია: release slm deployed; vllm Pod-ი READY 1/1 სწრაფად (PVC-მ შეინახა წონები? არა — ახალი PVC სახელი ხელახლა ჩამოტვირთვას ნიშნავს, თუ სახელები არ ემთხვევა. hf-cache დაარქვი? მაშინ კი: სწრაფად.)</p>
+</div>
+
+<div class="step">
+<h3>იგრძენი ძალა: შეცვალე მნიშვნელობა, გააკეთე upgrade, დააბრუნე უკან</h3>
+<pre><code>helm upgrade slm charts/slm-stack --set vllm.model.maxModelLen=2048
+kubectl get pods -n llm -w              # rolling replacement
+helm history slm
+helm rollback slm 1
+helm history slm</code></pre>
+<p class="expect">მოსალოდნელია: history აჩვენებს 3 რევიზიას; rollback-მა აღადგინა maxModelLen=4096</p>
+<div class="win"><strong>მოგება</strong>
+შენი სტეკი ახლა დაინსტალირებადი, ვერსიონირებული პაკეტია: <code>helm install slm charts/slm-stack</code> ყველაფერს ნულიდან აღადგენს. ეს ბრძანება README-ში პორტფოლიოს ენაზე ლაპარაკობს.</div>
+</div>
+
+</div>
+
+<h2>შეამოწმე საკუთარი თავი</h2>
+<div class="quiz" data-quiz>
+  <div class="q">
+    <p class="stem">helm upgrade-მა release გააფუჭა. ყველაზე სწრაფი უსაფრთხო აღდგენა?</p>
+    <button class="opt" data-correct>helm rollback წინა ცნობილ რევიზიაზე</button>
+    <button class="opt">helm uninstall და შემდეგ ხელახლა ინსტალაცია chart-იდან</button>
+    <button class="opt">kubectl edit-ით deployment-ის ხელით უკან დაბრუნება</button>
+    <p class="explain">rollback ხელახლა იყენებს შენახულ წინა რევიზიას — ატომურად და აუდიტირებადად. uninstall/ხელახალი ინსტალაცია კარგავს release-ის ისტორიას და შეიძლება PVC-ებიც წაშალოს; ხელით რედაქტირება კი chart-ისგან აცილებას (drift) იწვევს.</p>
+  </div>
+  <div class="q">
+    <p class="stem">chart სადღაც არავალიდურ YAML-ს არენდერებს. საუკეთესო პირველი დიაგნოსტიკა?</p>
+    <button class="opt" data-correct>helm template და გამოტანილის წაკითხვა</button>
+    <button class="opt">helm install და კლასტერის event-ების წაკითხვა</button>
+    <button class="opt">kubectl apply თითოეულ template ფაილზე პირდაპირ</button>
+    <p class="explain">გააკეთე რენდერი ლოკალურად და ნახე ზუსტად, რა დააგენერირა template-მა (ჩვეულებრივ ეს ჩაწევის (indentation) შეცდომაა — <code>nindent</code>). template ფაილები თავისთავად ვალიდური YAML არ არის, ამიტომ მათი პირდაპირ apply-ს აზრი არ აქვს.</p>
+  </div>
+</div>
+
+<h2>პირველწყარო</h2>
+<p><a href="https://helm.sh/docs/chart_template_guide/getting_started/">Helm Chart Template Guide</a> ("Getting Started"-იდან "Values Files" გვერდების ჩათვლით, ~25 წთ). შემდეგ თავიდან ბოლომდე წაიკითხე <a href="https://github.com/vllm-project/production-stack/blob/main/helm/values.yaml">production-stack-ის values.yaml</a> — ეს chart-ის API დიზაინის ნამდვილი მასტერკლასია.</p>
+
+<h2>შემდეგი</h2>
+<p><a href="0006-router-scaleout.html">გაკვეთილი 6</a>: სრულფასოვანი production-stack — რამდენიმე engine რეპლიკა და მოთხოვნების router (მარშრუტიზატორი) service discovery-ით, სესიის მიბმით (session affinity) და საკუთარი მეტრიკებით.</p>
+
+<div class="lesson-footer">
+<p>მასალები: <a href="../../reference/helm-cheatsheet.html">Helm-ის შპარგალკა</a>.</p>
+<p>template-ის შეცდომები ბუნდოვანია — გაუგზავნე ისინი შენს მასწავლებელს template ფაილთან ერთად.</p>
+</div>
+
+</div>
+<script src="../../assets/quiz.js"></script>
+</body>
+</html>

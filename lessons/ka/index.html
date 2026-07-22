@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="ka">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SLM Production Stack — კურსის მთავარი</title>
+<link rel="stylesheet" href="../../assets/course.css">
+</head>
+<body>
+<div class="page">
+<p class="lang-switch"><a href="../index.html">🇬🇧 English</a></p>
+
+<p class="lesson-kicker">SLM Production Stack · კურსის მთავარი</p>
+<h1>ააგე SLM Inference Production Stack</h1>
+<p class="lesson-lede">ათი გაკვეთილი, ერთი სისტემა: Qwen3.5-0.8B, რომელსაც vLLM ემსახურება Kubernetes-ზე — routing-ით, მონიტორინგით, UI-ით, დატვირთვის ტესტებით და autoscaling-ით — მთლიანად შენს Mac-ზე. მისია: გახდე ML-ინფრასტრუქტურის ინჟინერი.</p>
+
+<div class="arch">
+  <div class="box">Open WebUI<small>გაკვეთილი 8</small></div>
+  <div class="flow">→</div>
+  <div class="box">Router<small>გაკვეთილი 6</small></div>
+  <div class="flow">→</div>
+  <div class="box hot">vLLM × N<small>გაკვეთილები 3–5</small></div>
+  <div class="flow">←</div>
+  <div class="box">HPA<small>გაკვეთილი 10</small></div>
+</div>
+<div class="arch">
+  <div class="box">Prometheus + Grafana<small>გაკვეთილი 7</small></div>
+  <div class="box">k6 / vllm bench<small>გაკვეთილი 9</small></div>
+  <div class="box">kind cluster + Helm<small>გაკვეთილები 1, 2, 5</small></div>
+</div>
+
+<h2>გაკვეთილები</h2>
+<table>
+<tr><th>#</th><th>გაკვეთილი</th><th>რითი გამოდიხარ</th></tr>
+<tr><td>1</td><td><a href="0001-first-cluster.html">რუკა და შენი პირველი კლასტერი</a></td><td>2-node-იანი kind-კლასტერი; გაშვებული Deployment + Service; reconciliation ცოცხლად ნანახი</td></tr>
+<tr><td>2</td><td><a href="0002-production-manifests.html">Production-ის ფორმის მანიფესტები</a></td><td>ხელით დაწერილი YAML: namespace-ები, probe-ები, requests/limits; OOMKilled უსაფრთხოდ ნანახი</td></tr>
+<tr><td>3</td><td><a href="0003-vllm-engine-docker.html">Engine: vLLM Docker-ში</a></td><td>საკუთარი ARM CPU vLLM image; Qwen ესაუბრება OpenAI API-თ; continuous batching დაკვირვებული</td></tr>
+<tr><td>4</td><td><a href="0004-vllm-on-k8s.html">vLLM ხვდება Kubernetes-ს</a></td><td>Engine გაშლილი PVC-წონების cache-ით და LLM-ზე მორგებული probe-ებით</td></tr>
+<tr><td>5</td><td><a href="0005-helm-package.html">Helm: შეფუთე სტეკი</a></td><td>საკუთარი chart; upgrade/rollback-ის თავისუფლად ფლობა; values.yaml როგორც API</td></tr>
+<tr><td>6</td><td><a href="0006-router-scaleout.html">Scale Out: რეპლიკები და Router</a></td><td>2 engine production-stack router-ის უკან; session affinity ლოგებში დამტკიცებული</td></tr>
+<tr><td>7</td><td><a href="0007-observability.html">Observability: Prometheus + Grafana</a></td><td>ცოცხალი TTFT/queue დაფები; PromQL-ის 3 ძირითადი პატერნი</td></tr>
+<tr><td>8</td><td><a href="0008-ui-openwebui.html">UI: Open WebUI</a></td><td>ბრაუზერის ჩატი საკუთარ ინფრასტრუქტურაზე; მოთხოვნის სრული გზა ტრასირებადი; kill-a-pod მდგრადობის დემო</td></tr>
+<tr><td>9</td><td><a href="0009-load-testing.html">დატვირთვის ტესტირება: მიიღე რიცხვები</a></td><td>გაჯერების მრუდი; P90 TTFT/TPOT ცხრილი; k6 SLO-კარიბჭე</td></tr>
+<tr><td>10</td><td><a href="0010-autoscaling-capstone.html">Autoscaling და Capstone</a></td><td>HPA-ის უკუკავშირის ციკლი; პორტფოლიოს README; მზადყოფნა იმიტირებული ინტერვიუსთვის</td></tr>
+</table>
+
+<h2>მოწინავე ტრეკი — ნამდვილი პროდუქტიზაცია (მე-10 გაკვეთილის შემდეგ)</h2>
+<p>სენიორის დონის თეორია + ლაბორატორიები. მე-11 გაკვეთილში კლასტერს ხელახლა აშენებს Cilium-ითა და edge-პორტებით; მხოლოდ-GPU მექანიკა ისწავლება სიმულაციით, სიმძლავრის მათემატიკითა და დიზაინის დოკუმენტებით — პატიოსნად მონიშნული.</p>
+<table>
+<tr><th>#</th><th>გაკვეთილი</th><th>რითი გამოდიხარ</th></tr>
+<tr><td>11</td><td><a href="0011-advanced-scheduling.html">გაღრმავებული Scheduling და GPU-ფლოტი</a></td><td>Taints/affinity/topology/preemption ნავარჯიშები სიმულირებულ GPU-პულზე; MIG vs time-slicing; bin-packing-ის ეკონომიკა</td></tr>
+<tr><td>12</td><td><a href="0012-production-edge.html">Production Edge</a></td><td>Ingress + cert-manager TLS ნამდვილ hostname-ებზე; LLM-ის streaming/timeout გასწორებები; Gateway API-ის ცოდნა</td></tr>
+<tr><td>13</td><td><a href="0013-security-multitenancy.html">უსაფრთხოება და Multi-Tenancy</a></td><td>Default-deny NetworkPolicy გრაფი (Cilium), კვოტები, RBAC-აუდიტი, engine-ის API-გასაღებები — თავდამსხმელის დემო დაბლოკილი</td></tr>
+<tr><td>14</td><td><a href="0014-gitops-delivery.html">GitOps და Progressive Delivery</a></td><td>Argo CD ფლობს სტეკს; deploy + rollback git-ით; მოდელის canary-დიზაინი</td></tr>
+<tr><td>15</td><td><a href="0015-vllm-performance.html">vLLM-ის Performance-ინჟინერია</a></td><td>Quantization/chunked-prefill/spec-decode თეორია; დისციპლინირებული tuning-კვლევა + ანგარიში</td></tr>
+<tr><td>16</td><td><a href="0016-distributed-inference.html">განაწილებული და დისაგრეგირებული Inference</a></td><td>TP/PP/DP/EP, P/D disaggregation, KV-იერარქია; სიმძლავრის მათემატიკა + დაცული დიზაინის დოკუმენტი</td></tr>
+<tr><td>17</td><td><a href="0017-sre-inference.html">SRE Inference-ისთვის</a></td><td>SLO-ები, რეალურად ჩართული burn-rate ალერტები, runbook-ები, chaos day, blameless postmortem</td></tr>
+<tr><td>18</td><td><a href="0018-cost-capstone.html">ღირებულება, სიმძლავრე და სენიორის Capstone</a></td><td>$/1M-ტოკენის ეკონომიკა, build-vs-buy breakeven, პლატფორმის დიზაინის დოკუმენტი + დაცვა იმიტირებულ ინტერვიუზე</td></tr>
+</table>
+
+<h2>ფინალური ტრეკი — ატლასები (მე-18 გაკვეთილის შემდეგ)</h2>
+<p>ყველაფერი, რაც კურსმა არ მოიცვა, რუკაზე დატანილი: თემა → რა → როდის დაგჭირდება → სად წაიკითხო. თითოეული მთავრდება gap-map-ის თვითშეფასებით, რომელიც შენს მუდმივ გამეორების სილაბუსად იქცევა.</p>
+<table>
+<tr><th>#</th><th>გაკვეთილი</th><th>რითი გამოდიხარ</th></tr>
+<tr><td>19</td><td><a href="0019-k8s-atlas.html">Kubernetes-ის ატლასი</a></td><td>K8s-ის სრული რუკა AI-ინჟინრებისთვის: Jobs/Kueue/LWS, StatefulSet-ები, PDB + graceful drain, operator-ები/CRD-ები, DRA, Kustomize, mesh, storage. ლაბორატორია: batch Job, ცოცხალი drain, kubectl debug, სათამაშო CRD, ხარვეზების რუკა</td></tr>
+<tr><td>20</td><td><a href="0020-vllm-atlas.html">vLLM-ის ატლასი</a></td><td>vLLM-ის სრული რუკა: structured outputs, tool calling, მულტიმოდალურობა, multi-LoRA, offline batch, სწრაფი ჩატვირთვა, sleep mode, ეკოსისტემა (llm-d, Dynamo, SGLang). ლაბორატორია: API-ტური + offline Job + ხარვეზების რუკა</td></tr>
+</table>
+
+<h2>ცნობარები (ცოცხალი დოკუმენტები)</h2>
+<table>
+<tr><td><a href="../../reference/kubectl-cheatsheet.html">kubectl-ის შპარგალკა</a></td><td>ბრძანებები, pod-სტატუსების ამომხსნელი, კურსის ტერმინთა ლექსიკონი</td></tr>
+<tr><td><a href="../../reference/k8s-manifest-anatomy.html">მანიფესტის ანატომია</a></td><td>ანოტირებული ჩონჩხები: Deployment, Service, PVC, probe-ები, ConfigMap/Secret</td></tr>
+<tr><td><a href="../../reference/vllm-cheatsheet.html">vLLM-ის შპარგალკა</a></td><td>serve-ის flag-ები, CPU env-ცვლადები, OpenAI API-ის გამოძახებები, მეტრიკები</td></tr>
+<tr><td><a href="../../reference/helm-cheatsheet.html">Helm-ის შპარგალკა</a></td><td>ბრძანებები, chart-ის სტრუქტურა, შაბლონების სინტაქსის გადარჩენის ნაკრები</td></tr>
+<tr><td><a href="../../reference/observability-cheatsheet.html">Observability-ის შპარგალკა</a></td><td>PromQL-პატერნები, vLLM-მეტრიკების ცხრილი, serving-მეტრიკების განმარტებები</td></tr>
+</table>
+
+<h2>როგორ გამოიყენო ეს კურსი</h2>
+<ol>
+<li>თითო გაკვეთილი 1–2-საათიან სესიაზე, თანმიმდევრობით — თითოეული წინას კლასტერის მდგომარეობაზე შენდება.</li>
+<li>ლაბორატორიები რეალურად გააკეთე. YAML-ის კითხვა YAML-ის წერა არ არის.</li>
+<li>ქვიზებს მეხსიერებიდან უპასუხე, <em>სანამ</em> დააკლიკებ. გახსენება აშენებს დამახსოვრებას; ამოცნობა — არა.</li>
+<li>როცა რამე გატყდება — კარგია. <code>describe</code>, <code>logs</code>, შემდეგ ჰკითხე შენს მასწავლებელს (აგენტს) გამონატანთან ერთად. Debugging სწორედ სასწავლო პროგრამაა.</li>
+<li>ყოველი სესიის შემდეგ უთხარი აგენტს, რა გააკეთე — ის სწავლის ჩანაწერს წერს და შემდეგ გაკვეთილს აკალიბრებს.</li>
+</ol>
+
+<div class="note"><strong>ინტერვალური გახსენება</strong>
+მე-3 სესიიდან დაიწყე 5-წუთიანი თვითტესტით: მეხსიერებიდან აღადგინე წინა გაკვეთილის მთავარი ბრძანება/მანიფესტი. აგენტს შეუძლია გამოგკითხოს — უბრალოდ სთხოვე „გამახურე".</div>
+
+<div class="lesson-footer">
+<p><a href="../../MISSION.md">MISSION.md</a> · <a href="../../RESOURCES.md">RESOURCES.md</a> · სწავლის ჩანაწერები: <code>learning-records/</code></p>
+</div>
+
+</div>
+</body>
+</html>

@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="ka">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>გაკვეთილი 7 — Observability: Prometheus + Grafana</title>
+<link rel="stylesheet" href="../../assets/course.css">
+</head>
+<body>
+<div class="page">
+
+<p class="lang-switch"><a href="../0007-observability.html">🇬🇧 English</a></p>
+
+<p class="lesson-kicker">SLM Production Stack · გაკვეთილი 7 · ფაზა 7 · ~2 სთ</p>
+<h1>Observability: Prometheus + Grafana</h1>
+<p class="lesson-lede">ყოველი სერიოზული ინფერენსის პლატფორმა სამ კითხვას მუდმივად პასუხობს: რამდენად სწრაფია (TTFT, latency), რამდენად დატვირთულია (running/pending მოთხოვნები, KV cache-ის გამოყენება), რამდენად ჯანმრთელია (up, შეცდომების სიხშირე). დღეს ააგებ სისტემას, რომელიც ამ კითხვებს პასუხობს.</p>
+
+<h2>ცოდნა: scrape მოდელი</h2>
+
+<h3>1. Pull და არა push</h3>
+<p>Prometheus <em>scrape</em>-ავს (მონაცემებს თავად კრებს): ყოველ N წამში ის GET-ით უკავშირდება თითოეული სამიზნის <code>/metrics</code>-ს და ინახავს დროით მწკრივებს (time series). vLLM ამ endpoint-ს უკვე ააშკარავებს (მე-3 გაკვეთილში curl-ით მიმართე) — ინსტრუმენტირების ნულოვანი სამუშაო. router-იც ააშკარავებს საკუთარ სტატისტიკას თითო engine-ზე.</p>
+
+<h3>2. მეტრიკის ტიპები, რომლებსაც რეალურად წაიკითხავ</h3>
+<table>
+<tr><th>ტიპი</th><th>ფორმა</th><th>vLLM მაგალითი</th></tr>
+<tr><td>Gauge</td><td>მნიშვნელობა ახლავე, ზევით-ქვევით</td><td><code>vllm:num_requests_running</code>, <code>vllm:kv_cache_usage_perc</code></td></tr>
+<tr><td>Counter</td><td>მხოლოდ იზრდება → იკითხება როგორც <code>rate()</code></td><td><code>vllm:prompt_tokens_total</code>, <code>vllm:request_success_total</code></td></tr>
+<tr><td>Histogram</td><td>bucket-ები → იკითხება როგორც <code>histogram_quantile()</code></td><td><code>vllm:time_to_first_token_seconds</code>, <code>vllm:e2e_request_latency_seconds</code></td></tr>
+</table>
+<p>მეტრიკების სრული სია: <a href="https://docs.vllm.ai/en/latest/usage/metrics.html">vLLM production metrics დოკუმენტაცია</a> · შემოკლებული ცხრილი <a href="../../reference/observability-cheatsheet.html">observability-ის მასალაში</a>.</p>
+
+<h3>3. PromQL — 3 პატერნი, რომელიც 90%-ს ფარავს</h3>
+<pre><code># current load per engine (gauge, as-is)
+vllm:num_requests_running
+
+# throughput: tokens/sec over 1m window (counter → rate)
+rate(vllm:generation_tokens_total[1m])
+
+# P90 TTFT over 5m (histogram → quantile)
+histogram_quantile(0.9, rate(vllm:time_to_first_token_seconds_bucket[5m]))</code></pre>
+
+<h3>4. ServiceMonitor: უთხარი Prometheus-ს, რა scrape-ოს — K8s-ის წესით</h3>
+<p><strong>kube-prometheus-stack</strong> Helm chart-ი აინსტალირებს Prometheus-ს + Grafana-ს + Prometheus Operator-ს. Operator-ი უყურებს <strong>ServiceMonitor</strong> ობიექტებს — მანიფესტს, რომელიც ამბობს: "scrape-ე ამ label-ების შესაბამისი Service-ები ამ პორტზე". დეკლარაციული scrape კონფიგურაცია — იგივე ფილოსოფია, რაც ყველაფერ დანარჩენს, რაც უკვე ააგე.</p>
+
+<h2>ლაბორატორია: შუქი აინთე</h2>
+
+<div class="lab">
+
+<div class="step">
+<h3>დააინსტალირე kube-prometheus-stack</h3>
+<pre><code>helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+helm repo update
+helm install kps prometheus-community/kube-prometheus-stack \
+  --namespace monitoring --create-namespace \
+  --set grafana.adminPassword=admin \
+  --set prometheus.prometheusSpec.serviceMonitorSelectorNilUsesHelmValues=false
+kubectl get pods -n monitoring -w     # wait until all Running (2-3 min)</code></pre>
+<p class="expect">მოსალოდნელია: prometheus, grafana, operator, kube-state-metrics, node-exporter Pod-ები Running</p>
+<div class="note"><strong>ის ბოლო --set flag-ი</strong>
+ნაგულისხმევად chart-ი მხოლოდ იმ ServiceMonitor-ებს scrape-ავს, რომლებსაც მისივე release label-ი აქვთ. სელექტორის nil-uses-false-ზე დაყენება = "scrape-ე ნებისმიერი ServiceMonitor". ეს გიშველის კლასიკური "ჩემი target არასოდეს ჩნდება" საათისგან.</div>
+</div>
+
+<div class="step">
+<h3>მიმართე Prometheus-ი vLLM-ისკენ</h3>
+<p>შეინახე როგორც <code>k8s/vllm-servicemonitor.yaml</code>:</p>
+<pre><code>apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: vllm
+  namespace: llm
+  labels: { app: vllm }
+spec:
+  selector:
+    matchLabels: { app: vllm }
+  endpoints:
+  - port: "8000"
+    path: /metrics
+    interval: 15s</code></pre>
+<div class="warning"><strong>პორტი დასახელებული უნდა იყოს</strong>
+ServiceMonitor-ის <code>port:</code> Service-ის პორტის <em>სახელს</em> გულისხმობს და არა ნომერს. vllm-ის Service template-ში პორტს დაუმატე <code>name: http</code>, აქ კი გამოიყენე <code>port: http</code>. ეს შეუსაბამობა ServiceMonitor-ის #1 ხაფანგია.</div>
+<pre><code>kubectl apply -f k8s/vllm-servicemonitor.yaml</code></pre>
+</div>
+
+<div class="step">
+<h3>გადაამოწმე target-ი, გაუშვი პირველი query-ები</h3>
+<pre><code>kubectl port-forward -n monitoring svc/kps-kube-prometheus-stack-prometheus 9090:9090</code></pre>
+<p>გახსენი <a href="http://localhost:9090/targets">localhost:9090/targets</a> → შენი vllm endpoint-ები უნდა აჩვენებდნენ <strong>UP</strong>-ს (მიეცი ~30 წამი). შემდეგ Graph ჩანართში გაუშვი ცოდნის სექციის სამივე PromQL პატერნი. ჯერ router-ის გავლით ტრაფიკი დააგენერირე, რომ გრაფიკები ამოძრავდეს:</p>
+<pre><code>for i in $(seq 1 10); do curl -s localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"Qwen/Qwen3.5-0.8B","messages":[{"role":"user","content":"Tell me a 50 word story."}],"max_tokens":80}' &gt; /dev/null &amp; done</code></pre>
+</div>
+
+<div class="step">
+<h3>Grafana: ააგე ინფერენსის dashboard-ი</h3>
+<pre><code>kubectl port-forward -n monitoring svc/kps-grafana 3000:80</code></pre>
+<p>შედი <a href="http://localhost:3000">localhost:3000</a>-ზე (admin / admin). ორი გზაა — ორივე გააკეთე:</p>
+<p><strong>ა) დააიმპორტე საორიენტაციო dashboard-ი.</strong> production-stack-ს თან მოჰყვება: ჩამოტვირთე <a href="https://github.com/vllm-project/production-stack/tree/main/observability">observability/vllm-dashboard.json</a> რეპოზიტორიიდან → Grafana → Dashboards → Import → ატვირთვა. მყისიერი პანელები: TTFT-ის განაწილება, running/pending მოთხოვნები, ჯანმრთელი ინსტანსები.</p>
+<p><strong>ბ) ერთი პანელი შენით ააგე</strong> (სწორედ ეს არის უნარი): New dashboard → Add visualization → datasource Prometheus → query:</p>
+<pre><code>histogram_quantile(0.9, sum(rate(vllm:time_to_first_token_seconds_bucket[5m])) by (le))</code></pre>
+<p>დაარქვი "P90 TTFT", ერთეული — წამები, შეინახე dashboard-ი სახელით <em>SLM Stack</em>.</p>
+<p class="expect">მოსალოდნელია: ცოცხალი TTFT მრუდი, რომელიც ტრაფიკის ციკლის გაშვებისას იჭიმება ზევით</p>
+<div class="win"><strong>მოგება</strong>
+production-stack-ის README-ს სქრინშოტი — ხელმისაწვდომი ინსტანსები, TTFT-ის განაწილება, pending მოთხოვნები — ახლა შენს კლასტერზე მუშაობს და შენს engine-ებს უყურებს. გადაუღე სქრინშოტი პორტფოლიოს README-სთვის.</div>
+</div>
+
+<div class="step">
+<h3>დატვირთე-და-უყურე ვარჯიში (10 წთ)</h3>
+<p>გაყოფილი ეკრანი: მარცხნივ Grafana, მარჯვნივ ტერმინალი. გაუშვი 20 პარალელური მოთხოვნა. ხმამაღლა აღწერე, რასაც ხედავ: pending რიგი იზრდება → running პლატოზე გადის engine-ის სიმძლავრეზე → TTFT P90 იწევს → იცლება. ეს თხრობა <em>ზუსტად</em> ის არის, რასაც SRE-ს გასაუბრება dashboard-თან გთხოვს.</p>
+</div>
+
+</div>
+
+<h2>შეამოწმე საკუთარი თავი</h2>
+<div class="quiz" data-quiz>
+  <div class="q">
+    <p class="stem">რატომ უნდა შეიფუთოს counter-ები rate()-ში, რომ სასარგებლო იყოს?</p>
+    <button class="opt" data-correct>ნედლი მნიშვნელობა მხოლოდ გროვდება გაშვებიდან</button>
+    <button class="opt">Prometheus counter-ებს დაბალი გარჩევადობით ინახავს</button>
+    <button class="opt">counter-ები ყოველ scrape ინტერვალს შორის ნულდება</button>
+    <p class="explain">counter-ი მთელი სიცოცხლის ჯამია — მისი დახრილობა (rate) არის აზრიანი სიგნალი. rate() ასევე კორექტულად უმკლავდება გადატვირთვებს (counter-ის განულებას).</p>
+  </div>
+  <div class="q">
+    <p class="stem">ServiceMonitor-ი გამოყენებულია, target-ი Prometheus-ში არასოდეს ჩნდება. პირველი შემოწმება?</p>
+    <button class="opt" data-correct>პორტის სახელი ემთხვევა Service-ის პორტის სახელს</button>
+    <button class="opt">Pod-ი მეტრიკებს პრივილეგირებულ პორტზე ააშკარავებს</button>
+    <button class="opt">Grafana-ს datasource Prometheus-ზე მიუთითებს</button>
+    <p class="explain">დასახელებული პორტის შეუსაბამობა (ან label-სელექტორის შეუსაბამობა) ჩუმ არაღმოჩენას იწვევს. Grafana ნაკადის ქვევითაა — target-ის აღმოჩენასთან კავშირი არ აქვს.</p>
+  </div>
+  <div class="q">
+    <p class="stem">TTFT P90 იზრდება და ამავდროულად num_requests_waiting-იც — ეს ნიშნავს…</p>
+    <button class="opt" data-correct>engine-ები გაჯერებულია, მოთხოვნები prefill-მდე რიგში დგებიან</button>
+    <button class="opt">ქსელური დაყოვნება router-სა და engine-ებს შორის</button>
+    <button class="opt">KV cache-ის ფრაგმენტაცია ანელებს ტოკენების გენერაციას</button>
+    <p class="explain">მოლოდინის რიგის ზრდა = დაშვების ბექლოგი; რიგში გატარებული დრო TTFT-ში ხვდება. ქსელური დაყოვნება მილიწამებია, ხოლო PagedAttention ფრაგმენტაციას ისედაც არ უშვებს.</p>
+  </div>
+</div>
+
+<h2>პირველწყარო</h2>
+<p><a href="https://docs.vllm.ai/en/latest/usage/metrics.html">vLLM Production Metrics</a> + <a href="https://prometheus.io/docs/prometheus/latest/querying/basics/">PromQL-ის საფუძვლები</a>. სურვილისამებრ ოქრო: production-stack-ის <a href="https://github.com/vllm-project/production-stack/tree/main/observability">observability/</a> საქაღალდე — მათი ზუსტი dashboard JSON და საინსტალაციო სკრიპტი.</p>
+
+<h2>შემდეგი</h2>
+<p><a href="0008-ui-openwebui.html">გაკვეთილი 8</a>: ნამდვილი ჩატის UI router-ის თავზე — სტეკი პროდუქტად იქცევა.</p>
+
+<div class="lesson-footer">
+<p>მასალები: <a href="../../reference/observability-cheatsheet.html">observability-ის შპარგალკა</a>.</p>
+<p>dashboard-ი ცარიელია? გაუგზავნე მასწავლებელს შენი ServiceMonitor + Service YAML.</p>
+</div>
+
+</div>
+<script src="../../assets/quiz.js"></script>
+</body>
+</html>

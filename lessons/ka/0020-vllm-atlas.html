@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html lang="ka">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>გაკვეთილი 20 — vLLM-ის ატლასი: ყველაფერი დანარჩენი, რაც AI-ინჟინერს სჭირდება</title>
+<link rel="stylesheet" href="../../assets/course.css">
+</head>
+<body>
+<div class="page">
+<p class="lang-switch"><a href="../0020-vllm-atlas.html">🇬🇧 English</a></p>
+
+<p class="lesson-kicker">SLM Production Stack · ფინალური · გაკვეთილი 20 · ~2.5 სთ (ატლასი + ლაბორატორია)</p>
+<h1>vLLM-ის ატლასი</h1>
+<p class="lesson-lede">უკანასკნელი გაკვეთილი. ყველაფერი vLLM-ში, რაც კურსმა გამოიყენა, მაგრამ არ ჩაშალა, და ყველაფერი, რასაც production შემდეგ მოგთხოვს: structured outputs (სტრუქტურირებული გამონატანი), tool calling, მულტიმოდალურობა, LoRA-ფლოტები, offline batch, მოდელის სწრაფი ჩატვირთვა, ეკოსისტემა engine-ის გარშემო. რუკა → განხილვები → ლაბორატორია.</p>
+
+<h2>რუკა — API, რომელიც მხოლოდ ნახევრად გამოიყენე</h2>
+<table>
+<tr><th>თემა</th><th>რა არის</th><th>როდის დაგჭირდება</th></tr>
+<tr><td><strong>Sampling params</strong></td><td>temperature, top_p/top_k, min_p, repetition/frequency/presence penalties, stop, seed, logprobs, max_tokens</td><td>ყველა პროდუქტი ამათ აწყობს; <code>seed</code> + temp 0 რეპროდუცირებადი eval-ებისთვის; logprobs თავდაჯერებულობის შესაფასებლად</td></tr>
+<tr><td><strong>Structured outputs</strong></td><td>Constrained decoding (შეზღუდული დეკოდირება): პასუხი მიჰყვება JSON Schema-ს / regex-ს / გრამატიკას — აღსრულებული logits-ის დონეზე (xgrammar/guidance backend-ები)</td><td>ნებისმიერი downstream parser. სამუდამოდ კლავს „მოდელმა თითქმის-JSON დააბრუნა"-ს. განხილვა ქვემოთ</td></tr>
+<tr><td><strong>Tool calling</strong></td><td>OpenAI-თან თავსებადი <code>tools</code>/<code>tool_choice</code>; parser-ები მოდელის ოჯახის მიხედვით (<code>--tool-call-parser</code>)</td><td>აგენტები. სჭირდება სწორი chat template + parser-ის flag — „tool calling არ მუშაობს"-ის #1 მიზეზი</td></tr>
+<tr><td><strong>Chat templates</strong></td><td>Jinja-შაბლონი, რომელიც messages[]-ს მოდელის prompt-ფორმატად აქცევს</td><td>არასწორი/გამოტოვებული შაბლონი = ჩუმად დეგრადირებული მოდელი. Custom შაბლონები სპეციალური ფორმატებისთვის; <code>--chat-template</code> override</td></tr>
+<tr><td><strong>Multimodal inputs</strong></td><td>სურათები (ზოგ მოდელზე აუდიო/ვიდეოც) <code>image_url</code> content-ნაწილების მეშვეობით</td><td>შენი Qwen3.5-0.8B ᲛᲐᲠᲗᲚᲐ მულტიმოდალურია — ლაბორატორია ბოლოს და ბოლოს ამას იყენებს. ყურადღება <code>--limit-mm-per-prompt</code>-ზე, სურათის ტოკენ-ბიუჯეტებზე</td></tr>
+<tr><td><strong>Reasoning models</strong></td><td>Thinking/reasoning-შინაარსი გამოყოფილი საბოლოო პასუხისგან (<code>reasoning_content</code>)</td><td>o1/R1-ის სტილის მოდელების serving; thinking-ტოკენების ბიუჯეტის კონტროლი</td></tr>
+<tr><td><strong>Beam search / n&gt;1</strong></td><td>რამდენიმე კანდიდატი თითო მოთხოვნაზე</td><td>Reranking pipeline-ები; batch-სიმძლავრე უჯდება — იცოდე, რატომ გამორთო ეს პროდუქტმა</td></tr>
+</table>
+
+<h2>რუკა — serving-რეჟიმები ჩატის მიღმა</h2>
+<table>
+<tr><th>თემა</th><th>რა</th><th>ტრიგერი</th></tr>
+<tr><td><strong>Offline inference (<code>LLM</code> კლასი)</strong></td><td>Python API: <code>LLM(model=…).generate(prompts, params)</code> — სერვერის გარეშე, მაქსიმალური throughput-ის batch</td><td>Eval-ები, distillation-მონაცემები, backfill-ები — მე-19 გაკვეთილის Job-ებთან წყვილში. განხილვა ქვემოთ</td></tr>
+<tr><td><strong>OpenAI Batch-ფორმატის job-ები</strong></td><td><code>vllm run-batch</code> მოთხოვნების JSONL-ზე</td><td>პირდაპირი ჩანაცვლება OpenAI batch-pipeline-ებისთვის, offline scoring</td></tr>
+<tr><td><strong>Pooling models</strong></td><td>Embeddings, კლასიფიკაცია, reward, scoring/rerank endpoint-ები (<code>/v1/embeddings</code>, score API)</td><td>RAG-ის retriever-ები + reranker-ები ᲘᲒᲘᲕᲔ engine-ტექნოლოგიით — ერთი პლატფორმა, ორივე workload</td></tr>
+<tr><td><strong>Multi-LoRA serving</strong></td><td>ათობით fine-tuned ადაპტერი ერთ ბაზისურ მოდელზე, თითო მოთხოვნაზე მოდელის სახელით არჩეული; დინამიური load/unload</td><td>Fine-tune თითო კლიენტზე — GPU-ფლოტის გარეშე თითო კლიენტზე. განხილვა ქვემოთ</td></tr>
+<tr><td><strong>Speculative decoding</strong></td><td>(გაკვეთილი 15) draft/EAGLE/MTP/n-gram</td><td>უკვე შენია</td></tr>
+<tr><td><strong>Sleep mode</strong></td><td>წონების offload/„დაპარკვა", გაღვიძება მოთხოვნისას (<code>/sleep</code>, <code>/wake_up</code>)</td><td>RLHF-ციკლები (train↔serve ერთსა და იმავე GPU-ებზე), dev-კლასტერები, scale-to-almost-zero</td></tr>
+<tr><td><strong>Priority scheduling</strong></td><td><code>--scheduling-policy priority</code>; პრიორიტეტი თითო მოთხოვნაზე</td><td>ინტერაქტიული tier batch-tier-ს ᲔᲠᲗᲘ engine-ის ᲨᲘᲒᲜᲘᲗ ჯაბნის — შენი router-ის tier-ებს ავსებს</td></tr>
+</table>
+
+<h2>რუკა — engine-ის შიდა მექანიზმები და ოპერაციები</h2>
+<table>
+<tr><th>თემა</th><th>რა</th><th>ტრიგერი</th></tr>
+<tr><td><strong>V1 engine / AsyncLLM</strong></td><td>ხელახლა დაწერილი ბირთვი: მარტივი scheduler, chunked-prefill ნაგულისხმევად, ნულოვანი overhead-ის prefix caching</td><td>Flag-ების სემანტიკა V0↔V1-ში განსხვავდება; დოკუმენტაცია/issue-ები ხშირად უთითებენ, რომელ engine-ზეა საუბარი — იცოდე, რომ ეს გაყოფა არსებობს</td></tr>
+<tr><td><strong>მოდელის სწრაფი ჩატვირთვა</strong></td><td>Tensorizer, Run:ai Model Streamer, fastsafetensors — წონების სტრიმინგი პირდაპირ GPU-ში</td><td>შენი მე-10 გაკვეთილის scaling-დაყოვნება: ჩატვირთვის დრო ᲡᲬᲝᲠᲔᲓ შენი autoscaling-ის რეაქციის დროა. განხილვა ქვემოთ</td></tr>
+<tr><td><strong>კვანტიზებული checkpoint-ების ეკოსისტემა</strong></td><td>წინასწარ კვანტიზებული AWQ/GPTQ/FP8/GGUF/bitsandbytes checkpoint-ების ჩატვირთვა vs online-კვანტიზაცია</td><td>მე-15 გაკვეთილმა არჩევა გასწავლა; აქ: ᲡᲐᲘᲓᲐᲜ მოდის კვანტიზებული წონები (llm-compressor, community checkpoint-ები — გადაამოწმე)</td></tr>
+<tr><td><strong>კონტექსტის გაფართოება</strong></td><td>RoPE scaling / YaRN კონტექსტის training-სიგრძეს მიღმა გასაჭიმად</td><td>„128k შეგვიძლია?" — კი/არა/ხარისხის-კლდე პასუხი აქ ცხოვრობს</td></tr>
+<tr><td><strong>Per-request მეტრიკები და OTel tracing</strong></td><td>დროის ზომვები მოთხოვნის დონეზე; OpenTelemetry span-ები engine-იდან</td><td>Observability-ის მესამე სვეტი შენი მე-7 გაკვეთილის სტეკისთვის; ერთი ნელი მოთხოვნის ბოლომდე დაკავშირება</td></tr>
+<tr><td><strong>Custom logits processors / plugins</strong></td><td>ჩაერთვები sampling-საფეხურში; plugin-სისტემა custom მოდელებისთვის</td><td>Watermarking, აკრძალული ტოკენების სიები, შიდა sampling-კვლევა</td></tr>
+<tr><td><strong>დეტერმინიზმი და batch invariance</strong></td><td>იგივე მოთხოვნა, სხვა batch-მეზობლები → მცირე რიცხვითი გადახრა; flag-ები კონტროლისთვის</td><td>Eval-ების რეპროდუცირებადობის კამათი; ტიკეტი „რატომ განსხვავდებოდა temp-0 გამონატანები"</td></tr>
+<tr><td><strong>უსაფრთხოების მდგომარეობა</strong></td><td>მოდელის ფაილები როგორც კოდი (pickle-რისკი — ამჯობინე safetensors), <code>HF_HUB_OFFLINE</code>, API-სერვერის გამაგრება, ნდობის საზღვრები</td><td>მოდელების supply chain = ახალი dependency security; SOC2 იკითხავს</td></tr>
+<tr><td><strong>Troubleshooting-ის ნაკრები</strong></td><td><code>VLLM_LOGGING_LEVEL=DEBUG</code>, <code>--enforce-eager</code>, CUDA OOM-ის triage (gpu-mem-util, max-len, max-seqs), profiling hook-ები</td><td>შენი პირველი კვირა ნამდვილ GPU-ებზე, გარანტირებულად</td></tr>
+</table>
+
+<h2>რუკა — ეკოსისტემა engine-ის გარშემო</h2>
+<table>
+<tr><th>ფენა</th><th>მოთამაშეები</th><th>ერთსტრიქონიანი ორიენტირი</th></tr>
+<tr><td>K8s-native serving</td><td>production-stack, <strong>llm-d</strong>, AIBrix, KServe, KubeAI, llmaz, NVIDIA Dynamo</td><td>ყველა vLLM-ფლოტებს აორკესტრირებს; production-stack იცნობ; llm-d = K8s-native disagg+KV-aware შთამომავალი; Dynamo = NVIDIA-ს P/D სტეკი</td></tr>
+<tr><td>Gateways</td><td>LiteLLM, Envoy AI Gateway, Higress</td><td>მრავალპროვაიდერული auth/კვოტები/fallback შენი router-ის წინ</td></tr>
+<tr><td>App frameworks</td><td>LangChain, LlamaIndex, OpenAI SDKs</td><td>ყველა შენს სტეკს OpenAI API-თ ელაპარაკება — არაფერია შესაცვლელი</td></tr>
+<tr><td>ალტერნატიული engine-ები</td><td>SGLang, TensorRT-LLM, llama.cpp/Ollama</td><td>იცოდე კომპრომისი: TRT-LLM = პიკური NVIDIA წარმადობა/სირთულე; SGLang = RadixAttention-ის prefix-გამოყენება; llama.cpp = edge/CPU</td></tr>
+</table>
+
+<h2>განხილვა 1 — Structured outputs (გამოიყენე ყველგან)</h2>
+<pre><code>curl -s localhost:8080/v1/chat/completions -H "Content-Type: application/json" -d '{
+  "model": "Qwen/Qwen3.5-0.8B",
+  "messages": [{"role":"user","content":"Extract: The Mac M4 has 10 cores and 16GB RAM."}],
+  "response_format": {
+    "type": "json_schema",
+    "json_schema": { "name": "hw", "schema": {
+      "type": "object",
+      "properties": { "chip": {"type":"string"}, "cores": {"type":"integer"}, "ram_gb": {"type":"integer"} },
+      "required": ["chip","cores","ram_gb"] } } }
+}'</code></pre>
+<p>გრამატიკა არავალიდურ ტოკენებს sampling-ის დროსვე ნიღბავს — გამონატანი სქემას <em>ვერ</em> დაარღვევს. თითქმის ნულოვანი overhead გრამატიკის კომპილაციის შემდეგ. Retry-on-parse-error დღეს კვდება. (<a href="https://docs.vllm.ai/en/latest/features/structured_outputs/">docs</a>)</p>
+
+<h2>განხილვა 2 — Multi-LoRA: fine-tune-ები ფლოტების გარეშე</h2>
+<pre><code>vllm serve BASE --enable-lora \
+  --lora-modules customer-a=/adapters/a customer-b=/adapters/b
+# request routes by model name:
+{"model": "customer-a", ...}   # base weights + A's adapter, batched WITH B's traffic</code></pre>
+<p>ადაპტერები ~10–200 MB-ია GB-მასშტაბის ბაზისების ფონზე; ერთი engine სხვადასხვა ადაპტერის მოთხოვნებს ერთდროულად ჰკრავს batch-ებში; დინამიური load API ტენანტებს runtime-ზე ამატებს. ეკონომიკა: 50 fine-tuned კლიენტი ≈ ერთი ბაზისური ფლოტი + 50 პატარა ფაილი, და არა 50 ფლოტი. ეს ერთი ფუნქცია მთელ პლატფორმებს ამართლებს. (<a href="https://docs.vllm.ai/en/latest/features/lora/">docs</a>)</p>
+
+<h2>განხილვა 3 — Offline batch: engine-ის მეორე ნახევარი</h2>
+<pre><code>from vllm import LLM, SamplingParams
+llm = LLM(model="Qwen/Qwen3.5-0.8B", max_model_len=4096)
+out = llm.generate(prompts, SamplingParams(temperature=0, max_tokens=64, seed=7))</code></pre>
+<p>არც სერვერი, არც HTTP — scheduler თავისუფალია, წმინდა throughput მაქსიმუმამდე აწიოს: eval-ები და მონაცემთა გენერაცია ასე 2–5-ჯერ იაფი ჯდება, ვიდრე საკუთარი API-ის „ბომბარდირება". შეახვიე მე-19 გაკვეთილის Job-ში და მიიღებ ML-batch-ის კანონიკურ პატერნს.</p>
+
+<h2>განხილვა 4 — მოდელის ჩატვირთვის დრო შენი autoscaling-ის კონსტანტაა</h2>
+<p>რეპლიკის სარგებლიანობა = ჩამოტვირთვა + ჩატვირთვა + warmup. სამივეს შეუტიე: წონები RWX/PVC-ზე ან init-container-ის წინასწარი pre-pull (გაკვეთილი 19), streaming loader-ები (tensorizer / Run:ai streamer: სტრიმინგი პირდაპირ GPU-ში, CPU-ეტაპის გამოტოვება), და <code>--load-format</code>-ის არჩევანი. პლატფორმები „cold-replica-to-first-token"-ს პირველი რიგის SLO-დ ზომავენ — ჩასვი შენს დიზაინის დოკუმენტში.</p>
+
+<h2>ლაბორატორია (labs/lab-20): API-ტური, რომელიც არასდროს გაგივლია</h2>
+<div class="lab">
+<div class="step"><h3>Structured output</h3><p>გაუშვი განხილვა 1-ის curl ᲨᲔᲜᲘ router-ის გავლით. მერე გატეხე: მოითხოვე ჰაიკუ იმავე სქემით — უყურე, როგორ აიძულებს გრამატიკა JSON-ს მაინც. ორივე შეინახე <code>docs/vllm-api-tour.md</code>-ში.</p></div>
+<div class="step"><h3>მულტიმოდალურობა, ბოლოს და ბოლოს</h3><p>Qwen3.5-0.8B არის image-text-to-text და შენ მას 19 გაკვეთილის მანძილზე მხოლოდ ტექსტით ემსახურებოდი. გაუგზავნე სურათი (base64 data URL <code>image_url</code> content-ნაწილში): „რა არის ამ სურათზე?" თუ შენი build ამ არქიტექტურის მულტიმოდალურ გზას წინ უსწრებს, დააფიქსირე შეცდომა + საჭირო flag/ვერსია — ესეც ნამდვილი პლატფორმის სამუშაოა.</p></div>
+<div class="step"><h3>Sampling-საფარი</h3><p>იგივე prompt: temp 0 + seed (ორჯერ — იდენტურია?), temp 1.8 (ქაოსი), <code>logprobs: 5</code> (თავდაჯერებულობის ინსპექცია), repetition penalty ციკლისკენ მიდრეკილ prompt-ზე. ერთი ცხრილი ტურის დოკუმენტში.</p></div>
+<div class="step"><h3>Offline batch Job-ში</h3><p>ჩამაუნთე 20-prompt-იანი JSONL ConfigMap-ით; Job უშვებს <code>vllm-cpu:local</code>-ს განხილვა 3-ის python-ით (entrypoint override), რომელიც completion-ებს pod-ის ლოგში წერს. Offline engine + K8s Job = გაკვეთილი 19 × გაკვეთილი 20.</p></div>
+<div class="step"><h3>Alias + ხარვეზების რუკა</h3><p>დაამატე <code>--served-model-name qwen-prod</code> chart-ის values-ით; UI-ის ამომრჩევი განახლდება — მოდელის იდენტობა HF-ის path-ს მოწყდა (rollout-ის წინაპირობა მე-14 გაკვეთილიდან). შემდეგ <code>docs/vllm-gap-map.md</code>, იგივე სამმდგომარეობიანი გულახდილობა, რაც lab 19-ში.</p></div>
+</div>
+
+<h2>შეამოწმე შენი თავი</h2>
+<div class="quiz" data-quiz>
+  <div class="q">
+    <p class="stem">როგორ იძლევა structured outputs ვალიდური JSON-ის გარანტიას?</p>
+    <button class="opt" data-correct>არავალიდური ტოკენები sampling-ისას ინიღბება</button>
+    <button class="opt">გამონატანი მოწმდება და ჩავარდნისას ხელახლა გენერირდება</button>
+    <button class="opt">მოდელი სქემის მაგალითებზეა fine-tuned</button>
+    <p class="explain">Constrained decoding: გრამატიკა ანულებს იმ ტოკენების logits-ს, რომლებიც სქემას დაარღვევდნენ — არავალიდური გამონატანი წარმოუდგენელია და არა retry-თ გამოსწორებული.</p>
+  </div>
+  <div class="q">
+    <p class="stem">40 კლიენტზე მორგებული fine-tune ერთი 8B ბაზისისა. ყველაზე იაფი serving-ფორმა?</p>
+    <button class="opt" data-correct>ერთი ბაზისური ფლოტი, ორმოცი LoRA-ადაპტერი</button>
+    <button class="opt">ორმოცი კვანტიზებული რეპლიკა, თითო თითოზე</button>
+    <button class="opt">ერთი შერწყმული მოდელი ადაპტერების საშუალოთი</button>
+    <p class="explain">Multi-LoRA ყველა კლიენტს საზიარო ბაზისურ წონებზე ჰკრავს batch-ებში; ადაპტერები მეგაბაიტებია. ორმოცი ფლოტი = ორმოცჯერ მეტი აპარატურა; შერწყმა კლიენტების ინდივიდუალურ ქცევას ანადგურებს.</p>
+  </div>
+  <div class="q">
+    <p class="stem">ღამის eval 100k prompt-ზე: სერვერის API თუ offline LLM კლასი?</p>
+    <button class="opt" data-correct>Offline კლასი, მაქსიმალური batch-throughput</button>
+    <button class="opt">სერვერის API, production-შემოწმებების გამოყენებით</button>
+    <button class="opt">ნებისმიერი, throughput თითქმის იდენტურია</button>
+    <p class="explain">Offline-რეჟიმი აგდებს HTTP-ის/streaming-ის/სამართლიანობის შეზღუდვებს და scheduler-ს წმინდა throughput-ისთვის დაწყობის საშუალებას აძლევს — ამ მასშტაბზე შესამჩნევად იაფია. Prod-პარიტეტის smoke-ტესტები API-ზე დარჩეს.</p>
+  </div>
+</div>
+
+<h2>პირველწყარო</h2>
+<p>კითხვის რიგი შენ მიერ მონიშნული ხარვეზებისთვის: <a href="https://docs.vllm.ai/en/latest/features/structured_outputs/">structured outputs</a> → <a href="https://docs.vllm.ai/en/latest/features/lora/">LoRA</a> → <a href="https://docs.vllm.ai/en/latest/serving/offline_inference.html">offline inference</a> → <a href="https://docs.vllm.ai/en/latest/features/multimodal_inputs/">multimodal</a> → <a href="https://docs.vllm.ai/en/latest/features/tool_calling/">tool calling</a>.</p>
+
+<h2>დასასრული</h2>
+<p>ოცი გაკვეთილი: „რა არის Pod"-იდან პლატფორმის დიზაინის დაცვამდე, ყველაფრის ხარვეზ-რუკითურთ, რაც მის მიღმაა. ორი ატლასის gap-map შენი მუდმივი სასწავლო გეგმაა — კვარტალში ერთხელ ხელახლა შეაფასე შენი თავი. მისიის სტატუსი: ამჯერად <a href="../../MISSION.md">MISSION.md</a> თავად ჩაასწორე. მასწავლებელი კვლავ აქ არის იმიტირებული ინტერვიუებისთვის.</p>
+
+<div class="lesson-footer"><p><a href="index.html">კურსის მთავარი</a> · ლაბორატორია: <code>labs/lab-20/</code></p></div>
+</div>
+<script src="../../assets/quiz.js"></script>
+</body>
+</html>

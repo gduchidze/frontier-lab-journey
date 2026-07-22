@@ -1,0 +1,237 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lesson 3 · The Traffic Edge: DNS, CDN, Load Balancing</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<div class="lesson">
+  <header class="lesson-header">
+    <p class="kicker">Lesson 0003 · Phase 1 — Distributed Systems Core · <a href="0003-traffic-edge.ka.html">ქართული ვერსია</a></p>
+    <h1>The Traffic Edge: DNS, CDN, Load Balancing</h1>
+    <p class="dek">Every request crosses three gatekeepers before your code runs — know what each one can see, what it costs, and how it fails.</p>
+  </header>
+
+  <div class="mission-tie">
+    <strong>Mission tie.</strong> Anthropic's system design rounds, like every serious design interview, open with a scale number — <em>"…handles 100,000 requests per second."</em> That number must land on <em>many</em> machines, which means the first box you draw after the client is the traffic edge: DNS, maybe a CDN, then a load balancer. Interviewers probe exactly here — L4 or L7? which algorithm? what happens when a backend dies? who balances the balancer? This lesson gives you defensible answers to all four. (<a href="https://www.tryexponent.com/blog/anthropic-system-design-interview">Exponent's 2026 Anthropic guide</a>)
+  </div>
+
+  <h2>1 · The journey of a request</h2>
+  <p>Type <code>shop.example.com/checkout</code> and press Enter. Before your application code runs, the request traverses a chain of infrastructure that most candidates hand-wave — and interviewers notice:</p>
+  <pre><code>client → DNS (name → IP, cached at every step)
+       → CDN edge (static asset? answered here, journey over)
+       → load balancer (one virtual IP, many real servers)
+       → reverse proxy (TLS, compression, rate limits)
+       → app server (your code, finally)</code></pre>
+  <p>Each hop exists to solve one specific problem: DNS solves <em>naming</em>, the CDN solves <em>distance</em>, the load balancer solves <em>one machine isn't enough</em>, the reverse proxy solves <em>don't make app servers do plumbing</em>. Lesson 0001 gave you the physics motivating all of this: an ocean round trip costs ~150 ms, a datacenter round trip ~500 µs. The entire edge is an exercise in either avoiding the slow hop or amortizing it. (<a href="https://github.com/donnemartin/system-design-primer">System Design Primer</a>, sections 7–10, is the primary source for this whole lesson.)</p>
+
+  <h2>2 · DNS: the phone book with a cache problem</h2>
+  <p><strong>DNS</strong> translates <code>shop.example.com</code> into an IP address via a hierarchy of servers — your OS cache, your ISP's resolver, the root servers, the TLD (<code>.com</code>) servers, and finally the domain's authoritative name server. The record types you must recognize on sight (<a href="https://github.com/donnemartin/system-design-primer#domain-name-system">Primer §7</a>, <a href="https://www.cloudflare.com/learning/dns/what-is-dns/">Cloudflare: what is DNS</a>):</p>
+  <table>
+    <tr><th>Record</th><th>Maps</th><th>Typical use</th></tr>
+    <tr><td><strong>A</strong></td><td>name → IPv4 address</td><td>the workhorse (AAAA for IPv6)</td></tr>
+    <tr><td><strong>CNAME</strong></td><td>name → another name</td><td>alias <code>www</code>, or point at a CDN hostname</td></tr>
+    <tr><td><strong>NS</strong></td><td>zone → name server</td><td>delegates who answers for a domain</td></tr>
+    <tr><td><strong>MX</strong></td><td>domain → mail server</td><td>email routing, with priorities</td></tr>
+  </table>
+  <p>The property that dominates DNS design discussions is <strong>caching</strong>. Every answer carries a <strong>TTL</strong> (time-to-live), and resolvers all the way down to the user's laptop cache the answer for that long. Consequences worth saying out loud in an interview:</p>
+  <ul>
+    <li><strong>DNS lookups are usually free</strong> — the vast majority are answered from a nearby cache, which is why the hierarchy scales to the whole internet.</li>
+    <li><strong>DNS changes are slow to propagate.</strong> With a 300 s TTL, some users keep hitting the old IP for five minutes after you change the record — so DNS is a terrible <em>primary</em> failover mechanism.</li>
+    <li><strong>DNS is itself a dependency that fails.</strong> The 2016 DDoS on the Dyn DNS provider took Twitter, Spotify, and GitHub offline for hours <em>without touching any of their servers</em> — their names simply stopped resolving. Standard mitigation: multiple DNS providers, exactly like any other redundancy story.</li>
+  </ul>
+
+  <h2>3 · DNS as a router, not just a phone book</h2>
+  <p>Managed DNS services (Route 53, Cloudflare, NS1) can return <em>different answers to different queriers</em>, which turns DNS into a coarse global router (<a href="https://docs.aws.amazon.com/Route53/latest/DeveloperGuide/routing-policy.html">Route 53 routing policies</a>):</p>
+  <ul>
+    <li><strong>Weighted round-robin</strong> — return server A 95% of the time, server B 5%. Classic uses: canary releases (5% of traffic tastes the new version first), gradual migrations between providers, A/B splits at the infrastructure level.</li>
+    <li><strong>Latency-based</strong> — answer with the region that has the lowest measured RTT to the querier. A user in Frankfurt gets the EU load balancer's IP; a user in Virginia gets us-east's.</li>
+    <li><strong>Geolocation</strong> — route by where the user <em>is</em>, not what's fastest. This is the tool for data-residency law (EU users' data must stay in the EU) and localized content.</li>
+  </ul>
+  <p>Worked micro-example: a payments company runs active datacenters in Dublin and Oregon. Latency-based routing sends each user to the nearer one (~20 ms instead of ~140 ms cross-Atlantic — recall Lesson 0001's numbers). If Dublin fails, Route 53's health-checked failover flips answers to Oregon — but users behind resolvers that cached the Dublin answer stay broken until TTL expiry. Hence the rule of thumb: <strong>DNS routing for geography and coarse traffic shaping; load balancers for fast failover.</strong> Keep TTLs short (30–60 s) on records you may need to move, and accept the extra lookup traffic as the premium on that insurance.</p>
+
+  <h2>4 · CDN: don't make the request travel at all</h2>
+  <p>A <strong>CDN</strong> (content delivery network) beats the 150 ms ocean crossing by not crossing it: static content is copied to hundreds of <strong>edge servers</strong> (points of presence) and served from the one nearest the user. Two models for how content reaches the edge (<a href="https://github.com/donnemartin/system-design-primer#content-delivery-network">Primer §8</a>, <a href="https://www.cloudflare.com/learning/cdn/what-is-a-cdn/">Cloudflare: what is a CDN</a>):</p>
+  <table>
+    <tr><th></th><th>Push CDN</th><th>Pull CDN</th></tr>
+    <tr><td>Content arrives</td><td>you upload it at release time</td><td>edge fetches from origin on first miss</td></tr>
+    <tr><td>First request</td><td>fast (already there)</td><td>slow (miss + origin fetch)</td></tr>
+    <tr><td>Fits</td><td>small, rarely-changing catalogs</td><td>long tails; anything with unpredictable popularity</td></tr>
+    <tr><td>You pay for</td><td>storage everywhere, wanted or not</td><td>origin egress on misses; some stale-until-TTL content</td></tr>
+  </table>
+  <p><strong>What belongs on a CDN:</strong> images, JS/CSS bundles, fonts, video segments, downloadable files — anything static and shared between users. Netflix pushed this idea to its logical end with <a href="https://openconnect.netflix.com/">Open Connect</a>, its private CDN with cache boxes installed <em>inside ISPs</em>, because video is nearly all of its bytes. <strong>What doesn't:</strong> personalized pages, cart contents, anything that changes per-request. (Modern CDNs also proxy dynamic traffic for DDoS absorption and TLS termination at the edge, but the <em>caching</em> win is for static content.)</p>
+  <p>The costs interviewers like to hear acknowledged:</p>
+  <ul>
+    <li><strong>Egress fees.</strong> CDNs bill per GB delivered. An e-commerce site pushing 2 MB of images per page view at 10 M views/day ships ~20 TB/day; at ~$0.05/GB that's ~$1,000/day. Cheaper than building 300 global POPs — but a real line item that image compression directly reduces.</li>
+    <li><strong>Invalidation is the hard part.</strong> You shipped a broken JS bundle and it's cached at 300 edges with a 24 h TTL. Purge APIs are slow and unreliable at the worst moments. The professional pattern is <strong>versioned URLs</strong> (<code>app.9f3ab2.js</code>): deploy new HTML referencing a new asset name, cache assets effectively forever, and never purge.</li>
+    <li><strong>A cold cache is a thundering herd.</strong> After a mass purge (or a new region coming online), thousands of edge misses hit your origin at once. Origins must be sized for miss storms, not the average day.</li>
+  </ul>
+
+  <h2>5 · Load balancer: L4 vs L7</h2>
+  <p>The <strong>load balancer</strong> presents one address (a <strong>VIP</strong> — virtual IP) and spreads incoming requests across a pool of identical servers. The first design decision is which network layer it operates at (<a href="https://github.com/donnemartin/system-design-primer#load-balancer">Primer §9</a>, <a href="https://aws.amazon.com/elasticloadbalancing/features/">AWS ELB feature matrix</a>):</p>
+  <table>
+    <tr><th></th><th>L4 (transport layer)</th><th>L7 (application layer)</th></tr>
+    <tr><td>Sees</td><td>source/dest IP and port; forwards packets</td><td>the full HTTP request: path, headers, cookies</td></tr>
+    <tr><td>Work per request</td><td>minimal — NAT-style rewriting</td><td>terminates TCP and TLS, parses HTTP, opens a second connection</td></tr>
+    <tr><td>Capacity</td><td>millions of connections, near line-rate</td><td>less per box — you pay CPU for the parsing</td></tr>
+    <tr><td>Can do</td><td>spread TCP flows</td><td>route <code>/api</code> vs <code>/static</code> to different pools, cookie stickiness, per-path retries, header rewrites</td></tr>
+    <tr><td>Real products</td><td>AWS NLB, LVS, HAProxy (TCP mode)</td><td>AWS ALB, Nginx, HAProxy (HTTP mode), Envoy</td></tr>
+  </table>
+  <p>The trade is <strong>performance vs flexibility</strong>. Large sites often stack them: an L4 tier at the front (cheap, absorbs floods, spreads across the L7 tier) and an L7 tier behind it (smart routing to services). When asked "L4 or L7?", the winning answer names the trade and picks per workload — payments API with path-based routing and retries: L7; raw TCP throughput for a database proxy or game servers: L4.</p>
+
+  <h2>6 · Algorithms, stickiness, and why stateless wins</h2>
+  <p>Given a healthy pool, which backend gets the next request?</p>
+  <ul>
+    <li><strong>Round-robin</strong> — next server in the cycle. Fair by <em>count</em>; assumes requests cost roughly the same.</li>
+    <li><strong>Weighted round-robin</strong> — bigger machines get proportionally more. Fair by <em>capacity</em>.</li>
+    <li><strong>Least-connections</strong> — pick the server with the fewest in-flight requests. Fair by <em>current load</em>; the self-correcting choice when request costs vary (one slow report query shouldn't starve a server that's stuck with it).</li>
+    <li><strong>IP-hash / sticky sessions</strong> — hash the client's IP (or set a cookie at L7) so the same client always lands on the same server, and in-memory session state survives across requests.</li>
+  </ul>
+  <p>Stickiness deserves its own warning label, because it is how small systems grow into unscalable ones. The classic story is an e-commerce shopping cart kept in app-server memory: sticky routing makes it work — until a server is redeployed and every cart on it evaporates mid-purchase, or one corporate NAT (thousands of users, one IP) hashes onto a single unlucky server. Stickiness makes servers <em>non-interchangeable</em>, and interchangeability is the entire premise of horizontal scaling.</p>
+  <p>The grown-up pattern: keep app servers <strong>stateless</strong> and externalize sessions to a shared store — Redis holds the cart, keyed by a session ID in the user's cookie. Now any server can serve any request, deploys and autoscaling are non-events, and a server death loses nothing. Generalized, this is the <strong>shared-nothing</strong> prerequisite for horizontal scaling: no request may depend on local state (memory <em>or</em> disk) of one particular box. Uploaded files go to object storage, sessions to Redis, data to the database — the app tier becomes disposable, which is exactly what you want it to be. (<a href="https://github.com/donnemartin/system-design-primer#horizontal-scaling">Primer: horizontal scaling</a>)</p>
+
+  <h2>7 · Health checks, failover, and who balances the balancer</h2>
+  <p>The balancer earns its keep the moment a backend dies. It learns about deaths via <strong>health checks</strong> — typically an HTTP <code>GET /health</code> every few seconds. After <em>N</em> consecutive failures a backend leaves the rotation; a passing check readmits it. Two tunables, one trade:</p>
+  <pre><code>detection time ≈ check interval × failure threshold
+   interval 5 s × threshold 3  →  up to ~15 s of errors routed to a corpse
+   interval 1 s × threshold 2  →  ~2 s detection, but one GC pause can
+                                  eject a healthy server (false positive)</code></pre>
+  <p>There is no free setting — over-eager checks cause <em>flapping</em> (servers bouncing in and out of rotation, each ejection dumping extra load on survivors, which then slow down and get ejected too). Production systems pair fast checks with damping: require several passes before readmission, and never eject below a minimum pool size. Good L7 balancers also do <strong>passive</strong> detection — a refused connection counts as evidence without waiting for the next probe — and retry the failed request on another backend so the client never sees the death.</p>
+  <p>Now the uncomfortable question your interviewer is waiting to ask: <em>the load balancer is one box — isn't it a single point of failure?</em> Yes, and the standard answer is an <strong>LB pair</strong>: two balancers, active–passive, exchanging heartbeats; when the active dies, the passive claims the shared <strong>floating IP</strong> (via VRRP — <a href="https://www.keepalived.org/">keepalived</a> is the classic tool) and traffic continues within seconds. Alternatively active–active pairs behind round-robin DNS. Cloud load balancers (ALB/NLB) are pairs-and-then-some internally — that's what you're paying for. The one-sentence flex in an interview: <em>"the LB is an active–passive pair with a floating IP, so it's not a SPOF."</em></p>
+
+  <h2>8 · Reverse proxy: the balancer's quieter sibling</h2>
+  <p>A <strong>reverse proxy</strong> is a server that fronts your app servers and represents them to the world — a load balancer is just a reverse proxy that happens to balance. Even a <em>single</em>-server deployment wants one (<a href="https://github.com/donnemartin/system-design-primer#reverse-proxy-web-server">Primer §10</a>, <a href="https://www.f5.com/glossary/reverse-proxy">Nginx/F5: reverse proxy</a>), because it centralizes the plumbing your app shouldn't do:</p>
+  <ul>
+    <li><strong>TLS termination</strong> — certificates live in one place; backends speak plain HTTP on a private network.</li>
+    <li><strong>Compression and static files</strong> — Nginx serves <code>/static</code> from disk and gzips responses far more efficiently than your application runtime.</li>
+    <li><strong>Rate limiting and request filtering</strong> — drop abusive or malformed traffic before it costs you app-server capacity.</li>
+    <li><strong>A stable public face</strong> — backends can be renamed, re-addressed, and redeployed invisibly.</li>
+  </ul>
+  <p>The disadvantage list mirrors the load balancer's: one more hop, one more component to configure, and a SPOF unless paired. In practice the edge layers collapse into few boxes: Cloudflare plays CDN + DNS + L7 proxy at the global edge; an ALB or an Nginx/HAProxy pair plays balancer + reverse proxy at your datacenter's front door.</p>
+
+  <h2>9 · Worked example: sizing the edge for a flash sale</h2>
+  <p>Tie it together with Lesson 0002-style arithmetic. An e-commerce site expects a flash sale peaking at <strong>50,000 RPS</strong>. Page mix: 80% of requests are static (images, JS, CSS), 20% dynamic (search, cart, checkout).</p>
+  <pre><code>CDN offload:   50,000 × 0.80 = 40,000 RPS die at the edge (pull CDN, long-TTL assets)
+Origin sees:   50,000 × 0.20 = 10,000 RPS of dynamic traffic
+App servers:   one server ≈ 1,000 RPS  →  10 needed  →  run 13 (~30% headroom)
+Balancer:      L7 (route /checkout to its own beefier pool; cookie for cart A/B)
+               one modern L7 box ≈ tens of thousands RPS → a pair suffices
+Health:        interval 2 s × threshold 2 → ≤4 s detection; passive checks + retry
+               hide most failures from users entirely
+DNS:           TTL 60 s on shop.example.com, weighted 5% to the canary pool</code></pre>
+  <p>Note what made this easy: because the app tier is stateless (carts in Redis), "add three more servers mid-sale" is a one-line autoscaling event, not a data-migration project. Every layer of this lesson appears in five lines of arithmetic — this is exactly the shape of a strong interview answer.</p>
+
+  <h2>10 · One AI note: when request costs vary 100×</h2>
+  <p>Everything above assumed requests cost <em>roughly</em> the same, which is why round-robin is usually fine. LLM inference is the extreme counterexample: one request generates 100 tokens, the next 10,000 — a 100× spread hiding behind identical-looking HTTP calls. Round-robin equalizes <em>counts</em>, so one unlucky GPU server accumulates the long generations and its queue — and tail latency — explodes while neighbors idle. Inference gateways therefore use <strong>least-outstanding-requests</strong> (least-connections' close cousin) or deeper queue-depth signals from the serving engine. Same principle as the slow-report-query example in section 6, dialed to 100×. We design this properly in Phase 4; the lab below lets you watch it happen today.</p>
+
+  <h2>11 · Interview talking points</h2>
+  <p>How to <em>deploy</em> this lesson in a live design round:</p>
+  <ul>
+    <li><strong>Draw the edge in order, one sentence per box:</strong> "DNS resolves and geo-routes; CDN serves static assets from the edge; an L7 balancer pair spreads dynamic traffic over stateless app servers." Thirty seconds, enormous signal.</li>
+    <li><strong>Name the L4/L7 trade before picking.</strong> "L4 is faster, L7 can read the request — I want path-based routing and retries here, so L7." Never just name a product.</li>
+    <li><strong>Say "stateless, sessions in Redis" before you scale.</strong> Interviewers deduct quietly when candidates add servers to a stateful tier and hope.</li>
+    <li><strong>Volunteer the failure story unprompted:</strong> health checks with a detection-time number, LB as a pair, and "DNS failover is slow because of TTL caching — it's my backstop, not my mechanism."</li>
+    <li><strong>Keep three numbers loaded:</strong> ~150 ms cross-ocean RTT (why CDNs exist), CDN offload of 70–90% for content-heavy sites, and detection time = interval × threshold.</li>
+    <li><strong>Know the traps by name:</strong> sticky sessions (kills interchangeability), cache invalidation (version URLs instead), thundering herd on cold caches, health-check flapping, and the corporate-NAT hot spot under IP-hash.</li>
+  </ul>
+
+  <h2>12 · Lab — run your own load balancer</h2>
+  <div class="callout"><span class="label">Hands-on (do this before the quiz)</span>
+    In <code>labs/lab-0003-toy-load-balancer/</code>: <code>python3 toy_lb.py --demo</code> starts three
+    real HTTP backends plus a balancer with health checks, sends 30 requests, prints the
+    per-backend distribution — then kills a backend mid-run so you can watch failover happen.
+    Then do exercises E1–E4 in the lab README: <em>predict, edit config, re-run, compare.</em>
+    E1/E2 recreate the round-robin-vs-least-connections story from sections 6 and 10 with
+    your own numbers.
+  </div>
+
+  <h2>13 · Project step</h2>
+  <p>Back to our spine project, the <strong>LLM inference gateway</strong>. Decide its load-balancing strategy — L4 or L7, and which algorithm — and write <em>one sentence</em> defending the choice against the mixed 100-token/10k-token workload from section 10. (A defensible example: "L7 with least-outstanding-requests, because token counts make request counts meaningless and we need path-based routing for <code>/v1/messages</code> vs <code>/health</code>.") Bring your sentence to the next session; your teacher will attack it.</p>
+
+  <h2>Check yourself</h2>
+  <div class="quiz" id="quiz"></div>
+
+  <h2>Primary source</h2>
+  <p>Read the <strong>System Design Primer, sections 7–10</strong>: <a href="https://github.com/donnemartin/system-design-primer#domain-name-system">DNS</a>, <a href="https://github.com/donnemartin/system-design-primer#content-delivery-network">CDN</a>, <a href="https://github.com/donnemartin/system-design-primer#load-balancer">Load balancer</a>, and <a href="https://github.com/donnemartin/system-design-primer#reverse-proxy-web-server">Reverse proxy</a>. Each section ends with a "disadvantages" list — those lists are interview gold. Supplementary: <a href="https://www.cloudflare.com/learning/cdn/what-is-a-cdn/">Cloudflare's CDN explainer</a> and the <a href="https://aws.amazon.com/elasticloadbalancing/features/">AWS ALB-vs-NLB feature matrix</a> for how vendors package L7 vs L4.</p>
+
+  <footer class="lesson-footer">
+    <p><strong>Stuck or curious?</strong> Ask your teacher (the agent) anything — "when would I put an L4 balancer <em>in front of</em> an L7 one?" is an excellent follow-up question.</p>
+    <nav class="lesson-nav">
+      <a href="0002-back-of-envelope.html">◀ Prev: 0002 · Back-of-Envelope Drills</a>
+      <a href="0004-cap-and-replication.html">Next: 0004 · CAP and Replication ▶</a>
+    </nav>
+  </footer>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+renderQuiz(document.getElementById('quiz'), {
+  title: 'Check yourself',
+  questions: [
+    {
+      q: 'shop.example.com must always resolve to wherever example.com points, without copying the IP. Which record?',
+      options: [
+        'An A record duplicating the IPv4 address',
+        'A CNAME record aliasing shop to example.com',
+        'An NS record delegating the shop subdomain',
+      ],
+      answer: 1,
+      explain: 'CNAME maps name → name, so shop follows example.com automatically when its IP changes. A duplicated A record drifts out of date; NS delegates authority, it does not alias.',
+    },
+    {
+      q: 'A site serves a huge long tail of rarely requested images. Which CDN mode fits best?',
+      options: [
+        'Pull CDN, fetching content lazily on first request',
+        'Push CDN, uploading every asset to edges upfront',
+        'No CDN, serving all images from origin directly',
+      ],
+      answer: 0,
+      explain: 'Pull caches only what users actually request and TTLs evict the cold objects. Push would pay to store the whole long tail at every edge, mostly for nothing.',
+    },
+    {
+      q: 'What can an L7 load balancer inspect that an L4 balancer cannot?',
+      options: [
+        'Only source IP address and destination port',
+        'Nothing extra; both layers inspect identical data',
+        'HTTP headers, URL paths, and cookie contents',
+      ],
+      answer: 2,
+      explain: 'L4 sees packets: IPs and ports. L7 terminates the connection and reads the actual HTTP request — buying content-based routing at the price of more CPU per request.',
+    },
+    {
+      q: 'Why do stateless services with sessions in Redis beat sticky sessions?',
+      options: [
+        'Any server can handle any request, so scaling works',
+        'Redis is always faster than any local server memory',
+        'Sticky sessions encrypt user traffic worse than stateless designs',
+      ],
+      answer: 0,
+      explain: 'The win is interchangeability: servers can be added, removed, or die without losing sessions or carts. Redis is actually a network hop — slower than local memory — so the benefit is elasticity, not speed.',
+    },
+    {
+      q: 'A backend fails N consecutive health checks. What does the balancer do?',
+      options: [
+        'Restart the failing backend process over SSH immediately',
+        'Remove it from rotation until checks pass again',
+        'Keep sending traffic and return errors to clients',
+      ],
+      answer: 1,
+      explain: 'Health checks gate rotation membership, nothing more: the LB stops routing to the failed backend and readmits it when a check passes. Fixing the process is someone else’s job.',
+    },
+    {
+      q: 'Your requests vary enormously in processing cost per request. Which algorithm self-corrects best?',
+      options: [
+        'Round-robin, because every server receives equal counts',
+        'IP-hash, because each client keeps one server',
+        'Least-connections, because in-flight work guides each pick',
+      ],
+      answer: 2,
+      explain: 'When costs vary — a slow report query, or a 10,000-token LLM generation — equal counts are not equal work. Least-connections routes around busy servers automatically because unfinished requests are visible load.',
+    },
+  ],
+});
+</script>
+</body>
+</html>

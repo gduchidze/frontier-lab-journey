@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="ka">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>გაკვეთილი 18 — ღირებულება, სიმძლავრე და სენიორის Capstone</title>
+<link rel="stylesheet" href="../../assets/course.css">
+</head>
+<body>
+<div class="page">
+<p class="lang-switch"><a href="../0018-cost-capstone.html">🇬🇧 English</a></p>
+
+<p class="lesson-kicker">SLM Production Stack · მოწინავე · გაკვეთილი 18 · ~3 სთ + წერილობითი ანგარიში</p>
+<h1>ღირებულება, სიმძლავრე და სენიორის Capstone</h1>
+<p class="lesson-lede">ამ კურსში ყველა არქიტექტურული გადაწყვეტილება ფარულად ფინანსური გადაწყვეტილება იყო. ბოლო გაკვეთილი ფულს ცხადად აჩვენებს — $/მილიონ ტოკენზე, build vs buy (აშენება თუ ყიდვა), capacity planning (სიმძლავრის დაგეგმვა) — და მთავრდება არტეფაქტით, რომელიც წრეს კრავს: პლატფორმის დიზაინის დოკუმენტით, რომელსაც იმიტირებულ ინტერვიუზე დაიცავ.</p>
+
+<h2>ცოდნა</h2>
+
+<h3>1. ტოკენის ერთეულოვანი ეკონომიკა</h3>
+<pre><code>$/1M output tokens ≈ (GPU $/hr × num_GPUs) / (throughput tok/s × 3600) × 1e6
+
+H100 @ ~$2.5/hr, 70B fp8 TP=2 doing ~2500 tok/s:
+  (2.5 × 2) / (2500 × 3600) × 1e6  ≈  $0.56 / 1M output tokens — at 100% utilization</code></pre>
+<p>გადამწყვეტი ცვლადი არის <strong>utilization</strong> (რესურსების ათვისება). საშუალო დატვირთვის 20%-ზე შენი რეალური ღირებულება 5-ჯერ აღემატება „ხელზე ნაანგარიშებ" რიცხვს — და 20–40% ტიპურია დღიური ციკლის მქონე ჩატის ტრაფიკისთვის. ყველაფერი, რაც ააგე, სწორედ ამ რიცხვის ასაწევად არსებობს: continuous batching (გაკვეთილი 3), routing (6), autoscaling (10), bin-packing (11), disaggregation (16).</p>
+
+<h3>2. ბერკეტები, დალაგებული იმის მიხედვით, თუ რამდენად ხშირად იმარჯვებენ</h3>
+<table>
+<tr><th>ბერკეტი</th><th>ტიპური მოგება</th><th>სად ისწავლე</th></tr>
+<tr><td>მოდელის სწორი ზომა (0.8B იქ, სადაც 70B რეფლექსი იყო; distill/fine-tune)</td><td>10–100×</td><td>მთელი კურსის ამოსავალი წერტილი</td></tr>
+<tr><td>Utilization: autoscale + bin-pack + scale-to-zero არაპიკურ საათებში</td><td>2–5×</td><td>10, 11</td></tr>
+<tr><td>Quantization (fp8 წონები + KV)</td><td>~2× სიმძლავრე/GPU</td><td>15</td></tr>
+<tr><td>Prefix/KV caching საზიარო-კონტექსტიან სამუშაოებზე</td><td>1.5–10× prefill-ზე</td><td>6, 15, 16</td></tr>
+<tr><td>Spot/preemptible batch-ისთვის + stateless რეპლიკებისთვის</td><td>~3× ამ პულებზე</td><td>11 (პრიორიტეტები მას უსაფრთხოს ხდის)</td></tr>
+<tr><td>Batch tier: ღამის რიგი არაინტერაქტიული სამუშაოსთვის</td><td>ავსებს utilization-ის ჩავარდნებს</td><td>17 (SLO tiers)</td></tr>
+</table>
+
+<h3>3. Build vs buy — რელიგიის გარეშე</h3>
+<pre><code>API cost/mo  = tokens/mo × $/token           (scales with usage, zero floor)
+Self-host/mo = GPUs × $/hr × 730 + eng_time  (scales with PEAK capacity, high floor)</code></pre>
+<p>Breakeven (გატოლების წერტილი) ჩვეულებრივ თვეში სტაბილურ <em>ასობით მილიონ</em> ტოკენზე მოდის — მაგრამ გადაწყვეტილება იშვიათად არის წმინდა მათემატიკა: მონაცემთა მართვის წესები (prompt-ები შენს VPC-ს ტოვებს?), latency-ის კონტროლი, მოდელის კასტომიზაცია (LoRA ფლოტები) და rate-limit-ებზე სუვერენიტეტი — ყველაფერი ეს build-ისკენ იხრება; მკვეთრად ცვალებადი/დაბალი მოცულობა და ინფრასტრუქტურის გუნდის არარსებობა — buy-სკენ. სენიორის პასუხი ცხრილია და არა ლოზუნგი — და „დაიწყე API-ებზე, გაზომე გამოყენება, breakeven-ის მრუდთან გადახედე" ჩვეულებრივ ყველაზე პატიოსანი რეკომენდაციაა.</p>
+
+<h3>4. Capacity planning როგორც განმეორებადი პროცედურა</h3>
+<pre><code>1. Forecast: peak RPS, tokens in/out distribution, growth, tenant mix
+2. Measure:  bench ONE replica on target hardware (lesson 9 — you know how)
+3. Divide:   replicas = peak_demand / per-replica goodput (at SLO, not at max!)
+4. Headroom: ×1.3–1.5 for N-1 failures, deploys, cache warmup (lesson 10's lesson)
+5. Re-run:   every model change, quantization change, workload drift</code></pre>
+<p>ერთი რეპლიკის <em>goodput SLO-ზე</em> (სასარგებლო გამტარუნარიანობა) — მე-9 გაკვეთილის მრუდის „მუხლი" და არა პიკი — არის ის რიცხვი, რომელიც ცხრილში ჯდება. შენ ის უკვე გაზომე; ინჟინრების უმეტესობას ეს არასდროს გაუკეთებია.</p>
+
+<h3>5. დიზაინის დოკუმენტი — სენიორის მთავარი ნაშრომი</h3>
+<p>სამუშაო სტრუქტურა: კონტექსტი და მოთხოვნები → SLO-ები → არქიტექტურა (+ ორი უარყოფილი დიზაინი და მიზეზები) → სიმძლავრისა და ღირებულების მოდელი → Failure modes და blast radius-ები → უსაფრთხოება/tenancy → Rollout და ოპერაციები → ღია კითხვები. თუ 11–17 გაკვეთილებმა თითო არტეფაქტი დაგიტოვა, ეს დოკუმენტი ძირითადად მათ აწყობს — გეგმა თავიდანვე ეს იყო.</p>
+
+<h2>ლაბორატორია (labs/lab-18): სენიორის capstone</h2>
+<div class="lab">
+<div class="step"><h3>ღირებულების მოდელი</h3><p><code>docs/cost-model.md</code>: სამი სცენარი — (a) შენი რეალური CPU სტეკი (Mac-ის ამორტიზაცია! ელექტროენერგია! ეს $0 არ არის); (b) იგივე პროდუქტი 2×A10 cloud-ზე; (c) 70B-fp8 API-vs-self-host breakeven მრუდი გამოთვლილი გადაკვეთის წერტილით. ცხრილები + ცხადად ჩამოწერილი დაშვებები.</p></div>
+<div class="step"><h3>დიზაინის დავალება</h3><p><code>docs/platform-design.md</code> — მოეპყარი როგორც ნამდვილ take-home დავალებას: <em>„დააპროექტე inference-პლატფორმა chat+API პროდუქტისთვის: 3 მოდელი (0.8B, 8B, 70B), 5k პიკური RPS ძირითადად პატარა მოდელებზე, P90 TTFT &lt; 1.5s ინტერაქტიულ tier-ზე, batch tier ღამით, 3 enterprise ტენანტი იზოლაციის მოთხოვნით, SOC2 ჰორიზონტზე, ბიუჯეტზე მომჭირნე CFO."</em> სრული სტრუქტურა §5-დან. ყველა სექცია უნდა უთითებდეს გაკვეთილის არტეფაქტს (SLO დოკუმენტი, tuning-ის ანგარიში, distributed-design დოკუმენტი, netpol დიაგრამა, ღირებულების მოდელი).</p></div>
+<div class="step"><h3>დაცვა</h3><p>იმიტირებული ინტერვიუ შენს მასწავლებელთან: 45 წუთი, დაფასთან. მოელოდე: „გამატარე ერთი მოთხოვნის გზაზე", „engine-ფლოტი ღამის 2 საათზე OOM-დება — იმოქმედე", „CFO GPU-ბიუჯეტს 40%-ით ჭრის — რა დეგრადირდება პირველად და როგორ ირჩევ", „რატომ არ გამოვიყენოთ უბრალოდ OpenAI API სამივე მოდელისთვის?". ინტერვიუს შემდეგ დოკუმენტი გადაამუშავე. მეორე რაუნდი, თუ ცუდად ჩაიარა — ეს მარცხი კი არა, სწორედ ვარჯიშის მუშაობის ნიშანია.</p></div>
+<div class="step"><h3>პორტფოლიოს გამოქვეყნება</h3><p>რეპოზიტორიის ფინალური გავლა: README აკავშირებს დიზაინის დოკუმენტს, tuning-ის ანგარიშს, chaos-day postmortem-ს, benchmark-ცხრილებს, Grafana-ს სქრინშოტებს. ჩამაგრე GitHub-ზე. გამოაქვეყნე r/LocalLLaMA-ზე / vLLM Slack-ში — გარე თვალები სიბრძნის საფეხურია, და უკუკავშირის თემა თავად ხდება პორტფოლიოს მტკიცებულება.</p></div>
+</div>
+
+<h2>შეამოწმე შენი თავი</h2>
+<div class="quiz" data-quiz>
+  <div class="q">
+    <p class="stem">„ხელზე ნაანგარიშები" $0.56/1M ტოკენს ამბობს; ანგარიშ-ფაქტურა $2.80-ს გულისხმობს. ყველაზე სავარაუდო მიზეზი?</p>
+    <button class="opt" data-correct>ფლოტის utilization ბევრად ასზე დაბალია</button>
+    <button class="opt">Cloud egress-ის საფასური ტოკენ-პასუხებზე</button>
+    <button class="opt">Prefill-ტოკენები decode-ის ტარიფით დაფასდა</button>
+    <p class="explain">5× სხვაობა ≈ 20% utilization — კლასიკური რიცხვი დღიური ციკლის ტრაფიკისთვის. გამოთვლა უშვებდა, რომ GPU-ები არასდროს უქმდებიან; სინამდვილეში ძირითადად უქმად დგანან. ტექსტზე egress კაპიკებია.</p>
+  </div>
+  <div class="q">
+    <p class="stem">Capacity plan მოთხოვნას რომელ ერთი-რეპლიკის რიცხვზე ყოფს?</p>
+    <button class="opt" data-correct>Goodput SLO-ს „მუხლის" წერტილში</button>
+    <button class="opt">პიკური throughput სრულ გაჯერებაზე</button>
+    <button class="opt">დღის საშუალო throughput</button>
+    <p class="explain">„მუხლს" მიღმა ისეთ ტოკენებს ემსახურები, რომლებიც SLO-ს არღვევენ — სიმძლავრე, რომელიც „არსებობს", მაგრამ ვერ გაიყიდება. გაჯერების throughput-ზე დაგეგმვა პიკზე SLO-ს დარღვევებს თავიდანვე დებს გეგმაში.</p>
+  </div>
+  <div class="q">
+    <p class="stem">ყველაზე ძლიერი ერთი არგუმენტი self-hosting-ის სასარგებლოდ, API-ს მოხერხებულობის მიუხედავად?</p>
+    <button class="opt" data-correct>Prompt-ები და მონაცემები საზღვარს არ ტოვებენ</button>
+    <button class="opt">Self-hosted მოდელები ყოველთვის იაფია</button>
+    <button class="opt">API-ებს fine-tuned მოდელების serving არ შეუძლიათ</button>
+    <p class="explain">მონაცემთა მართვის მოთხოვნა ბინარულია და ზოგი მყიდველისთვის — არადათმობადი; ღირებულება მოცულობასთან ერთად იცვლება, ხოლო API-ვენდორები fine-tune-ებსაც ჰოსტავენ. როცა მოთხოვნა data-residency-ია, მათემატიკა მეორეხარისხოვანი ხდება.</p>
+  </div>
+</div>
+
+<h2>პირველწყარო</h2>
+<p><a href="https://sre.google/workbook/capacity-planning/">SRE Workbook — Capacity Planning</a> + GPU-ს ფასების მიმდინარე გვერდები (Lambda, RunPod, CoreWeave) ცოცხალი რიცხვებისთვის შენს ღირებულების მოდელში.</p>
+
+<h2>შემდეგი</h2>
+<p>ორი დასკვნითი ატლას-გაკვეთილი ასახავს ყველაფერს, რაც კურსმა არ მოიცვა: <a href="0019-k8s-atlas.html">გაკვეთილი 19 — Kubernetes-ის ატლასი</a> და <a href="0020-vllm-atlas.html">გაკვეთილი 20 — vLLM-ის ატლასი</a>.</p>
+
+<h2>დასასრული — და წრის შეკვრა</h2>
+<p>მოწინავე დონის ფინალური გამოცდა, ორ კვირაში: წაშალე ყველაფერი, ააგე ბაზისური + მოწინავე სტეკი მხოლოდ შენი დოკუმენტაციიდან, შემდეგ კი დიზაინის დოკუმენტი ხელახლა, მომზადების გარეშე დაიცავი. ამის მერე ამ სტეკის სტუდენტი აღარ ხარ — მისი ავტორი ხარ. ინტერვიუების დროა.</p>
+
+<div class="lesson-footer"><p><a href="index.html">კურსის მთავარი</a> · ლაბორატორია: <code>labs/lab-18/</code> · <a href="../../MISSION.md">მისია — გადადი და მონიშნე</a></p></div>
+</div>
+<script src="../../assets/quiz.js"></script>
+</body>
+</html>

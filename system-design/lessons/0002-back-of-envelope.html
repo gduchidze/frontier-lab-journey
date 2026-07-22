@@ -1,0 +1,235 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lesson 2 · Back-of-Envelope Estimation</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<div class="lesson">
+  <header class="lesson-header">
+    <p class="kicker">Lesson 0002 · Phase 1 — Distributed Systems Core · <a href="0002-back-of-envelope.ka.html">ქართული ვერსია</a></p>
+    <h1>Back-of-Envelope Estimation</h1>
+    <p class="dek">Five minutes of powers-of-ten that decide every design choice you make afterward — the full playbook, worked examples, traps, and interview delivery.</p>
+  </header>
+
+  <div class="mission-tie">
+    <strong>Mission tie.</strong> The Anthropic prompt from Lesson 0001 — <em>"design a token-generation service that handles 100,000 requests per second"</em> — is unanswerable until you turn its numbers into machines: how many servers is 100k RPS? Does the hot state fit in RAM? Is storage or bandwidth the bottleneck? Estimation is the translator between a prompt's numbers and the boxes you are about to draw. Get it wrong by 100× and every later choice — sharding, caching, replication — is wrong with it. (<a href="https://www.tryexponent.com/blog/anthropic-system-design-interview">Exponent's 2026 Anthropic guide</a>)
+  </div>
+
+  <h2>1 · Rounding discipline</h2>
+  <p>Napkin math has one rule: <strong>powers of ten beat precision</strong>. A day has 86,400 seconds — in an interview it has <strong>10<sup>5</sup></strong>. The 14% error you just accepted is noise compared to the 2–10× uncertainty in your traffic assumptions. The <a href="https://github.com/sirupsen/napkin-math">napkin-math</a> credo: landing <em>within an order of magnitude</em> is success. This is how the numbers are used inside Google too — Jeff Dean's famous "numbers everyone should know" slide exists precisely so engineers can do this arithmetic in their heads mid-meeting. (<a href="https://static.googleusercontent.com/media/research.google.com/en//people/jeff/stanford-295-talk.pdf">Dean, Stanford CS295 talk</a>)</p>
+  <p>Second rule: <strong>state assumptions out loud</strong>. "I'll assume 200 bytes per message — text plus metadata. Sound reasonable?" The interviewer is grading the method and the checkpoint, never the third significant digit — and saying it aloud lets them correct you <em>before</em> you build five minutes of math on a bad premise.</p>
+  <p>Third rule: <strong>carry units through every line</strong>. "2×10⁸ messages/day × 200 B/message = 4×10¹⁰ B/day." If the units don't cancel to what you wanted, the arithmetic is wrong no matter how confident you feel. Most public estimation blunders are unit errors, not multiplication errors.</p>
+
+  <h2>2 · The numbers you carry — rules of thumb</h2>
+  <p>You cannot estimate without constants, and you cannot look them up mid-interview. The full tables live in the <a href="../reference/0002-estimation-kit.html">Estimation Kit</a>; this is the working set:</p>
+  <table>
+    <tr><th>Constant</th><th class="num">Napkin value</th><th>Why it matters</th></tr>
+    <tr><td>Seconds per day</td><td class="num">10<sup>5</sup></td><td>every per-day → per-second conversion</td></tr>
+    <tr><td>1M requests/day</td><td class="num">≈ 12 RPS</td><td>instant sanity anchor</td></tr>
+    <tr><td>2<sup>10</sup> / 2<sup>20</sup> / 2<sup>30</sup> / 2<sup>40</sup></td><td class="num">KB / MB / GB / TB</td><td>≈ thousand / million / billion / trillion</td></tr>
+    <tr><td>Char / int64 / pointer</td><td class="num">1 B / 8 B / 8 B</td><td>sizing records and indexes</td></tr>
+    <tr><td>Tweet-sized text record</td><td class="num">~200 B – 1 KB</td><td>text is small; metadata often doubles it</td></tr>
+    <tr><td>Web image / photo</td><td class="num">~100 KB / ~500 KB</td><td>media is 1,000× text — it dominates instantly</td></tr>
+    <tr><td>Minute of compressed video</td><td class="num">~10–50 MB</td><td>why video companies are storage companies</td></tr>
+    <tr><td>Commodity server</td><td class="num">~32–128 GB RAM, ~10k QPS</td><td>the unit you multiply to get machine counts</td></tr>
+    <tr><td>Replication factor</td><td class="num">×3 (erasure coding ~×1.5)</td><td>nothing durable is stored once</td></tr>
+    <tr><td>Peak factor</td><td class="num">×2–10 over average</td><td>social ~2–5×, retail promos 10×+</td></tr>
+  </table>
+  <p>Pair these with the latency ladder from Lesson 0001 (memory 100 ns → datacenter RTT 500 µs → cross-ocean 150 ms) and the Primer's <a href="https://github.com/donnemartin/system-design-primer#powers-of-two-table">powers of two</a> and <a href="https://github.com/donnemartin/system-design-primer#latency-numbers-every-programmer-should-know">latency numbers</a> appendix. Memorization here is not trivia — it is what makes the next section take five minutes instead of twenty.</p>
+
+  <h2>3 · The playbook — one sequence for any prompt</h2>
+  <p>Every estimation follows the same spine. Memorize it as a pipeline:</p>
+  <table>
+    <tr><th>Step</th><th>Formula</th><th>Anchor</th></tr>
+    <tr><td>1. DAU → avg QPS</td><td class="num">DAU × actions/user ÷ 10<sup>5</sup></td><td>1M req/day ≈ 12 RPS</td></tr>
+    <tr><td>2. Avg → peak QPS</td><td class="num">avg × 2–10</td><td>ask, or assume 5×</td></tr>
+    <tr><td>3. Read/write split</td><td class="num">reads = writes × ratio</td><td>10:1 typical, 100:1 for feeds</td></tr>
+    <tr><td>4. Storage/day</td><td class="num">writes/day × bytes/item</td><td>×365/year, ×3 replicas, ×growth</td></tr>
+    <tr><td>5. Bandwidth</td><td class="num">bytes/day ÷ 10<sup>5</sup></td><td>ingest ≠ egress; egress = ingest × read ratio</td></tr>
+  </table>
+  <p>In the interview, run it as a fill-in template — literally write this skeleton on the whiteboard and populate it top to bottom:</p>
+  <pre><code>DAU: ____        actions/user/day: ____   →  requests/day: ____
+avg QPS = requests/day ÷ 10⁵ = ____       →  peak QPS (×__): ____
+read:write = __:1                          →  read QPS: ____ / write QPS: ____
+item size: ____ B                          →  storage/day: ____  →  /year (×365): ____
+                                              provisioned (×3 replicas): ____
+bandwidth: ingest ____ /s · egress (×read ratio) ____ /s
+VERDICT: bottleneck is ________ → design must be ________-first</code></pre>
+  <p>This whole pipeline is the <em>second</em> thing you do in an interview — right after clarifying requirements — and it should take <strong>≤ 5 minutes</strong>. Its outputs (peak QPS, storage class, bandwidth class) are the inputs to every architecture decision that follows. It is the same order taught in Alex Xu's back-of-envelope chapter (<a href="https://bytebytego.com/courses/system-design-interview/back-of-the-envelope-estimation">ByteByteGo, SDI vol. 1 ch. 2</a>) and drilled in <a href="https://github.com/sirupsen/napkin-math">napkin-math</a>.</p>
+
+  <h2>4 · Worked example — a 10M-DAU social feed</h2>
+  <pre><code>Assume: 10M DAU · 2 posts/user/day · 10 feed loads/user/day, 20 posts each
+        1 KB per post (text + metadata) · peak 5×
+
+writes:  10M × 2 = 2×10⁷ posts/day ÷ 10⁵ s = 200 writes/s avg → 1,000 peak
+reads:   10M × 10 = 10⁸ feed loads/day = 1,000 loads/s avg → 5,000 peak
+         × 20 posts each = 100,000 post-fetches/s at peak → read:write ≈ 100:1
+storage: 2×10⁷ × 1 KB = 20 GB/day → ×365 ≈ 7 TB/year (×3 replicas ≈ 21 TB)</code></pre>
+  <p>Read the numbers like an architect. 200 writes/s is <em>nothing</em> — a laptop Postgres absorbs it. 100,000 post-fetches/s at peak is <em>everything</em> — that 100:1 read:write ratio is the single number that mandates a cache tier and precomputed timelines (fan-out-on-write), which is exactly how Twitter's original timeline service was shaped (<a href="https://www.infoq.com/presentations/Twitter-Timeline-Scalability/">Krikorian, Timelines at Scale</a>). The estimate didn't just size the system — it <em>chose the architecture</em>.</p>
+
+  <h2>5 · Worked example — e-commerce checkout and payments</h2>
+  <pre><code>Assume: 5M DAU marketplace · 30 page views/user/day · 1 in 20 users buys/day
+        order record 2 KB · each order → ~5 payment-service calls
+        Black Friday peak: 10× (retail peaks are violent — use the top of the range)
+
+browse:  5M × 30 = 1.5×10⁸ views/day = 1,500 QPS avg → 15,000 QPS Black Friday
+orders:  5M ÷ 20 = 250k orders/day = 2.5 orders/s avg → 25/s peak
+payment: 25 × 5 = 125 payment calls/s at peak
+storage: 250k × 2 KB = 500 MB/day → ~180 GB/year of orders</code></pre>
+  <p>Two lessons hide in this napkin. First, <strong>the read side and the write side live in different worlds</strong>: 15,000 QPS of catalog browsing needs CDN + cache + replicas, while 25 orders/s needs almost no scale at all — one well-run relational database holds years of orders. What the <em>order path</em> needs instead is durability, idempotency, and audit — qualities, not quantities. This is why real payment systems obsess over idempotency keys rather than sharding (<a href="https://stripe.com/blog/idempotency">Stripe: idempotency in payment APIs</a>).</p>
+  <p>Second, <strong>peak factor is a business fact, not a math constant</strong>. A social feed peaks ~2–5× at evening hours; retail peaks 10×+ on promo days; payroll peaks on the 1st of the month; logistics peaks with shopping seasons. Asking "is your peak a daily rhythm or an event spike?" is a clarifying question that earns points on its own.</p>
+
+  <h2>6 · Worked example — Instagram-scale photo storage and CDN</h2>
+  <p>Rerun the feed with one changed assumption — users attach photos — and watch every conclusion flip:</p>
+  <pre><code>Assume: 10M DAU · 2 photos/user/day · 500 KB/photo · reads 100:1
+
+ingest:     10M × 2 × 500 KB = 10¹³ B = 10 TB/day   (vs 20 GB/day of text — 500×)
+replicated: × 3 for durability → 30 TB/day provisioned
+per year:   10 TB × 365 ≈ 3.6 PB/year raw → ~11 PB provisioned
+bandwidth:  ingest 10 TB/day ÷ 10⁵ s ≈ 100 MB/s sustained
+            egress at 100:1 reads ≈ 10 GB/s → CDN is not optional</code></pre>
+  <p>Three multipliers turn "manageable" into "petabytes," and interviewers check whether you apply them unprompted: <strong>replication ×3</strong> (or ~1.5× with erasure coding — say which you assumed), <strong>metadata and indexes ~×2</strong> on structured data (rows carry indexes, write-ahead logs, fragmentation), and <strong>growth</strong> (a 5-year horizon at 2×/year is ~30× — a design sized only for today expires in 18 months).</p>
+  <p>The architectural consequence is the classic <strong>metadata/blob split</strong>: small hot rows (post text, photo IDs, user graph) in a database; large immutable blobs in object storage behind a CDN. That is Instagram's actual shape — a modest relational core beside an ocean of objects (<a href="https://instagram-engineering.com/what-powers-instagram-hundreds-of-instances-dozens-of-technologies-adf2e22da2ad">Instagram Engineering: What Powers Instagram</a>) — and the same split appears in every photo, video, and document system you will ever design.</p>
+
+  <h2>7 · Common estimation traps — six ways napkins lie</h2>
+  <table>
+    <tr><th>Trap</th><th>Symptom</th><th>Guard rail</th></tr>
+    <tr><td>Designing for average, not peak</td><td>system dies at 8 pm or on Black Friday</td><td>always multiply by 2–10× and say the factor</td></tr>
+    <tr><td>Bits vs bytes</td><td>8× error on every bandwidth figure</td><td>networks quote bits (Gbps); storage quotes bytes (GB)</td></tr>
+    <tr><td>Forgetting replication + overhead</td><td>storage bill 3–6× the estimate</td><td>raw × 3 (replicas) × ~2 (indexes, logs)</td></tr>
+    <tr><td>Per-day vs per-second confusion</td><td>answers off by exactly 10⁵</td><td>write units on every line; make them cancel</td></tr>
+    <tr><td>Estimating means when tails rule</td><td>meets average SLO, fails p99 (Lesson 0001)</td><td>capacity from peak, latency from percentiles</td></tr>
+    <tr><td>Silent assumptions</td><td>five minutes of math on a wrong premise</td><td>voice every assumption as a question</td></tr>
+  </table>
+  <p>A seventh, subtler one: <strong>false precision as a tell</strong>. Saying "13,889 QPS" instead of "~15k" signals you computed 1.2B ÷ 86,400 by long division and missed the point. Precision beyond one significant figure is not rigor — it is noise wearing rigor's clothes.</p>
+
+  <h2>8 · From estimates to architecture decisions</h2>
+  <p>The whole reason to estimate is that each output crosses (or doesn't cross) a threshold that opens or closes a design door:</p>
+  <table>
+    <tr><th>Estimate says</th><th>Threshold crossed</th><th>Decision it drives</th></tr>
+    <tr><td>&lt; ~10k QPS</td><td>one commodity box's worth</td><td>load-balanced pair; no sharding conversation yet</td></tr>
+    <tr><td>≫ 10k QPS peak</td><td>multiple machines mandatory</td><td>horizontal scaling, stateless services, LB tiers</td></tr>
+    <tr><td>Hot set &lt; a few hundred GB</td><td>fits in RAM</td><td>cache the whole thing; DB becomes system of record</td></tr>
+    <tr><td>Read:write ≥ 10:1</td><td>read-dominated</td><td>cache tier, replicas, CDN, precomputed views</td></tr>
+    <tr><td>Write-heavy stream</td><td>ingest-dominated</td><td>append-friendly stores (LSM), queues, batch compaction</td></tr>
+    <tr><td>Data in TBs, single table</td><td>one node's disk/IOPS ceiling</td><td>partitioning/sharding — pick a key <em>now</em></td></tr>
+    <tr><td>Blobs in PBs</td><td>beyond databases entirely</td><td>object storage + metadata DB + CDN split</td></tr>
+    <tr><td>Egress ≫ ingest</td><td>bandwidth cost dominates</td><td>CDN, compression, regional replication</td></tr>
+  </table>
+  <p>This table is the bridge to the rest of Phase 1: Lesson 0003 (traffic and the edge) is the top rows; the storage lessons are the bottom rows. When you estimate in an interview, <em>narrate the doors as they open</em>: "500 MB/day of orders — storage is a non-problem, so I'll spend my complexity budget on the read path."</p>
+
+  <h2>9 · The same napkin, aimed at AI serving (one taste)</h2>
+  <p>Every technique above transfers unchanged to LLM infrastructure — only the constants change. Two formulas turn a model card into a capacity plan: <code>weights (bf16) = params × 2 bytes</code>, and <code>KV cache per token = 2 × layers × kv_heads × head_dim × 2 bytes</code>. Applied: a 70B model is 140 GB of weights — it does not even fit one 80 GB H100, forcing tensor parallelism across two GPUs, which then leave only ~20 GB of memory for roughly 7 concurrent 8k-token sessions (~2.7 GB of KV cache each). An 8B model (16 GB weights, ~1.1 GB per 8k session) fits ~60 sessions on <em>one</em> GPU. Same five lines of arithmetic as Section 4; ~15× difference in hardware. The lab drills these alongside the classic problems, and Phase 4 builds the full serving design on top of them.</p>
+
+  <h2>10 · Lab — drill until it's reflex</h2>
+  <div class="callout"><span class="label">Hands-on (do this before the quiz)</span>
+    <code>labs/lab-0002-napkin-math/</code> is a drill harness: <code>python3 napkin_math.py</code>
+    fires 10 estimation problems at you (QPS, storage, bandwidth, plus the GPU set from Section 9)
+    and grades your answer within order-of-magnitude tolerance — exactly how an interviewer would.
+    <code>python3 napkin_math.py --demo</code> prints 3 fully worked solutions to study first.
+    Then do exercises E1–E4 in the lab README: <em>predict, edit config, re-run, compare.</em>
+  </div>
+
+  <h2>11 · Project step</h2>
+  <p>Take the SLO sheet you wrote for the <strong>LLM inference gateway</strong> in Lesson 0001 and add a <strong>capacity line</strong> using Section 3's template: from your sustained RPS target and an assumed in-flight duration, estimate concurrent sessions; from an assumed model size and context length, compute memory demand and a machine count (Section 9's formulas). Then add one classic-systems line: estimated request-log volume per day (requests × ~1 KB structured log), with replication, and where it lives after 90 days. Bring both numbers — your teacher will attack the assumptions, which is the point.</p>
+
+  <h2>12 · Interview talking points</h2>
+  <p>How to run the five-minute estimation slot, in order:</p>
+  <ul>
+    <li><strong>Announce the transition.</strong> After clarifying: <em>"Let me spend three minutes on numbers so the design has a target."</em> Interviewers score candidates who structure their own time.</li>
+    <li><strong>Assumptions as questions.</strong> <em>"Assume 10M DAU and 5× peak — fair?"</em> Every assumption voiced is a correction opportunity and a collaboration signal.</li>
+    <li><strong>Round shamelessly, and say the tolerance.</strong> <em>"Within 10× is all we need here."</em> Never apologize for imprecision; explain it.</li>
+    <li><strong>Tie every number to a door.</strong> Numbers without decisions are trivia. <em>"100:1 reads — so a cache tier and precomputed feeds, and the write path stays boring."</em></li>
+    <li><strong>Close with a verdict line.</strong> <em>"So: ~15k QPS peak, ~10 TB/day of media, egress-dominated — the design has to be CDN-first."</em> That one sentence is the contract for the next 30 minutes.</li>
+    <li><strong>If pushed on precision,</strong> do one exact calculation to show you can, then return to powers of ten. The skill being tested is judgment about <em>when precision pays</em>.</li>
+    <li><strong>Run the red-flag list silently before moving on:</strong> peak? bits/bytes? replication? per-day/per-second? tail? Five seconds of checking beats five minutes of confidently wrong arithmetic.</li>
+  </ul>
+
+  <h2>Check yourself</h2>
+  <div class="quiz" id="quiz"></div>
+
+  <h2>Primary source</h2>
+  <p>Work through <strong><a href="https://github.com/sirupsen/napkin-math">sirupsen/napkin-math</a></strong> — the base rates table and practice problems are the closest thing to a gym for this skill. Companion references: the Primer's <a href="https://github.com/donnemartin/system-design-primer#powers-of-two-table">powers of two</a> and <a href="https://github.com/donnemartin/system-design-primer#latency-numbers-every-programmer-should-know">latency numbers</a> appendix, Jeff Dean's <a href="https://static.googleusercontent.com/media/research.google.com/en//people/jeff/stanford-295-talk.pdf">numbers talk</a>, and this course's <a href="../reference/0002-estimation-kit.html">Estimation Kit</a> (keep it open during the lab).</p>
+
+  <footer class="lesson-footer">
+    <p><strong>Stuck or curious?</strong> Ask your teacher (the agent) anything — "why does fan-out-on-write beat fan-out-on-read at 100:1 but lose for celebrity accounts?" is an excellent follow-up question.</p>
+    <nav class="lesson-nav">
+      <span>◀ Prev: <a href="0001-performance-vocabulary.html">0001 · Latency, Throughput, and the Tail</a></span>
+      <span>Next: <a href="0003-traffic-edge.html">0003 · Traffic and the Edge</a> ▶</span>
+    </nav>
+  </footer>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+renderQuiz(document.getElementById('quiz'), {
+  title: 'Check yourself',
+  questions: [
+    {
+      q: 'Average QPS is 2,000 and the interviewer asks for peak capacity. With no traffic data, what do you assume?',
+      options: [
+        'Peak equals average because traffic stays flat',
+        'Peak is one hundred times the average',
+        'Peak is two to ten times average',
+      ],
+      answer: 2,
+      explain: 'Without data, the standard assumption is a 2–10× peak factor (say 5×) — and the factor is a business fact: retail promo spikes are harsher than social evening rhythms. Flat traffic almost never happens; 100× would gold-plate the design.',
+    },
+    {
+      q: 'Why round 86,400 seconds per day to 10^5 during an interview estimate?',
+      options: [
+        'Speed matters more than false precision here',
+        'The exact figure is impossible to remember',
+        'Interviewers penalize candidates for using exact numbers',
+      ],
+      answer: 0,
+      explain: 'The 14% rounding error is noise next to the 2–10× uncertainty in your assumptions. Powers of ten keep the arithmetic fast enough to do while talking — and precision beyond one significant figure signals a missed point, not rigor.',
+    },
+    {
+      q: 'A photo product ingests 200M photos/day at 500 KB each. Raw new storage per day?',
+      options: [
+        'About 10 TB of new storage daily',
+        'About 100 TB of new storage daily',
+        'About 1 PB of new storage daily',
+      ],
+      answer: 1,
+      explain: '2×10⁸ × 5×10⁵ B = 10¹⁴ B = 100 TB/day. Media is ~1,000× text — a single assumption change (attachments) moves the answer by orders of magnitude, which is why you re-run the template when the data type changes.',
+    },
+    {
+      q: 'Your raw storage estimate is 100 TB/day. What does standard 3× replication make the provisioned figure?',
+      options: [
+        'Still 100 TB because replication is free',
+        'About 133 TB after replication overhead added',
+        'About 300 TB provisioned across the replicas',
+      ],
+      answer: 2,
+      explain: 'Nothing durable is stored once: triple replication means 3× raw, so 300 TB/day provisioned (erasure coding gets it to ~1.5×). Forgetting this multiplier is one of the six classic napkin traps.',
+    },
+    {
+      q: 'Your estimate says the hot dataset is 200 GB. What architecture door does that open?',
+      options: [
+        'Serve it from RAM on few machines',
+        'It requires a distributed file system immediately',
+        'It must be sharded across hundred nodes',
+      ],
+      answer: 0,
+      explain: '200 GB fits in memory on a couple of commodity boxes — the whole hot set can live in a cache tier with the database as system of record. Crossing (or not crossing) the fits-in-RAM threshold is exactly what estimates are for.',
+    },
+    {
+      q: 'When does back-of-envelope estimation happen in a 45-minute design interview?',
+      options: [
+        'At the end, verifying the finished design',
+        'Right after clarifying, within five short minutes',
+        'Before clarifying, to impress the interviewer early',
+      ],
+      answer: 1,
+      explain: 'Clarify requirements first, then estimate in ≤5 minutes. The outputs (peak QPS, storage class, bandwidth class) drive every architecture choice afterward — too late to compute them at the end.',
+    },
+  ],
+});
+</script>
+</body>
+</html>

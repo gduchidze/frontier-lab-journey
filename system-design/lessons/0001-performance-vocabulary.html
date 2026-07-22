@@ -9,7 +9,7 @@
 <body>
 <div class="lesson">
   <header class="lesson-header">
-    <p class="kicker">Lesson 0001 · Phase 1 — Distributed Systems Core</p>
+    <p class="kicker">Lesson 0001 · Phase 1 — Distributed Systems Core · <a href="0001-performance-vocabulary.ka.html">ქართული ვერსია</a></p>
     <h1>Latency, Throughput, and the Tail</h1>
     <p class="dek">The three words every design answer is graded in — and why the average is a lie.</p>
   </header>
@@ -52,7 +52,16 @@
                                           while the GPU's compute units sit mostly idle.</code></pre>
   <p>Decode is <strong>memory-bandwidth-bound</strong> — which is exactly why serving systems batch many users onto one weight-read. Latency vs throughput, again. We will build this into a full design in lessons 22–26.</p>
 
-  <h2>5 · Project step</h2>
+  <h2>5 · Lab — measure the tail yourself</h2>
+  <div class="callout"><span class="label">Hands-on (do this before the quiz)</span>
+    Everything above is now verifiable in <code>labs/lab-0001-measure-the-tail/</code>:
+    <code>python3 latency_lab.py</code> runs three experiments — mean-vs-p99 on a 1%-tail service,
+    fan-out amplification (watch measured % converge to 1 − 0.99<sup>N</sup>), and the batching
+    throughput/latency trade. Then do exercises E1–E4 in the lab README: <em>predict, edit config,
+    re-run, compare.</em> Wrong predictions are the deliverable — bring them to the next session.
+  </div>
+
+  <h2>6 · Project step</h2>
   <p>Our spine project is an <strong>LLM inference gateway</strong>. Its birth certificate is an SLO sheet. In a scratch note (or in your head, then check), write SLOs for it covering: <strong>TTFT</strong> p50 and p99, <strong>TPOT</strong> p50, sustained <strong>throughput</strong> in requests/sec and tokens/sec, and availability. (TTFT/TPOT are defined in the <a href="../reference/0001-glossary.html">Glossary</a>.) A defensible example: TTFT p99 &lt; 1 s, TPOT p50 &lt; 50 ms, 1,000 RPS sustained, 99.9% availability. There is no single right answer — the skill is <em>stating</em> targets before designing. Bring your sheet to the next session and your teacher will critique it.</p>
 
   <h2>Check yourself</h2>

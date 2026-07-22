@@ -173,6 +173,16 @@ th, td { padding: 0.45rem 0.6rem; border-bottom: 1px solid var(--border); vertic
 .quiz .explain { font-size: 0.85rem; color: var(--muted); margin: 0.4rem 0 0; display: none; }
 .quiz .q.answered .explain { display: block; }
 
+/* ---------- language switch ---------- */
+.lang-switch {
+  font-family: var(--mono);
+  font-size: 0.72rem;
+  text-align: right;
+  margin: -1.5rem 0 1rem;
+}
+.lang-switch a { text-decoration: none; color: var(--muted); border: 1px solid var(--border); border-radius: 999px; padding: 0.2rem 0.7rem; }
+.lang-switch a:hover { color: var(--accent); border-color: var(--accent); }
+
 /* ---------- footer nav ---------- */
 .lesson-footer {
   margin-top: 3.5rem;

@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<html lang="ka">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>გაკვეთილი 2 — Production-ის ფორმის მანიფესტები</title>
+<link rel="stylesheet" href="../../assets/course.css">
+</head>
+<body>
+<div class="page">
+<p class="lang-switch"><a href="../0002-production-manifests.html">🇬🇧 English</a></p>
+
+<p class="lesson-kicker">SLM Production Stack · გაკვეთილი 2 · ფაზა 2 · ~90 წთ</p>
+<h1>Production-ის ფორმის მანიფესტები</h1>
+<p class="lesson-lede">გაკვეთილი 1-ში გენერატორ ბრძანებებს იყენებდი. რეალური გუნდები YAML-ს git-ში ინახავენ. დღეს მანიფესტებს (manifest — სასურველი მდგომარეობის დეკლარაცია) ხელით დაწერ — namespace-ებით, resource limit-ებით და health probe-ებით — ზუსტად ის სამი ბერკეტი, რომელიც vLLM deployment-ს ან ააწყობს, ან ჩაშლის.</p>
+
+<div class="note"><strong>წინაპირობა</strong>
+<a href="0001-first-cluster.html">გაკვეთილი 1-ის</a> cluster-ი <code>llm-stack</code> გაშვებულია (<code>kubectl get nodes</code> → 2 Ready). თუ არა: <code>kind create cluster --config k8s/kind-config.yaml</code>.</div>
+
+<h2>ცოდნა: ხუთი იდეა</h2>
+
+<h3>1. ყველაფერი მანიფესტია</h3>
+<p>მანიფესტი არის YAML, რომელიც სასურველ მდგომარეობას აცხადებს: <code>apiVersion</code> + <code>kind</code> + <code>metadata</code> + <code>spec</code>. <code>kubectl apply -f</code> მას API server-ს უგზავნის; controller-ები კი მას რეალობად აქცევენ. git-ში დაკომიტებული მანიფესტები = შენს ინფრასტრუქტურას აქვს code review, ისტორია, rollback. სწორედ ამიტომ არის "GitOps" სამსახურის მოთხოვნა. სრული ანოტირებული ჩონჩხები: <a href="../../reference/k8s-manifest-anatomy.html">manifest anatomy reference</a>.</p>
+
+<h3>2. Namespace-ები კლასტერს ანაწილებენ</h3>
+<p><a href="https://kubernetes.io/docs/concepts/overview/working-with-objects/namespaces/">Namespace</a> (სახელთა სივრცე) არის კლასტერის დასახელებული ნაჭერი. ჩვენი სტეკი ცხოვრობს <code>llm</code>-ში; მონიტორინგი იცხოვრებს <code>monitoring</code>-ში. DNS კლასტერის შიგნით: <code>&lt;service&gt;.&lt;namespace&gt;.svc.cluster.local</code> — დაიმახსოვრე ეს, router-ისა და UI-ის გაკვეთილები მასზეა დამოკიდებული.</p>
+
+<h3>3. Request-ები და limit-ები</h3>
+<p><strong>Request</strong> = ის, რასაც scheduler შენთვის იჯავშნის ("დასათავსებლად 4 CPU მჭირდება"). <strong>Limit</strong> = ჭერი, რომლის გადაკვეთისთვისაც მოგკლავენ (მეხსიერება → <code>OOMKilled</code>). (<a href="https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/">დოკუმენტაცია</a>) 16 GB Mac-ზე ეს აკადემიური საკითხი არ არის: vLLM CPU-ს ~6 Gi მოუნდება. request-ები ზედმეტად მაღლა დააყენე → Pod სამუდამოდ <code>Pending</code>-ში გაიჭედება. ეს #1 GPU-cluster უნარიცაა — GPU-ები იმავე გზით მოითხოვება (<code>nvidia.com/gpu: 1</code>).</p>
+
+<h3>4. სამი probe</h3>
+<table>
+<tr><th>Probe</th><th>კითხვა</th><th>ჩავარდნისას</th><th>vLLM-ის კონტექსტში</th></tr>
+<tr><td>startup</td><td>ჩატვირთვა დაასრულე?</td><td>ლოდინი გრძელდება (ზღვრამდე)</td><td>მოდელი ჯერ კიდევ იტვირთება/ჩამოიტვირთება — შეიძლება წუთები დასჭირდეს</td></tr>
+<tr><td>readiness</td><td>შეგიძლია <em>ახლა</em> ტრაფიკის მიღება?</td><td>ამოღება Service-ის endpoint-ებიდან</td><td>Engine დაკავებულია/გადატვირთულია — აქ routing შეწყდეს</td></tr>
+<tr><td>liveness</td><td>საერთოდ ცოცხალი ხარ?</td><td>კონტეინერი გადაიტვირთება</td><td>Engine გაიჭედა — მოკვლა და ხელახლა ჩატვირთვა</td></tr>
+</table>
+<p>startup probe-ის გარეშე ნელა ჩამტვირთავ მოდელს liveness ციკლურად კლავს: კლასიკური <code>CrashLoopBackOff</code> deploy-ისას. (<a href="https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/">დოკუმენტაცია</a>)</p>
+
+<h3>5. ConfigMap-ები და Secret-ები</h3>
+<p>კონფიგურაცია image-ის გარეთ ცხოვრობს: <strong>ConfigMap</strong> ჩვეულებრივი პარამეტრებისთვის, <strong>Secret</strong> ავტორიზაციის მონაცემებისთვის (შენი Hugging Face token ფაზა 4-ში). ინექცია ხდება env ცვლადებად ან ფაილებად. token-ები არასდროს ჩააშენო image-ებში ან git-ში დაკომიტებულ YAML-ში.</p>
+
+<h2>ლაბორატორია: hello-ს ხელახლა აწყობა, production-ის ფორმით</h2>
+<p>იგივე nginx, რაც გაკვეთილ 1-ში — მაგრამ ახლა namespace-ში, რესურსებით შემოსაზღვრული, probe-ებით და ConfigMap-ით კონფიგურირებული. მერე კი განზრახ გავაფუჭებთ.</p>
+
+<div class="lab">
+
+<div class="step">
+<h3>შექმენი აპლიკაციის მანიფესტები</h3>
+<p>შეინახე როგორც <code>k8s/lab2.yaml</code> (რამდენიმე დოკუმენტი, <code>---</code>-ით გამოყოფილი):</p>
+<pre><code>apiVersion: v1
+kind: Namespace
+metadata:
+  name: llm
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: hello-config
+  namespace: llm
+data:
+  index.html: |
+    &lt;h1&gt;Served by Kubernetes, configured by ConfigMap&lt;/h1&gt;
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hello
+  namespace: llm
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app: hello }
+  template:
+    metadata:
+      labels: { app: hello }
+    spec:
+      containers:
+      - name: web
+        image: nginx:alpine
+        ports:
+        - containerPort: 80
+        resources:
+          requests: { cpu: 100m, memory: 64Mi }
+          limits:   { cpu: 500m, memory: 128Mi }
+        startupProbe:
+          httpGet: { path: /, port: 80 }
+          periodSeconds: 2
+          failureThreshold: 15
+        readinessProbe:
+          httpGet: { path: /, port: 80 }
+          periodSeconds: 5
+        livenessProbe:
+          httpGet: { path: /, port: 80 }
+          periodSeconds: 10
+        volumeMounts:
+        - name: content
+          mountPath: /usr/share/nginx/html
+      volumes:
+      - name: content
+        configMap: { name: hello-config }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: hello
+  namespace: llm
+spec:
+  selector: { app: hello }
+  ports:
+  - port: 80
+    targetPort: 80</code></pre>
+</div>
+
+<div class="step">
+<h3>Apply და გადამოწმება</h3>
+<pre><code>kubectl apply -f k8s/lab2.yaml
+kubectl get pods -n llm -w      # wait for 2/2 READY 1/1, Ctrl+C
+kubectl port-forward -n llm svc/hello 8080:80</code></pre>
+<p>მეორე ტერმინალი:</p>
+<pre><code>curl -s localhost:8080</code></pre>
+<p class="expect">მოსალოდნელია: ConfigMap-ის HTML და არა nginx-ის სტანდარტული გვერდი</p>
+</div>
+
+<div class="step">
+<h3>გააფუჭე readiness probe — უყურე, როგორ იწრიტება ტრაფიკი</h3>
+<pre><code>kubectl exec -n llm deploy/hello -- rm /usr/share/nginx/html/index.html 2>/dev/null; \
+kubectl get pods -n llm -w</code></pre>
+<p>მოიცადე — ამან ᲔᲠᲗᲘ pod-ის დამაუნთებული volume-იდან წაშალა? არა: ConfigMap-ის mount-ები read-only-ა. სცადე — <code>rm</code> ჩავარდება. კარგია. გააფუჭე სხვაგვარად — მიმართე probe იმ path-ზე, რომელიც არ არსებობს:</p>
+<pre><code>kubectl patch deployment hello -n llm --type=json -p='[
+ {"op":"replace","path":"/spec/template/spec/containers/0/readinessProbe/httpGet/path","value":"/nope"}]'
+kubectl get pods -n llm -w</code></pre>
+<p class="expect">მოსალოდნელია: ახალი pod-ები ჩნდება, მაგრამ READY 0/1-ზე რჩება — rollout ჩერდება, ᲫᲕᲔᲚᲘ pod-ები კი აგრძელებენ მომსახურებას</p>
+<p>ეს არის დამცავი ბადე მოქმედებაში: Kubernetes უარს ამბობს მომუშავე Pod-ების გაფუჭებულებით ჩანაცვლებაზე. შეამოწმე, <em>რატომ</em> არ არის ready:</p>
+<pre><code>kubectl describe pod -n llm -l app=hello | grep -A3 "Readiness"
+kubectl rollout undo deployment/hello -n llm
+kubectl get pods -n llm</code></pre>
+<p class="expect">მოსალოდნელია: undo-ს შემდეგ ისევ 2 pod READY 1/1</p>
+</div>
+
+<div class="step">
+<h3>გააფუჭე მეხსიერება — გაიცანი OOMKilled</h3>
+<p>გაუშვი Pod, რომელიც თავის limit-ზე მეტს გამოყოფს:</p>
+<pre><code>kubectl run oom-demo -n llm --image=polinux/stress --restart=Never \
+  --limits=memory=64Mi \
+  -- stress --vm 1 --vm-bytes 128M --vm-hang 0
+sleep 10 && kubectl get pod oom-demo -n llm
+kubectl describe pod oom-demo -n llm | grep -A2 "Last State"</code></pre>
+<p class="expect">მოსალოდნელია: STATUS OOMKilled — ზუსტად ის ჩავარდნა, რომელსაც დაადიაგნოსტირებ, როცა vLLM მეხსიერების limit-ს გადააჭარბებს</p>
+<pre><code>kubectl delete pod oom-demo -n llm</code></pre>
+<div class="win"><strong>მოგება</strong>
+შენ ახლა პრაქტიკაში ნახე ის ორი ჩავარდნის რეჟიმი, რომლებიც რეალურ vLLM ოპერაციებში დომინირებს: <em>readiness-ის ჩავარდნა → ტრაფიკი იწრიტება</em> და <em>OOMKilled → limit-ები ზედმეტად მჭიდროა</em>. ფაზა 4-ში ამ ბერკეტებს ნამდვილი engine-ისთვის დააყენებ.</div>
+</div>
+
+<div class="step">
+<h3>წაშალე აპლიკაცია, namespace დაიტოვე</h3>
+<pre><code>kubectl delete deployment hello -n llm
+kubectl delete svc hello -n llm
+kubectl delete configmap hello-config -n llm</code></pre>
+</div>
+
+</div>
+
+<h2>შეამოწმე საკუთარი თავი</h2>
+<div class="quiz" data-quiz>
+  <div class="q">
+    <p class="stem">vLLM-ს მოდელის ჩატვირთვას 4 წუთი სჭირდება. რომელი probe აღკვეთს restart-ციკლებს ჩატვირთვისას?</p>
+    <button class="opt" data-correct>Startup probe მაღალი failure threshold-ით</button>
+    <button class="opt">Liveness probe მაღალი failure threshold-ით</button>
+    <button class="opt">Readiness probe გრძელი საწყისი დაყოვნებით</button>
+    <p class="explain">startup probe თიშავს liveness შემოწმებას, სანამ თავად არ გაივლის. liveness-ის გაწელვა მუშაობს, მაგრამ სამუდამოდ ასუსტებს გაჭედვის აღმოჩენას; startup probe-ები მხოლოდ ჩატვირთვას ფარავენ.</p>
+  </div>
+  <div class="q">
+    <p class="stem">Pod ითხოვს 8 CPU-ს node-ზე, რომელსაც 6 თავისუფალი აქვს. შედეგი?</p>
+    <button class="opt" data-correct>Pending სამუდამოდ, scheduler ვერ პოულობს შესაფერის ადგილს</button>
+    <button class="opt">ნელა მუშაობს, ექვს CPU-მდე შეზღუდული</button>
+    <button class="opt">სხვებს დევნის, scheduler CPU-ებს ითვისებს</button>
+    <p class="explain">Request-ები scheduling-ის კონტრაქტია. ვერცერთი node ვერ აკმაყოფილებს → <code>Pending</code>. <code>kubectl describe pod</code> → Events აჩვენებს "Insufficient cpu"-ს.</p>
+  </div>
+  <div class="q">
+    <p class="stem">Readiness probe ორი რეპლიკიდან ერთზე ვარდება. რა მოუვა მას?</p>
+    <button class="opt" data-correct>ამოღება Service-ის endpoint-ებიდან, გაშვებული რჩება</button>
+    <button class="opt">kubelet გადატვირთავს, მერე Service-ს უბრუნდება</button>
+    <button class="opt">Deployment წაშლის, შემცვლელი შეიქმნება</button>
+    <p class="explain">Readiness მხოლოდ ტრაფიკს აკონტროლებს. გადატვირთვები liveness-ის საქმეა; ჩანაცვლება — Deployment-ის საქმე, როცა Pod-ები კვდებიან.</p>
+  </div>
+</div>
+
+<h2>პირველადი წყარო</h2>
+<p><a href="https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/">Configure Liveness, Readiness and Startup Probes</a> (K8s docs, 20 წთ). ზემოთ მოცემული probe-ების ცხრილი მას აჯამებს; დოკუმენტში კი ის edge case-ებია, რომლებიც ინტერვიუერებს უყვართ.</p>
+
+<h2>შემდეგი</h2>
+<p><a href="0003-vllm-engine-docker.html">გაკვეთილი 3</a>: ერთი სესიით Kubernetes-ს ვტოვებთ და თავად engine-ს ვხვდებით — vLLM CPU-ზე, ჩვეულებრივ Docker-ში, Qwen-თან საუბარში.</p>
+
+<div class="lesson-footer">
+<p>Reference მასალები: <a href="../../reference/k8s-manifest-anatomy.html">manifest anatomy</a> · <a href="../../reference/kubectl-cheatsheet.html">kubectl cheat sheet</a>.</p>
+<p>გაიჭედე? ჰკითხე შენს მასწავლებელს (აგენტს) — ჩასვი error და ერთად გავადებაგებთ.</p>
+</div>
+
+</div>
+<script src="../../assets/quiz.js"></script>
+</body>
+</html>

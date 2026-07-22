@@ -46,47 +46,55 @@ Added 2026-07-22 on user request. **Diagnostic-driven:** each lesson opens with 
 8. **Asynchronism & communication** — message vs task queues (Kafka/RabbitMQ/SQS/Celery), backpressure (503 + exponential backoff), TCP vs UDP, RPC (gRPC/Protobuf) vs REST, idempotency. [Primer §14–15]
 9. **Interview OS** — the 4-step framework (use cases/constraints → high-level → core components → scale), security checklist. First timed mini-design. [Primer interview approach]
 
-### Phase 2 — Classic design reps (lessons 10–16, each a timed 50-min rep)
-10. **API rate limiter** — token/sliding window, distributed counters, Redis. [Primer Qs]
-11. **Pastebin + TinyURL** — ID generation incl. Snowflake, read-heavy caching. [Primer solutions]
-12. **Twitter timeline/news feed** — fanout-on-write vs read, celebrity problem. [Primer solutions]
-13. **Web crawler** — frontier, politeness, dedup, DFS/BFS at scale. [Primer solutions]
-14. **Distributed KV store / query cache** — consistent hashing, LRU, replication. [Primer solutions]
-15. **Distributed search, 1B docs** — inverted indexes, sharded ranking, merge — reported Anthropic prompt. [Primer Qs + real-world architectures]
-16. **Scaling to millions of users on AWS** — capstone evolution rep. [Primer solutions]
+### Phase 2 — Software architecture & reliability (lessons 10–17) [ADDED 2026-07-23: broader-SWE rebalance]
+10. **Monolith → microservices** — decomposition criteria, service discovery (Consul/etcd/Zookeeper), API gateway vs BFF, when microservices are the wrong answer. [Primer §11, DDIA]
+11. **API design deep** — REST semantics done right, versioning, pagination (cursor vs offset), idempotency keys, webhooks; gRPC vs GraphQL vs REST decision table. [Primer §15]
+12. **Storage engine internals** — B-tree vs LSM-tree (read vs write amplification), WAL, compaction; object vs block vs file storage (S3 model). [DDIA ch3]
+13. **Streams & events** — Kafka model (partitions, consumer groups, offsets, log compaction), event-driven architecture, event sourcing + CQRS, exactly-once revisited. [DDIA ch11]
+14. **Distributed transactions & coordination** — sagas, outbox pattern, 2PC and why it's avoided; consensus high level (Raft), leader election, distributed locks + fencing tokens. [DDIA ch8–9]
+15. **Reliability patterns** — timeouts, retry budgets, circuit breakers, bulkheads, load shedding, graceful degradation, chaos engineering. [AWS Builders' Library, Release It! patterns]
+16. **Observability & ops** — structured logs, metrics (RED/USE), distributed tracing, SLI/SLO/error budgets, alerting philosophy, incident response. [Google SRE book]
+17. **Security & multi-tenancy** — OAuth2/OIDC/JWT, mTLS, secrets management, rate limiting as security control, tenant isolation models. [Primer §16]
 
-### Phase 3 — ML system design patterns (lessons 17–21)
-17. **ML serving patterns** — web-single, sync vs async vs batch, prep-pred split, microservice vertical/horizontal; antipatterns (online-bigsize, all-in-one). [Mercari serving, DMLS ch7]
-18. **Data & training infra** — feature pipelines, data/model versioning, batch & pipeline training, param/arch search; antipatterns (training-code-in-serving, too-many-pipes). [Mercari training/operation, DMLS ch4–6]
-19. **Prediction ops** — prediction cache & data cache, circuit breaker, multi-stage prediction, condition/parameter-based serving, model-in-image vs model-load. [Mercari serving/operation]
-20. **ML QA in prod** — shadow A/B, online A/B, load testing, prediction logs/monitoring, drift detection; offline-only antipattern. [Mercari QA, DMLS ch8–9]
-21. **Rep: recommendation engine (50M users) or fraud detection (100 ms hybrid ML+rules)**. [AISD case studies 11, 14]
+### Phase 3 — Classic design reps (lessons 18–28, each a timed 50-min rep)
+18. **API rate limiter** — token/sliding window, distributed counters, Redis. [Primer Qs]
+19. **Pastebin + TinyURL** — ID generation incl. Snowflake, read-heavy caching. [Primer solutions]
+20. **Twitter timeline/news feed** — fanout-on-write vs read, celebrity problem. [Primer solutions]
+21. **Chat system (WhatsApp)** — WebSockets, presence, delivery receipts, message ordering, offline queues. [Primer Qs]
+22. **File sync (Dropbox)** — chunking, dedup, delta sync, conflict resolution. [Primer Qs]
+23. **Notification system + distributed scheduler** — multi-channel fanout, dedup, cron at scale. [Primer Qs]
+24. **Web crawler** — frontier, politeness, dedup, DFS/BFS at scale. [Primer solutions]
+25. **Distributed KV store / query cache** — consistent hashing, LRU, replication. [Primer solutions]
+26. **Distributed search, 1B docs** — inverted indexes, sharded ranking, merge — reported Anthropic prompt. [Primer Qs + real-world architectures]
+27. **Payment system** — idempotency, double-entry ledger, reconciliation, exactly-once money movement. [classic senior rep]
+28. **Scaling to millions of users on AWS** — capstone evolution rep. [Primer solutions]
 
-### Phase 4 — LLM inference & GPU infra (lessons 22–27) ← Anthropic core
-22. **Inference anatomy** — transformer forward pass at serving time, prefill vs decode, TTFT/TPOT, why decode is memory-bound. [vLLM, AISD 01/04]
-23. **KV cache economics** — sizing math, quadratic recompute avoided, cache growth vs batch size, prefix caching. [vLLM, DigitalOcean KV article]
-24. **Continuous batching + PagedAttention** — iteration-level scheduling, block tables, fragmentation, preemption; vLLM engine loop (schedule→step→postprocess). [vLLM]
-25. **Model routing & cost** — AI gateways, fallback/rate limiting (LiteLLM-style), quantization, speculative decoding, distillation pipelines, token FinOps. [AISD 11-03/04, case study 19]
-26. **THE REP: inference batching service @ 100k RPS** — full 50-min design; also token-generation service variant. [Exponent guide + everything above]
-27. **Distributed training & multi-tenant fine-tuning** — data/tensor/pipeline parallelism basics, checkpointing, LoRA hot-swap platforms (280-tenant case). [AISD case study 17, DDIA batch ch]
+### Phase 4 — ML system design patterns (lessons 29–33)
+29. **ML serving patterns** — web-single, sync vs async vs batch, prep-pred split, microservice vertical/horizontal; antipatterns (online-bigsize, all-in-one). [Mercari serving, DMLS ch7]
+30. **Data & training infra** — feature pipelines, data/model versioning, batch & pipeline training, param/arch search; antipatterns (training-code-in-serving, too-many-pipes). [Mercari training/operation, DMLS ch4–6]
+31. **Prediction ops** — prediction cache & data cache, circuit breaker, multi-stage prediction, condition/parameter-based serving, model-in-image vs model-load. [Mercari serving/operation]
+32. **ML QA in prod** — shadow A/B, online A/B, load testing, prediction logs/monitoring, drift detection; offline-only antipattern. [Mercari QA, DMLS ch8–9]
+33. **Rep: recommendation engine (50M users) or fraud detection (100 ms hybrid ML+rules)**. [AISD case studies 11, 14]
 
-### Phase 5 — AI application systems (lessons 28–31)
-28. **RAG at production scale** — chunking, vector DBs (Pinecone/Qdrant/Milvus trade-offs), hybrid search, reranking (cross-encoder, ColBERT late-interaction), contextual retrieval, multimodal RAG, millions-of-docs scaling. [AISD 06]
-29. **Agentic systems infra** — tool use/MCP, durable execution (exactly-once, replay, Temporal), memory tiers L1–L3, loop engineering & token budgets. [AISD 07/08]
-30. **Multi-tenant & security** — RBAC/ABAC, tenant isolation defense-in-depth, permission-aware retrieval (2M docs case), sandboxing computer-use agents. [AISD 12, case studies 08/15/16]
-31. **Evals & observability** — LLM judges, RAG eval, eval-gated CI/CD (block PRs on quality regression), monitoring/tracing. [AISD 14/18, case study 18]
+### Phase 5 — LLM inference & GPU infra (lessons 34–40) ← Anthropic core
+34. **Inference anatomy** — prefill vs decode, TTFT/TPOT, why decode is memory-bound. [vLLM, AISD 01/04]
+35. **KV cache economics** — sizing math, cache growth vs batch size, prefix caching. [vLLM, DigitalOcean KV article]
+36. **Continuous batching + PagedAttention** — iteration-level scheduling, block tables, preemption; vLLM engine loop. [vLLM]
+37. **Streaming token delivery** — SSE vs WebSockets vs gRPC streams, 100k concurrent connections, tokenizer-service placement. [interviewing.io, vLLM]
+38. **Model routing & cost** — AI gateways, fallback/rate limiting, quantization, speculative decoding, distillation, token FinOps. [AISD 11-03/04, case study 19]
+39. **THE REP: inference batching service @ 100k RPS** — full 50-min design; token-generation variant. [Exponent + everything above]
+40. **Distributed training + multi-tenant GPU scheduling** — data/tensor/pipeline parallelism, checkpointing, LoRA hot-swap, fair-share/preemption/quotas. [AISD case study 17, reported Anthropic topic]
 
-### Phase 4b — additions from gap research 2026-07-22
-27b. **Streaming token delivery** — SSE vs WebSockets vs gRPC streams, connection state at 100k concurrent, tokenizer-service placement/batching. [interviewing.io, vLLM]
-27c. **Multi-tenant GPU scheduling** — fair-share vs priority queues, preemption, tenant isolation on shared GPUs, quota/admission control. [reported Anthropic topic]
+### Phase 6 — AI application systems (lessons 41–45)
+41. **RAG at production scale** — chunking, vector DBs, hybrid search, reranking, contextual retrieval, millions-of-docs scaling. [AISD 06]
+42. **Agentic systems infra** — tool use/MCP, durable execution, memory tiers, loop engineering. [AISD 07/08]
+43. **Multi-tenant & security for AI** — tenant isolation defense-in-depth, permission-aware retrieval, sandboxing. [AISD 12, case studies 08/15/16]
+44. **Eval pipeline design** — large-scale evaluation as batch/stream system: orchestration, result storage, judge fanout. [reported Anthropic prompt class]
+45. **Safety/red-teaming workflow design** — human-in-the-loop review queues, sampling, escalation, audit trails. [reported Anthropic prompt class]
 
-### Phase 5b — Anthropic-specific system classes
-31b. **Eval pipeline design** — large-scale model evaluation as a batch/stream system: job orchestration, result storage, judge-model fanout. [reported Anthropic prompt class]
-31c. **Safety/red-teaming workflow design** — human-in-the-loop review queues, sampling strategies, escalation, audit trails. [reported Anthropic prompt class — unique to Anthropic, low coverage elsewhere]
-
-### Phase 6 — Interview execution (lessons 32+)
-32. **50-min protocol drills** — clarify → estimate → high-level → deep-dive → trade-offs; driving without guidance (Anthropic staff bar). [Exponent]
-33+. **Mock rotation** through AISD 116-question bank + 9 whiteboard exercises; one case study dissection per session from the 20 worked architectures.
+### Phase 7 — Interview execution (lessons 46+)
+46. **50-min protocol drills** — clarify → estimate → high-level → deep-dive → trade-offs; driving without guidance (Anthropic staff bar). [Exponent]
+47+. **Mock rotation** through AISD 116-question bank + Primer question list; one case study dissection per session.
 
 ## Mastery protocol (how the user turns coverage into skill)
 1. **Lesson → quiz → project step** (this course): builds fluency.
@@ -116,6 +124,10 @@ Five stages, ~4–6 weeks: recruiter call → technical screen (coding + ML fund
 ## Preferences observed
 - 2026-07-22: v1 syllabus rejected — wants advanced depth + heavy research per topic. Keep lessons short but content dense; assume fast learner.
 - Project-based; prefers direct research over agent delegation (rejected subagent spawn).
+- 2026-07-23: ~~Georgian version of every lesson~~ **PAUSED later same day** — user: English first, Georgian later. KA exists for 0001 (+ any agents finished before the stop order). Convention when resumed: `NNNN-<slug>.ka.html`, cross-linked kickers, tech terms English with Georgian gloss.
+- 2026-07-23: **Depth over brevity (supersedes "keep lessons short")** — user asked for "full knowledge": comprehensive detailed English lessons, 7–10 sections, tables, worked examples, failure modes, closing "Interview talking points" section.
+- 2026-07-23: **Broaden as SOFTWARE engineering, less AI-centric** — primary examples must be classic systems (e-commerce, social, payments, logistics); AI/LLM at most one short subsection per lesson. Roadmap restructured: new Phase 2 (software architecture & reliability, lessons 10–17), Phase 3 classic reps expanded to 11 (chat, Dropbox, notifications, payments added); AI phases moved to 4–6; interview execution now Phase 7. Total ≈ 47 lessons + Phase 0.
+- 2026-07-23: **"Doing > theory" — every lesson MUST ship a practical lab.** Convention: `labs/lab-NNNN-<slug>/` with runnable stdlib-Python (or real infra later) + README of predict-edit-rerun exercises; lesson links the lab; lab deliverable = prediction-vs-observed notes, which seed learning records. Lab 0001 (measure the tail) retrofitted to lesson 0001. Phase 1 lab ideas: L2 estimation → napkin-math checker script; L3 load balancing → toy LB with health checks in front of 3 local HTTP servers; L4 replication → simulate replication lag; L5–7 → SQLite/Redis-style experiments; L8 → queue + backpressure simulation with 503s.
 
 ## Working notes
 - Workspace strictly `system-design/`. Root-level MISSION.md/lessons/ belong to another workspace — do not touch.

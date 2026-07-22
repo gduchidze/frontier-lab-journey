@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="ka">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>გაკვეთილი 13 — უსაფრთხოება და მრავალმომხმარებლიანობა (Multi-Tenancy)</title>
+<link rel="stylesheet" href="../../assets/course.css">
+</head>
+<body>
+<div class="page">
+<p class="lang-switch"><a href="../0013-security-multitenancy.html">🇬🇧 English</a></p>
+
+<p class="lesson-kicker">SLM Production Stack · გაძლიერებული · გაკვეთილი 13 · ~2 სთ</p>
+<h1>უსაფრთხოება და მრავალმომხმარებლიანობა (Multi-Tenancy)</h1>
+<p class="lesson-lede">Inference-პლატფორმას ორი განძი აქვს: ძვირადღირებული გამოთვლითი რესურსი, რომლის "სესხებაც" ყველას სიამოვნებით უნდა, და prompt-ები, სავსე მომხმარებელთა მონაცემებით. დღეს: მრავალშრიანი დაცვა (defense in depth) ორივესთვის — ქსელი, იდენტობა, რესურსები და engine-ის საკუთარი შესასვლელი კარი.</p>
+
+<h2>ცოდნა</h2>
+
+<h3>1. 4C მენტალური მოდელი</h3>
+<p>Cloud → Cluster → Container → Code: თითოეული შრე მხოლოდ იმდენად ძლიერია, რამდენადაც მის გარეთა შრეები. დღეს ვმუშაობთ Cluster-ზე (RBAC, NetworkPolicy, კვოტები) და Container/Code-ზე (image-ების ჰიგიენა, engine-ის ავთენტიფიკაცია). (<a href="https://kubernetes.io/docs/concepts/security/overview/">დოკუმენტაცია</a>)</p>
+
+<h3>2. NetworkPolicy: default-deny, შემდეგ დაუშვი შენ მიერ დახაზული გრაფი</h3>
+<p>ბრტყელი pod-ქსელი = ნებისმიერ კომპრომეტირებულ pod-ს შეუძლია curl-ით შენს engine-ებამდე მიწვდეს. <strong>NetworkPolicy</strong> (ქსელური პოლიტიკა) pod-ის დონის firewall-ია — მაგრამ მხოლოდ მაშინ, თუ CNI მას აღასრულებს (kind-ის ნაგულისხმევი kindnet ამას არ აკეთებს; სწორედ ამიტომ დააინსტალირა მე-11 ლაბორატორიამ Cilium). საპროდაქშენო პატერნი:</p>
+<pre><code>1. default-deny ingress in the namespace
+2. allow: ui → router (port 8000)
+3. allow: router → engines (port 8000)
+4. allow: monitoring → engines (/metrics)
+5. everything else stays dead — including engine → engine</code></pre>
+<p>შენი არქიტექტურული დიაგრამა მე-8 გაკვეთილიდან სწორედ ეს allowlist-ია. თუ დახაზვა შეგიძლია, აღსრულებაც შეგიძლია.</p>
+
+<h3>3. RBAC როგორც აუდიტირებადი ზედაპირი</h3>
+<p>მინიმალური პრივილეგიები განწყობა კი არა, query-ა:</p>
+<pre><code>kubectl auth can-i --list --as=system:serviceaccount:llm:vllm-router -n llm
+kubectl auth can-i delete pods --as=system:serviceaccount:ui:default -n llm</code></pre>
+<p>სენიორის ჩვევა: ServiceAccount-ების აუდიტი კვარტალში ერთხელ; ყველაფერი, რასაც <code>cluster-admin</code> ან <code>*</code> verbs აქვს, ან თავს ამართლებს, ან კვდება. შენი router-ის 3-verb-იანი Role მე-6 გაკვეთილიდან სამაგალითო მოქალაქეა.</p>
+
+<h3>4. Tenancy = namespace + quota + limits + netpol, როგორც ერთი მთლიანობა</h3>
+<table>
+<tr><th>ობიექტი</th><th>რას აკონტროლებს</th><th>LLM-პლატფორმის მაგალითი</th></tr>
+<tr><td><code>ResourceQuota</code></td><td>Namespace-ის ჯამურ რესურსებს</td><td>გუნდი A იღებს 8 GPU-ს, 200Gi RAM-ს — მკაცრი ლიმიტი</td></tr>
+<tr><td><code>LimitRange</code></td><td>Per-pod ნაგულისხმევებს/საზღვრებს</td><td>ულიმიტო pod-ები GPU-node-ებზე ვერ შეიპარებიან</td></tr>
+<tr><td>NetworkPolicy</td><td>ვინ ვის ესაუბრება</td><td>Tenant A ვერ წვდება tenant B-ს engine-ებს</td></tr>
+<tr><td>PriorityClass</td><td>ვინ იმარჯვებს რესურსებზე კონკურენციისას</td><td>Prod &gt; staging &gt; ექსპერიმენტები (გაკვეთილი 11)</td></tr>
+</table>
+<p>Namespace-ები რბილი tenancy-ა (ერთი API server, ერთი kernel). მტრულად განწყობილი tenant-ები ⇒ ცალკე კლასტერები ან მკაცრი sandbox-ები (Kata/gVisor) — იცოდე, სად გადის ეს ზღვარი.</p>
+
+<h3>5. Secret-ები და image-ები, გულახდილი ვერსია</h3>
+<p>K8s Secret-ები etcd-ში base64-ია — დაცვა მოდის RBAC + etcd encryption-at-rest + ხანმოკლე ტოკენებისგან. პროდაქშენი მათ secret-მენეჯერიდან იღებს (<a href="https://external-secrets.io/">External Secrets Operator</a> + Vault/ღრუბლის SM); git-ში ინახება მითითებები და არასდროს — მნიშვნელობები (ან sealed-secrets, თუ შიფროტექსტის შენახვა აუცილებელია). Image-ები: დააფიქსირე digest-ები, დაასკანერე (trivy), მინიმალური base image-ები, არავითარი <code>:latest</code> პროდაქშენში — შენი <code>vllm-cpu:local</code> იქნებოდა <code>registry/vllm-cpu@sha256:…</code>.</p>
+
+<h3>6. Engine-ის საკუთარი კარი</h3>
+<p><code>vllm serve --api-key</code> (Secret-იდან, env-ად ჩაწოდებული) ნიშნავს, რომ pod-ი, რომელიც netpol-ს გვერდს აუვლის, მოდელს მაინც ვერ მისცემს prompt-ს. მრავალშრიანი დაცვა: edge-ავთენტიფიკაცია (გაკვეთილი 12) + ქსელი (ეს გაკვეთილი) + engine-ის key.</p>
+
+<h2>ლაბორატორია (labs/lab-13): ჩაკეტე სტეკი</h2>
+<div class="lab">
+<div class="step"><h3>Default-deny — უყურე, როგორ ტყდება</h3><p>გამოიყენე deny-all ingress <code>llm</code>-ზე. UI კვდება, scrape-ები კვდება, router→engine კვდება. იგრძენი აფეთქების რადიუსი — 30 წამი კონტროლირებადი წყვეტა მეტს გასწავლის, ვიდრე ერთსაათიანი კითხვა.</p></div>
+<div class="step"><h3>დაუშვი დახაზული გრაფი</h3><p>დაამატე ოთხი allow-პოლიტიკა (ui→router, router→engines, monitoring→engines, edge→ui/router). ყველაფერი ბრუნდება. შემდეგ დაამტკიცე იზოლაცია: <code>kubectl run attacker</code> default namespace-ში → curl engine-ისკენ → timeout. გადაუღე screenshot ამ timeout-ს; ეს პორტფოლიოს არტეფაქტია.</p></div>
+<div class="step"><h3>დაუწესე tenant-ს კვოტა</h3><p>ResourceQuota (cpu 12, mem 20Gi, pods 10) + LimitRange ნაგულისხმევები <code>llm</code>-ზე. სცადე engine-ების 5-მდე დასკეილება — უყურე, როგორ ეტყვის კვოტა თავაზიან უარს Events-ში.</p></div>
+<div class="step"><h3>Engine-ის API key</h3><p>Secret → env → <code>--api-key</code> არგუმენტი შენს chart-ში (values-ით მართული). Curl key-ის გარეშე → 401; UI განახლებული key-ით → მუშაობს. გააკეთე RBAC-ის აუდიტი <code>auth can-i --list</code>-ით llm/ui-ის ყველა ServiceAccount-ისთვის.</p></div>
+</div>
+
+<h2>შეამოწმე შენი თავი</h2>
+<div class="quiz" data-quiz>
+  <div class="q">
+    <p class="stem">სტანდარტულ kind-ზე (kindnet) გამოყენებული NetworkPolicy-ები…</p>
+    <button class="opt" data-correct>არაფერს აკეთებენ: CNI მათ ჩუმად უგულებელყოფს</button>
+    <button class="opt">აღასრულებენ ingress-წესებს, მაგრამ არა egress-ს</button>
+    <button class="opt">ბლოკავენ ტრაფიკს მას შემდეგ, რაც kubelet გადატვირთავს pod-ებს</button>
+    <p class="explain">პოლიტიკები უბრალოდ ობიექტებია; აღსრულება CNI-ის საქმეა. kindnet მათ არ ახორციელებს — უსაფრთხოების #1 ცრუ განცდა ლოკალურ კლასტერებში. Cilium/Calico კი აღასრულებენ.</p>
+  </div>
+  <div class="q">
+    <p class="stem">რატომ არ არის base64 Secret-ში დაშიფვრა?</p>
+    <button class="opt" data-correct>ეს შექცევადი კოდირებაა, key-ის გარეშე</button>
+    <button class="opt">ის მხოლოდ 1KB-ზე მცირე მნიშვნელობებს შიფრავს</button>
+    <button class="opt">ის ჰეშირებს, მაგრამ არასდროს ამატებს salt-ს</button>
+    <p class="explain">base64-ის დეკოდირება ნებისმიერს შეუძლია, ვისაც ბაიტები უჭირავს. ნამდვილი დაცვა: RBAC ობიექტზე, etcd encryption at rest, გარე secret-მენეჯერები.</p>
+  </div>
+  <div class="q">
+    <p class="stem">ორი გადამხდელი კლიენტი მკაცრ იზოლაციას ითხოვს. საკმარისია namespace-ები?</p>
+    <button class="opt" data-correct>არა: საზიარო control plane და kernel-ები</button>
+    <button class="opt">დიახ: კვოტები პლუს netpol სრულად იზოლირებს</button>
+    <button class="opt">დიახ: თუ თითოეული namespace საკუთარ node-ებს მიიღებს</button>
+    <p class="explain">Namespace-tenancy რბილია — ერთი API server, საზიარო kernel-ები, გაქცევის გზები არასწორი კონფიგურაციით. მკაცრი მოთხოვნები ⇒ კლასტერი თითო tenant-ზე ან hardware/VM sandbox-ები (გამოყოფილი node-ებიც კი control plane-ს იზიარებენ).</p>
+  </div>
+</div>
+
+<h2>პირველწყარო</h2>
+<p><a href="https://kubernetes.io/docs/concepts/services-networking/network-policies/">NetworkPolicy docs</a> + <a href="https://kubernetes.io/docs/concepts/security/rbac-good-practices/">RBAC good practices</a>. თვალი გადაავლე <a href="https://docs.vllm.ai/en/latest/usage/security.html">vLLM security guide</a>-ს.</p>
+
+<h2>შემდეგი</h2>
+<p><a href="0014-gitops-delivery.html">გაკვეთილი 14</a>: GitOps — კლასტერი git-ს მიჰყვება, მოდელების rollout-ები კი pull request-ებად იქცევა.</p>
+
+<div class="lesson-footer"><p><a href="index.html">კურსის მთავარი გვერდი</a> · ლაბორატორია: <code>labs/lab-13/</code></p></div>
+</div>
+<script src="../../assets/quiz.js"></script>
+</body>
+</html>

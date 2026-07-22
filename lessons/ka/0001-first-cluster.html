@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html lang="ka">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>გაკვეთილი 1 — რუკა და შენი პირველი კლასტერი</title>
+<link rel="stylesheet" href="../../assets/course.css">
+</head>
+<body>
+<div class="page">
+<p class="lang-switch"><a href="../0001-first-cluster.html">🇬🇧 English</a></p>
+
+<p class="lesson-kicker">SLM Production Stack · გაკვეთილი 1 · ფაზა 1 · ~90 წთ</p>
+<h1>რუკა და შენი პირველი კლასტერი</h1>
+<p class="lesson-lede">სანამ ენობრივ მოდელს მოემსახურები, გჭირდება ადგილი, სადაც მას გაუშვებ. დღეს გაიგებ, რა არის სინამდვილეში Kubernetes, დაინახავ მთლიან სტეკს, რომელსაც ააწყობ, და გაუშვებ შენს პირველ workload-ს ნამდვილ cluster-ში (კლასტერში) საკუთარ მანქანაზე.</p>
+
+<h2>საით მიდიხარ</h2>
+<p>ეს არის სისტემა, რომელიც კურსის ბოლოსთვის აწყობილი გექნება — იგივე არქიტექტურა, რაც <a href="https://github.com/vllm-project/production-stack">vLLM production-stack</a>-ს აქვს, ოფიციალური რეფერენსი, რომელსაც რეალური inference პლატფორმები იყენებენ:</p>
+
+<div class="arch">
+  <div class="box">Open WebUI<small>ჩატის frontend · ფაზა 8</small></div>
+  <div class="flow">→</div>
+  <div class="box">Request Router<small>სესიების routing · ფაზა 6</small></div>
+  <div class="flow">→</div>
+  <div class="box hot">vLLM engines<small>Qwen3.5-0.8B · ფაზები 3–5</small></div>
+</div>
+<div class="arch">
+  <div class="box">Prometheus<small>აგროვებს მეტრიკებს · ფაზა 7</small></div>
+  <div class="flow">→</div>
+  <div class="box">Grafana<small>TTFT, latency დაშბორდები · ფაზა 7</small></div>
+  <div class="flow"></div>
+  <div class="box">k6 / vllm bench<small>დატვირთვის ტესტები · ფაზა 9</small></div>
+</div>
+
+<p>ყველაფერი, რაც ამ ყუთებშია, <em>Kubernetes-ის შიგნით</em> მუშაობს. სწორედ ამიტომ იწყება კურსი K8s-ით: ის მთელი სტეკის ოპერაციული სისტემაა.</p>
+
+<h2>ცოდნა: Kubernetes ოთხ იდეაში</h2>
+
+<h3>1. კლასტერი არის მანქანები, რომლებიც ერთ კომპიუტერად ასაღებენ თავს</h3>
+<p><strong>cluster</strong> (კლასტერი) = <strong>control plane</strong> (ტვინი: API server, scheduler) + <strong>node</strong>-ები (კუნთები: მანქანები, რომლებზეც შენი კონტეინერები მუშაობს). API server-ს ეუბნები <em>რა გინდა</em>; scheduler წყვეტს, <em>რომელი node</em> გაუშვებს. კომპანიაში node-ები GPU სერვერებია. შენს Mac-ზე node-ები Docker კონტეინერებია, რომლებსაც <a href="https://kind.sigs.k8s.io/">kind</a> ქმნის — "Kubernetes in Docker". იგივე API, იგივე უნარები.</p>
+
+<h3>2. Pod არის ატომი</h3>
+<p><strong>Pod</strong> (პოდი — უმცირესი გასაშვები ერთეული) არის ერთი ან რამდენიმე კონტეინერი, რომლებიც საერთო ქსელურ იდენტობას იზიარებენ. Pod-ებს პირდაპირ თითქმის არასდროს ქმნი — ისინი მოკვდავები არიან. როცა Pod კვდება, ის სამუდამოდ ქრება. (<a href="https://kubernetes.io/docs/concepts/workloads/pods/">დოკუმენტაცია</a>)</p>
+
+<h3>3. Deployment-ები სასურველ მდგომარეობას ინარჩუნებენ</h3>
+<p><strong>Deployment</strong> (დეპლოიმენტი) ამბობს: "მინდა ამ Pod-ის 3 რეპლიკა, ყოველთვის." Kubernetes უშვებს reconciliation loop-ს (შეჯერების ციკლს): მოკალი Pod, და ახალი გაჩნდება. ეს არის <em>დეკლარაციული</em> ინფრასტრუქტურა — შენ აცხადებ მიზანს, K8s ასრულებს სამუშაოს. სწორედ ამ ერთმა იდეამ მოუტანა K8s-ს გამარჯვება. (<a href="https://kubernetes.io/docs/concepts/workloads/controllers/deployment/">დოკუმენტაცია</a>)</p>
+
+<h3>4. Service-ები მოკვდავ Pod-ებს უკვდავ მისამართს აძლევენ</h3>
+<p>Pod-ები შემთხვევით IP-ებს იღებენ და კვდებიან. <strong>Service</strong> (სერვისი) არის სტაბილური სახელი + IP, რომელიც დატვირთვას ანაწილებს ყველა იმ Pod-ზე, რომელიც ამჟამად მის label selector-ს ემთხვევა. როცა ფაზა 6-ში შენი router ტრაფიკს "vLLM engine-ებთან" გაგზავნის, ის Service-ს დაელაპარაკება და არასდროს — Pod-ებს. (<a href="https://kubernetes.io/docs/concepts/services-networking/service/">დოკუმენტაცია</a>)</p>
+
+<div class="note"><strong>კარიერული შენიშვნა</strong>
+ML infra პოზიციების ინტერვიუებზე რეგულარულად კითხულობენ: "რა ხდება, როცა <code>kubectl apply</code>-ს უშვებ?" და "Deployment vs Pod vs Service?" დღევანდელი ლაბორატორიის შემდეგ სამივეს შეხებული იქნები.</div>
+
+<h2>ლაბორატორია: კლასტერი აწეულია, აპლიკაცია — გაშვებული</h2>
+<p>მიზანი: ორ-node-იანი cluster შენს Mac-ზე, nginx ვებ-სერვერი, რომელიც Deployment-ად მუშაობს და Service-ის გავლით არის მისაწვდომი. ~45–60 წთ, ინსტალაციების ჩათვლით.</p>
+
+<div class="lab">
+
+<div class="step">
+<h3>გაუშვი Docker, დააინსტალირე ხელსაწყოები</h3>
+<p>გახსენი Docker Desktop (kind Docker-ის შიგნით ცხოვრობს), შემდეგ:</p>
+<pre><code>brew install kind helm
+kind version &amp;&amp; helm version</code></pre>
+<p class="expect">მოსალოდნელია: kind v0.2x.x, helm v3.x</p>
+</div>
+
+<div class="step">
+<h3>შექმენი კლასტერი</h3>
+<p>შეინახე როგორც <code>k8s/kind-config.yaml</code> ამ workspace-ში (იგივე პატერნი, რაც <a href="https://github.com/doronmak/VLLM-Kubernetes-Deployment/blob/main/k8s/kind-config.yaml">doronmak-ის რეპოშია</a> — control-plane node პლუს worker, პორტი 30080 შენს Mac-ზეა გადამისამართებული მოგვიანებით გამოსაყენებლად):</p>
+<pre><code>kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: llm-stack
+nodes:
+  - role: control-plane
+    extraPortMappings:
+      - containerPort: 30080
+        hostPort: 30080
+  - role: worker</code></pre>
+<pre><code>kind create cluster --config k8s/kind-config.yaml
+kubectl get nodes</code></pre>
+<p class="expect">მოსალოდნელია: 2 node, STATUS Ready (control-plane-ს შესაძლოა ~30წმ დასჭირდეს)</p>
+</div>
+
+<div class="step">
+<h3>დააკვირდი, რა ააგე</h3>
+<pre><code>docker ps                          # your "machines" are containers
+kubectl get pods -A                # K8s runs itself as pods too
+kubectl cluster-info</code></pre>
+<p>შენიშნე <code>kube-apiserver</code>, <code>etcd</code>, <code>kube-scheduler</code> namespace-ში <code>kube-system</code> — ეს არის control plane #1 იდეიდან, თავადაც Pod-ებად გაშვებული.</p>
+</div>
+
+<div class="step">
+<h3>გაუშვი Deployment</h3>
+<pre><code>kubectl create deployment hello --image=nginx:alpine --replicas=2
+kubectl get pods -o wide</code></pre>
+<p class="expect">მოსალოდნელია: 2 pod hello-xxxx Running, node-ებზე გადანაწილებული</p>
+<p>ახლა დაამტკიცე reconciliation loop (#3 იდეა). წაშალე ერთი Pod და უყურე, როგორ აღადგენს მას K8s:</p>
+<pre><code>kubectl delete pod $(kubectl get pods -l app=hello -o name | head -1)
+kubectl get pods -w        # Ctrl+C to stop watching</code></pre>
+<p class="expect">მოსალოდნელია: ᲐᲮᲐᲚᲘ pod (განსხვავებული სუფიქსით) წამებში გამოჩნდება</p>
+</div>
+
+<div class="step">
+<h3>გახსენი ის Service-ით</h3>
+<pre><code>kubectl expose deployment hello --port=80
+kubectl get svc hello
+kubectl port-forward svc/hello 8080:80</code></pre>
+<p>მეორე ტერმინალში:</p>
+<pre><code>curl -s localhost:8080 | head -4</code></pre>
+<p class="expect">მოსალოდნელია: &lt;!DOCTYPE html&gt; ... Welcome to nginx!</p>
+<div class="win"><strong>მოგება</strong>
+შენ ახლა მინიატურაში გააკეთე ზუსტად ის, რასაც ფაზა 4 აკეთებს vLLM-ით: Deployment უშვებს workload-ს, Service აძლევს მას სტაბილურ მისამართს, port-forward კი საშუალებას გაძლევს დაელაპარაკო. ჩაანაცვლე <code>nginx</code> → <code>vllm</code> და <code>curl /</code> → <code>curl /v1/chat/completions</code> — იგივე ფორმაა.</div>
+</div>
+
+<div class="step">
+<h3>მოწესრიგება (კლასტერი დაიტოვე!)</h3>
+<pre><code>kubectl delete deployment hello
+kubectl delete svc hello</code></pre>
+<p>კლასტერი რჩება — გაკვეთილი 2 მასზე აშენდება. (თუ ოდესმე მთლიანად წაშლა დაგჭირდა: <code>kind delete cluster --name llm-stack</code>.)</p>
+</div>
+
+</div>
+
+<h2>შეამოწმე საკუთარი თავი</h2>
+<p>უპასუხე მეხსიერებიდან — გახსენება არის მთავარი. დააკლიკე ვარიანტს.</p>
+
+<div class="quiz" data-quiz>
+  <div class="q">
+    <p class="stem">შენს Deployment-ში Pod ღამის 3 საათზე კრაშდება. რა ხდება?</p>
+    <button class="opt" data-correct>Controller ავტომატურად ქმნის შემცვლელ Pod-ს</button>
+    <button class="opt">ოპერატორი იღებს შეტყობინებას და ხელით უშვებს ხელახლა</button>
+    <button class="opt">Service პირდაპირ გადატვირთავს ჩავარდნილ Pod-ს</button>
+    <p class="explain">Deployment-ის reconciliation loop ამჩნევს, რომ ფაქტობრივი მდგომარეობა (1 რეპლიკა) ≠ სასურველი მდგომარეობა (2 რეპლიკა) და ქმნის ახალ Pod-ს. Service-ები Pod-ებს არასდროს მართავენ — ისინი მხოლოდ ტრაფიკს მიმართავენ მათკენ.</p>
+  </div>
+  <div class="q">
+    <p class="stem">რატომ ელაპარაკება router Service-ს და არა Pod-ების IP-ებს?</p>
+    <button class="opt" data-correct>Pod-ები ხშირად კვდებიან, Service-ის მისამართი კი სტაბილური რჩება</button>
+    <button class="opt">Service-ები უფრო სწრაფია, Pod-ის ქსელი latency-ს ამატებს</button>
+    <button class="opt">Pod-ების IP-ები დამალულია, Service-ები კი ყველაფერს აჩენენ</button>
+    <p class="explain">Pod-ები მოკვდავები არიან და ყოველ ჯერზე ახალ IP-ებს იღებენ. Service არის სტაბილური სახელი, რომელიც დატვირთვას ანაწილებს ყველა იმ Pod-ზე, რომელიც ამჟამად მის selector-ს ემთხვევა.</p>
+  </div>
+  <div class="q">
+    <p class="stem">kind-ში რა არის "node" ფიზიკურად?</p>
+    <button class="opt" data-correct>Docker კონტეინერი, რომელიც ერთ მანქანას ასიმულირებს</button>
+    <button class="opt">ვირტუალური მანქანა, რომელიც hypervisor-ის შიგნით მუშაობს</button>
+    <button class="opt">ცალკე პროცესი ჰოსტ macOS-ზე</button>
+    <p class="explain">kind = Kubernetes IN Docker. თითოეული node კონტეინერია. სწორედ ამიტომ აჩვენა <code>docker ps</code>-მა შენი "მანქანები". რეალური კლასტერები VM-ებს ან bare metal-ს იყენებენ — API ორივე შემთხვევაში იგივეა.</p>
+  </div>
+</div>
+
+<h2>პირველადი წყარო</h2>
+<p>წაიკითხე ეს დღეს საღამოს (15 წთ): <a href="https://kubernetes.io/docs/concepts/overview/">Kubernetes docs — Overview &amp; Concepts</a>. ეს კანონიკური წყაროა და უჩვეულოდ კარგად არის დაწერილი. გადაათვალიერე <a href="https://kind.sigs.k8s.io/docs/user/quick-start/">kind quickstart</a> იმისთვის, რაც ახლახან გააკეთე.</p>
+
+<h2>შემდეგი</h2>
+<p>გაკვეთილი 2: production-ის ფორმის მანიფესტები — YAML-ს საკუთარი ხელით დაწერ (დღეს გენერატორ ბრძანებებს იყენებდი), პლუს namespace-ები, resource requests/limits და health probe-ები. ეს არის ზუსტად ის ბერკეტები, რომლებზეც ფაზა 4-ის vLLM deployment არის დამოკიდებული.</p>
+
+<div class="lesson-footer">
+<p>კურსის მთავარი გვერდი: <a href="index.html">ყველა გაკვეთილი</a> · დღევანდელი reference ბარათი: <a href="../../reference/kubectl-cheatsheet.html">kubectl cheat sheet</a>.</p>
+<p>გაიჭედე ან ცნობისმოყვარეობა გაგიჩნდა? ჰკითხე შენს მასწავლებელს (აგენტს) რაც გინდა — error-ის output, "რატომ", "რა იქნებოდა, თუ". სწორედ ამისთვის არსებობს.</p>
+</div>
+
+</div>
+<script src="../../assets/quiz.js"></script>
+</body>
+</html>

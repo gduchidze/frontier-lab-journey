@@ -1,0 +1,235 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lesson 9 · The Interview OS: the 4-Step Framework</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<div class="lesson">
+  <header class="lesson-header">
+    <p class="kicker">Lesson 0009 · Phase 1 — Distributed Systems Core · <a href="0009-interview-os.ka.html">ქართული ვერსია</a></p>
+    <h1>The Interview OS: the 4-Step Framework</h1>
+    <p class="dek">Phase 1 gave you replication, sharding, caching, and queues. This lesson is the operating system that schedules them under a 50-minute clock.</p>
+  </header>
+
+  <div class="mission-tie">
+    <strong>Mission tie.</strong> Anthropic's design round hands you one open-ended sentence and then watches <em>who drives</em>. The interviewer is a collaborator you consult — not a guide you wait for. Candidates who need prompting to move from requirements to estimates to design fail the bar regardless of how much they know: the round is explicitly calibrated for engineers who structure ambiguity themselves. This lesson turns the Phase-1 toolkit into a repeatable execution loop. (<a href="https://www.tryexponent.com/blog/anthropic-system-design-interview">Exponent's Anthropic guide</a>)
+  </div>
+
+  <h2>1 · The 50-minute shape: you drive</h2>
+  <p>The prompt will be one sentence — <em>"design a package-tracking system for a logistics company"</em>, <em>"design the checkout flow for a global e-commerce site"</em>, <em>"design a news feed."</em> Everything after that sentence is yours to structure. Silence reads as being lost; an agenda read aloud reads as seniority. So your literal first sentence should be the agenda: <em>"I'll spend a few minutes on requirements, do quick capacity math, sketch the high-level design, then go deep on whatever looks hardest — interrupt me anywhere."</em> That last clause matters: it invites collaboration on your terms instead of waiting for rescue.</p>
+  <table>
+    <tr><th>Step</th><th>Budget</th><th>Output on the whiteboard</th><th>Failure smell</th></tr>
+    <tr><td>1 · Clarify</td><td class="num">5–8 min</td><td>Written requirements + explicit out-of-scope list</td><td>Designing a product nobody asked for</td></tr>
+    <tr><td>2 · Estimate</td><td class="num">~5 min</td><td>QPS, storage, bandwidth — numbers you will reuse</td><td>Numbers computed, never referenced again</td></tr>
+    <tr><td>3 · High-level design</td><td class="num">~15 min</td><td>Boxes and arrows, API sketch, data model sketch</td><td>Boxes with no narrated trade-offs</td></tr>
+    <tr><td>4 · Deep dive + scale</td><td class="num">~20 min</td><td>1–2 components under load; bottlenecks, failures, monitoring</td><td>Breadth everywhere, depth nowhere</td></tr>
+  </table>
+  <p>This is the structure every serious guide converges on — the <a href="https://github.com/donnemartin/system-design-primer#how-to-approach-a-system-design-interview-question">Primer's four steps</a> and <a href="https://interviewing.io/guides/system-design-interview">interviewing.io's senior guide</a> use the same skeleton, and interviewing.io's data-backed observation is blunt: strong candidates are distinguished less by what they know than by <em>how they allocate the hour</em>. The budgets are guardrails, not laws; the skill is noticing when you're over and saying so out loud ("I'm spending too long here — parking this, moving to the data model").</p>
+
+  <h2>2 · Step 1 — Clarify (5–8 min): buy the right problem</h2>
+  <p>Open-ended prompts are deliberately underspecified. "Design checkout" for a boutique with 100 orders/day and for Amazon on Prime Day are different systems with different correct answers. Step 1 is where you buy the <em>right</em> problem, and you buy it with four question families:</p>
+  <ul>
+    <li><strong>Users &amp; use cases.</strong> Who calls this and why? Shoppers and the fraud team hit checkout very differently; drivers, warehouses, and customers hit package tracking differently.</li>
+    <li><strong>Scale.</strong> Daily active users, requests/day, data volume, growth. "Are we at 1M or 100M users?" is a one-second question that changes every downstream decision.</li>
+    <li><strong>Read/write ratio.</strong> A social feed is ~100:1 reads; a payments ledger is write-heavy and audit-read. The ratio picks your caching and storage strategy before you draw anything.</li>
+    <li><strong>SLOs.</strong> Latency target at which percentile, availability target, and — critically for payments — consistency: is a double-charge acceptable? (No.) Is a feed that's 30 seconds stale acceptable? (Yes.)</li>
+  </ul>
+  <p>Then do two things weak candidates skip. First, <strong>write the answers down</strong> where both of you can see them — they are the grading contract for the rest of the hour, and referring back to them later ("we said 99.9%, so this single point of failure is disqualifying") is one of the cheapest senior signals available. Second, separate the two requirement types explicitly:</p>
+  <table>
+    <tr><th>Type</th><th>Question it answers</th><th>Checkout example</th></tr>
+    <tr><td><strong>Functional</strong></td><td>What does the system <em>do</em>?</td><td>Add to cart, apply discount, charge card exactly once, email receipt</td></tr>
+    <tr><td><strong>Non-functional</strong></td><td>How <em>well</em> must it do it?</td><td>p99 &lt; 500 ms at 30k QPS peak, 99.99% availability, no double-charges ever</td></tr>
+  </table>
+  <p>Finally, state what is <strong>out of scope</strong>: "I'll assume auth, fraud scoring, and tax calculation are existing services I can call." Scoping is not dodging — it is what senior engineers do to real projects every week, and it protects your clock. Write the exclusions down too, so a late "but what about fraud?" gets the answer "scoped out at minute 3, happy to pull it back in."</p>
+
+  <h2>3 · Step 2 — Estimate (~5 min): numbers you will spend later</h2>
+  <p>Run the lesson-0002 sequence — users → QPS (with a peak multiplier) → storage → bandwidth, powers of ten only, narrated aloud (<a href="https://github.com/donnemartin/system-design-primer#back-of-the-envelope-calculations">Primer: back-of-the-envelope</a>, and your own <a href="../reference/0002-estimation-kit.html">Estimation Kit</a>). Worked example for a social feed prompt:</p>
+  <pre><code>200M DAU, each opens the feed 10×/day
+  → 2B feed reads/day ÷ ~100k s/day ≈ 20k QPS average, ×3 peak ≈ 60k QPS
+Writes: 100M new posts/day ≈ 1.2k posts/s
+  → read/write ratio ≈ 50:1  →  this is a READ problem
+Storage: 100M posts/day × 1 KB ≈ 100 GB/day ≈ 36 TB/year (before media)</code></pre>
+  <p>The trap — named by every guide and by interviewers themselves — is computing numbers and never touching them again. Every estimate must be <em>spent</em> on a decision:</p>
+  <ul>
+    <li><em>"60k QPS peak means one box won't do → load balancer + N stateless replicas."</em></li>
+    <li><em>"50:1 read-heavy → cache the rendered feed; fan-out-on-write becomes viable."</em></li>
+    <li><em>"36 TB/year won't fit one Postgres by year two → partition by user ID from day one."</em></li>
+  </ul>
+  <p>A useful physical habit: draw an arrow next to each number as you use it. At the end of the interview, un-arrowed numbers are wasted minutes — and interviewers notice the difference between candidates who estimate as ritual and candidates who estimate as input.</p>
+
+  <h2>4 · Step 3 — High-level design (~15 min): boxes, API, data model</h2>
+  <p>Now, and only now, draw. Three artifacts, in order:</p>
+  <p><strong>Boxes and arrows.</strong> Client → CDN/edge → load balancer → stateless services → cache → storage → async workers behind a queue. Follow one request through the whole path out loud — "a shopper hits <em>place order</em>, the order service writes the order as PENDING, drops a message on the queue, and returns; payment capture and email happen asynchronously." Tracing one concrete request is the fastest way to expose a missing arrow.</p>
+  <p><strong>API sketch.</strong> 3–5 endpoints with verbs is plenty; resist designing all forty. For checkout:</p>
+  <pre><code>POST /cart/{id}/items          add item
+POST /orders                   create order from cart (Idempotency-Key header)
+GET  /orders/{id}              order status
+POST /payments                 capture payment (Idempotency-Key header)</code></pre>
+  <p>That <code>Idempotency-Key</code> header is a whole senior signal in one line: retries happen, networks fail after the charge succeeds, and exactly-once effect requires the client to name the operation so the server can deduplicate — the pattern Stripe's API is built around (<a href="https://stripe.com/blog/idempotency">Stripe: designing robust and predictable APIs with idempotency</a>).</p>
+  <p><strong>Data model sketch.</strong> Entities, keys, and which store each lives in. <code>orders(order_id PK, user_id, status, total)</code> in a relational store because order state transitions want transactions; <code>sessions</code> in Redis because they're ephemeral and hot; <code>events</code> append-only in a log store because audit wants immutability. You are not designing the schema — you are proving you know that <em>different data has different homes</em>.</p>
+  <p>Through all of it, <strong>narrate trade-offs while drawing</strong>: "I'm putting a queue between order placement and email so a slow mail provider can't block checkout — the cost is the receipt arriving seconds later, which our SLOs don't care about." A diagram with narrated costs is a design; a diagram without them is clip art.</p>
+
+  <h2>5 · Step 4 — Deep dive + scale (~20 min): where offers are won</h2>
+  <p>The largest budget goes here because this is where senior signal lives. Pick the 1–2 components where the hard problems are — or, better, offer the choice: <em>"I could go deep on making payment capture exactly-once, or on scaling feed fan-out for celebrity accounts; do you have a preference?"</em> Either answer wins: you have shown you know where both dragons live.</p>
+  <p>Then apply the Phase-1 toolkit <em>deliberately</em>, each tool justified by a Step-2 number or a Step-1 SLO:</p>
+  <table>
+    <tr><th>Tool</th><th>Reach for it when…</th><th>Classic worked example</th></tr>
+    <tr><td><strong>Replication</strong></td><td>Availability SLO forbids single points of failure; reads outgrow one node</td><td>Order DB: 1 primary + 2 replicas; reads of order history go to replicas</td></tr>
+    <tr><td><strong>Sharding</strong></td><td>Writes or data volume exceed one node</td><td>36 TB/year of posts → shard by user_id; watch for celebrity hot shards</td></tr>
+    <tr><td><strong>Caching</strong></td><td>Read-heavy ratio + tolerance for staleness</td><td>Product pages at 50:1 reads → cache-aside with TTL; invalidate on price change</td></tr>
+    <tr><td><strong>Queues</strong></td><td>Spiky producers, slow consumers, or work that may retry</td><td>Flash sale: absorb the 100× spike in a queue; workers drain at sustainable rate</td></tr>
+  </table>
+  <p>Two things must come from you <strong>unprompted</strong> — interviewers deliberately wait to see if they do:</p>
+  <ul>
+    <li><strong>The bottleneck.</strong> "At 60k QPS the feed cache is fine, but the fan-out workers are the bottleneck when an account with 50M followers posts — that write amplification is why Twitter's timeline design fans out on write for normal users and falls back to fan-out-on-read for celebrities." (<a href="https://github.com/donnemartin/system-design-primer#design-the-twitter-timeline-and-search">Primer: Twitter timeline design</a>)</li>
+    <li><strong>A failure mode, with mitigation.</strong> "If the payment provider times out <em>after</em> charging, we must not retry blindly — that's the double-charge. The idempotency key plus a reconciliation job closes it." Naming the failure before the interviewer's inevitable "what if X dies?" is worth more than a perfect answer after it.</li>
+  </ul>
+  <p>Close the hour on your terms, not the clock's: <strong>monitoring</strong> ("the metric that pages a human is p99 checkout latency and payment error rate, not CPU") and <strong>the more-time list</strong> ("with more time I'd address multi-region failover and the analytics pipeline"). That closing sentence converts everything you didn't cover from an omission into a roadmap.</p>
+
+  <h2>6 · Worked miniature: the heartbeat problem</h2>
+  <p>Here is the full loop compressed, on the exact problem your lab uses — <em>monitor 100,000 servers, alert within 30 s of one going silent</em> (a logistics/fleet-infrastructure staple):</p>
+  <ol>
+    <li><strong>Clarify.</strong> Functional: register server, receive heartbeats, alert on silence, ack alerts. Non-functional: detection p99 &lt; 30 s, 99.9% availability, false-alarm rate low enough that on-call trusts it. Out of scope: dashboards, auth, billing.</li>
+    <li><strong>Estimate.</strong> 10 s heartbeat interval → 10k heartbeats/s; 100-byte payload → ~1 MB/s in — trivial bandwidth, non-trivial <em>write rate</em>. Storing every heartbeat = ~86 GB/day of nearly useless rows → <em>spend that number:</em> keep only <code>last_seen</code> state (100k rows, fits in memory) plus counters.</li>
+    <li><strong>Design.</strong> <code>POST /heartbeat</code>, <code>GET /servers/{id}/status</code>, <code>POST /alert-rules</code>. Ingest tier (stateless, behind LB) updates an in-memory <code>last_seen</code> store; a detector sweeps for <code>now − last_seen &gt; 30 s</code>; alerts go through a queue so a slow pager integration can't block detection.</li>
+    <li><strong>Deep dive.</strong> Bottleneck: the sweep at 100k entries is fine, but the <code>last_seen</code> store is a SPOF → replicate it, or shard detectors by server-ID range. Failure mode named unprompted: <em>who watches the watcher?</em> A dead detector makes its whole partition go silent — so detectors heartbeat each other. Second failure mode: a network partition makes 20k healthy servers "go silent" at once → add alert coalescing ("1 datacenter down", not 20k pages). Monitoring: alert-pipeline lag is the metric that pages a human.</li>
+  </ol>
+  <p>Notice the shape: every design choice traced back to a requirement or a number, and the two failure modes arrived before anyone asked. That shape <em>is</em> the interview.</p>
+
+  <h2>7 · Anti-patterns that fail candidates</h2>
+  <table>
+    <tr><th>Anti-pattern</th><th>Why it fails</th><th>Replacement move</th></tr>
+    <tr><td>"I'd use Kafka and Cassandra" before any requirement exists</td><td>Signals pattern-matching, not engineering; the tech may not fit the problem you haven't scoped</td><td>Requirements first; technologies are conclusions, not openings</td></tr>
+    <tr><td>Silent thinking — 30 seconds of dead air</td><td>The interviewer can only grade what they can hear; silence grades as lost</td><td>Think aloud: "I'm weighing push vs pull here…"</td></tr>
+    <tr><td>Numbers computed in Step 2, never referenced again</td><td>Reveals estimation as ritual performance, not engineering input</td><td>Every estimate explicitly justifies a later decision</td></tr>
+    <tr><td>Ignoring interviewer hints ("what about that node dying?")</td><td>Hints are the rubric leaking; ignoring one usually means missing a scored dimension</td><td>Follow the hint immediately — it is free information</td></tr>
+    <tr><td>Breadth with zero depth: ten shallow boxes</td><td>Junior engineers name components; senior engineers dissect them</td><td>Two components under load beat ten components named</td></tr>
+    <tr><td>Decisions stated without alternatives or costs</td><td>Every real design decision has a loser; hiding it reads as not knowing it exists</td><td>Signpost: "I see three options… I'd pick B because…"</td></tr>
+  </table>
+  <p>interviewing.io's guide adds a meta-observation worth internalizing: most failed senior interviews fail on <em>process</em> — time allocation, communication, requirement discipline — not on missing knowledge. The framework exists precisely because process is trainable. (<a href="https://interviewing.io/guides/system-design-interview">interviewing.io senior guide</a>)</p>
+
+  <h2>8 · Communication moves: the three verbal tools</h2>
+  <p>Three moves carry the whole hour, and all three are scripts you can rehearse:</p>
+  <ul>
+    <li><strong>Signposting.</strong> "For feed delivery I see three options: fan-out-on-write, fan-out-on-read, or a hybrid. I'd pick the hybrid <em>because</em> our 50:1 read ratio rewards precomputation but celebrity accounts make pure fan-out-on-write explode." Enumerate → choose → <em>because</em>. It proves you saw the design space and can still commit.</li>
+    <li><strong>Checking in.</strong> "Want me to go deeper on the reconciliation job, or move on to scaling?" Once per major section is the right frequency — it steers you toward what the interviewer wants scored, and it converts them from examiner into collaborator, which is exactly the dynamic Anthropic's round is designed to test for.</li>
+    <li><strong>Thinking aloud.</strong> Narrate forks even when you resolve them fast: "SQL or NoSQL for orders… state transitions want transactions, so SQL." Ten words, and a decision that would have been invisible becomes a scored data point.</li>
+  </ul>
+  <p>One warning: communication moves are amplifiers, not substitutes. Signposting three bad options is still three bad options — the moves exist to make the Phase-1 knowledge you actually have <em>visible</em>.</p>
+
+  <h2>9 · If the prompt is an AI system</h2>
+  <p>At Anthropic the prompt may be AI-flavored — "design a model-serving gateway" — but the framework does not change, and that is the point. Clarify still asks users/scale/SLOs (the SLOs become TTFT and tokens/sec — <a href="../reference/0001-glossary.html">Glossary</a>); Estimate still converts users to QPS to hardware count; the deep dive still reaches for replication, sharding, caching, and queues, just wearing GPU-shaped clothes (batching queues, KV-cache). Phases 3–4 supply that domain content. If you can execute the loop on checkout and heartbeats, you can execute it on inference — the OS is the transferable asset.</p>
+
+  <h2>10 · Interview talking points</h2>
+  <p>How to deploy this lesson live — lines that carry disproportionate signal:</p>
+  <ul>
+    <li><em>Opening:</em> "Let me spend five minutes on requirements before any boxes — I want to make sure I'm designing the right system." (Announces the framework; buys silence-free structure.)</li>
+    <li><em>Leaving Step 1:</em> "So the contract is: 60k QPS peak, p99 under 500 ms, 99.99% availability, and fraud is out of scope — correct?" (Confirmation converts your notes into an agreed rubric.)</li>
+    <li><em>Spending a number:</em> "We said 50:1 reads — that number is why I'm adding a cache here and not a bigger database."</li>
+    <li><em>Offering the deep dive:</em> "The two hard problems are exactly-once payment and hot-shard fan-out. I can go deep on either — preference?"</li>
+    <li><em>Unprompted failure mode:</em> "Before you ask what breaks: the payment-provider timeout after a successful charge is the scary one. Here's how the idempotency key closes it."</li>
+    <li><em>Closing:</em> "To operate this I'd page on p99 latency and error rate. With more time: multi-region failover and the reconciliation audit job." (Ends the hour as the driver, not as the clock's victim.)</li>
+  </ul>
+
+  <h2>11 · Lab — your first full rep</h2>
+  <div class="callout"><span class="label">Hands-on (do this before the quiz)</span>
+    The framework only becomes yours under a clock. In <code>labs/lab-0009-design-rep/</code>,
+    <code>python3 design_rep.py</code> runs a timed 4-step rep against a real prompt
+    (a heartbeat service watching 100,000 servers — section 6's problem, now yours to solve
+    cold), tracks your elapsed time per step, then walks you through a 12-dimension
+    self-scoring rubric and saves everything to <code>rep-notes.txt</code>.
+    Speak your answers aloud — type only bullet notes.
+    Run <code>python3 design_rep.py --demo</code> first to preview the structure and rubric.
+  </div>
+
+  <h2>12 · Project step</h2>
+  <p>Do <strong>one full timed rep</strong> with <code>design_rep.py</code> — out loud, alone in a room, no pausing the clock. Score yourself honestly on all 12 rubric dimensions and bring the generated <code>rep-notes.txt</code> to the next session; your teacher will critique the scores, not the design. A rep where you ran out of time in Step 3 is a better deliverable than no rep — the whole point of Phase 1's closing lesson is to find out where <em>your</em> clock breaks before an interviewer does.</p>
+
+  <h2>Check yourself</h2>
+  <div class="quiz" id="quiz"></div>
+
+  <h2>Primary source</h2>
+  <p>Read <strong>interviewing.io's <a href="https://interviewing.io/guides/system-design-interview">senior system design guide</a></strong> — especially the sections on driving the interview and communication patterns. Companions: the Primer's <a href="https://github.com/donnemartin/system-design-primer#how-to-approach-a-system-design-interview-question">"How to approach a system design interview question"</a> (the canonical 4-step statement), its <a href="https://github.com/donnemartin/system-design-primer#design-the-twitter-timeline-and-search">Twitter timeline worked solution</a> (watch the steps executed on a classic prompt), and <a href="https://www.tryexponent.com/blog/anthropic-system-design-interview">Exponent's Anthropic-specific guide</a> for how this company weights the collaborate-and-drive dimension.</p>
+
+  <footer class="lesson-footer">
+    <p><strong>Stuck or curious?</strong> Ask your teacher (the agent) anything — "how do I recover when I realize at minute 30 that my Step-1 requirements were wrong?" is an excellent follow-up question.</p>
+    <nav class="lesson-nav">
+      <span>◀ <a href="0008-async-and-communication.html">0008 · Async &amp; Communication</a></span>
+      <span>Phase 2 · 0010 Rate Limiter ▶</span>
+    </nav>
+  </footer>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+renderQuiz(document.getElementById('quiz'), {
+  title: 'Check yourself',
+  questions: [
+    {
+      q: 'The interviewer says "design a checkout system" and stops talking. What is your first move?',
+      options: [
+        'Sketch the full architecture diagram immediately',
+        'Clarify users, scale, and SLOs first',
+        'Name the databases you would use',
+      ],
+      answer: 1,
+      explain: 'Requirements come before everything. Technology names before requirements is the classic failing open; the diagram comes in Step 3, after clarification and estimation.',
+    },
+    {
+      q: 'What makes the Step-2 estimates actually worth their five minutes?',
+      options: [
+        'They prove you can do arithmetic quickly',
+        'Interviewers require them before any drawing happens',
+        'Their outputs justify later architecture decisions concretely',
+      ],
+      answer: 2,
+      explain: '"We computed 60k QPS peak, so one box won\'t do → LB + N replicas." A number that never drives a decision was wasted time — that is the anti-pattern.',
+    },
+    {
+      q: 'Mid-design, the interviewer asks "what happens if that node dies?" How should you read this?',
+      options: [
+        'Follow it; hints signal what interviewers value',
+        'Ignore it; your planned agenda matters more',
+        'Defer it; failure modes come after monitoring',
+      ],
+      answer: 0,
+      explain: 'Interviewer hints are the rubric leaking through. Ignoring them is a named anti-pattern; a collaborator consults the other person in the room.',
+    },
+    {
+      q: 'Which of the following behaviors is a documented candidate-failing anti-pattern?',
+      options: [
+        'Checking in before choosing a component to deepen',
+        'Naming technologies before any requirements are written down',
+        'Stating trade-offs aloud while drawing the boxes',
+      ],
+      answer: 1,
+      explain: '"I\'d use Kafka" as an opening move signals pattern-matching, not engineering. Checking in and narrating trade-offs are the moves that pass candidates.',
+    },
+    {
+      q: 'Why does the 4-step framework give the largest time budget to its final step?',
+      options: [
+        'Clarifying requirements, because everything else depends there',
+        'High-level design, because diagrams show most breadth',
+        'Deep dive, because depth separates senior candidates',
+      ],
+      answer: 2,
+      explain: 'Breadth with zero depth is an anti-pattern. Two components dissected under load — with bottlenecks and failure modes named unprompted — is where senior signal lives, hence ~20 of 50 minutes.',
+    },
+    {
+      q: 'What does the signposting move "I see three options… I\'d pick B because…" accomplish?',
+      options: [
+        'Shows breadth of options plus reasoned choice',
+        'Buys extra thinking time without saying anything',
+        'Lets the interviewer choose the design direction',
+      ],
+      answer: 0,
+      explain: 'Signposting proves you saw the design space AND can commit with a reason. It replaces the anti-pattern of stating decisions with no alternatives and no costs.',
+    },
+  ],
+});
+</script>
+</body>
+</html>

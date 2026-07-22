@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html lang="ka">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>გაკვეთილი 10 — Autoscaling და Capstone</title>
+<link rel="stylesheet" href="../../assets/course.css">
+</head>
+<body>
+<div class="page">
+<p class="lang-switch"><a href="../0010-autoscaling-capstone.html">🇬🇧 English</a></p>
+
+<p class="lesson-kicker">SLM Production Stack · გაკვეთილი 10 · ფაზა 10 · ~2 სთ</p>
+<h1>Autoscaling და Capstone</h1>
+<p class="lesson-lede">ბოლო ციკლი: კლასტერი დატვირთვაზე თავად რეაგირებს. შემდეგ ათი გაკვეთილის ნამუშევარს კრავ პორტფოლიო-პროექტად, რომელიც ინტერვიუებზე შენ მაგივრად ილაპარაკებს.</p>
+
+<h2>ცოდნა: მართვის ციკლის ჩაკეტვა</h2>
+
+<h3>1. HPA: სასურველი replica-ების რაოდენობა როგორც მეტრიკების ფუნქცია</h3>
+<p><a href="https://kubernetes.io/docs/tasks/run-application/horizontal-pod-autoscale/">HorizontalPodAutoscaler</a> (ჰორიზონტალური ავტომასშტაბირების მექანიზმი) არეგულირებს Deployment-ის <code>replicas</code>-ს ისე, რომ მეტრიკა სამიზნესთან ახლოს დარჩეს: <code>desired = ceil(current × metricValue / target)</code>. მას სჭირდება მეტრიკების წყარო — <strong>metrics-server</strong> CPU/მეხსიერებისთვის (kind-ზე ნაგულისხმევად დაყენებული არ არის).</p>
+
+<h3>2. CPU% არასწორი მეტრიკაა LLM-ებისთვის — მაინც იცოდე რატომ</h3>
+<p>ინფერენსის engine შეიძლება „სავსე" იყოს (რიგი იზრდება), როცა CPU 60%-ზეა, ან 100%-ზე იყოს მიჭერილი და მაინც ჯანმრთელი. <em>სწორი</em> სიგნალები engine-ის საკუთარი მეტრიკებია: <code>vllm:num_requests_waiting</code>, KV cache-ის გამოყენება — ზუსტად ამას გულისხმობს production-stack-ის roadmap ფრაზით „autoscaling based on vLLM-specific metrics". Custom-მეტრიკებზე მასშტაბირებას სჭირდება <a href="https://keda.sh/">KEDA</a> ან prometheus-adapter, რომელიც Prometheus → HPA ხიდს დებს. დღეს: CPU-ზე დაფუძნებული HPA (მექანიზმი), KEDA — დოკუმენტირებული stretch-მიზანი (production-პასუხი). ცოდნა იმისა, <em>თუ რატომ არის CPU არასწორი</em>, სწორედ ინტერვიუს პასუხია.</p>
+
+<h3>3. მასშტაბირების ლიმიტები, რომლებსაც ვერავინ გაექცევა</h3>
+<p>Scale-out ამატებს სიმძლავრეს, მაგრამ ყოველმა ახალმა replica-მ მოდელი უნდა ჩატვირთოს (CPU-ზე — წუთები; ამიტომაც არიან რეალური პლატფორმები მოდელის ჩატვირთვის დროზე შეპყრობილნი, იყენებენ PV-ში დაქეშილ წონებს და წინასწარ თბობას). ზედმეტად სწრაფად რომ <em>დაპატარავდე</em> (scale down), engine-ებს გენერაციის შუაში კლავ. HPA-ს <code>behavior</code> სექცია (სტაბილიზაციის ფანჯრები) ზუსტად ამისთვის არსებობს.</p>
+
+<h2>ლაბორატორია, ნაწილი A: რეაქტიული კლასტერი</h2>
+
+<div class="lab">
+
+<div class="step">
+<h3>დააყენე metrics-server (kind-ს flag სჭირდება)</h3>
+<pre><code>helm repo add metrics-server https://kubernetes-sigs.github.io/metrics-server/
+helm install metrics-server metrics-server/metrics-server \
+  -n kube-system --set args={--kubelet-insecure-tls}
+sleep 30 && kubectl top nodes && kubectl top pods -n llm</code></pre>
+<p class="expect">მოსალოდნელია: CPU/მეხსიერების რიცხვები თითო node-სა და pod-ზე (insecure-tls flag მხოლოდ kind-ისთვისაა: node-ების სერტიფიკატებს SAN-ები აკლიათ)</p>
+</div>
+
+<div class="step">
+<h3>შექმენი HPA</h3>
+<p>შეინახე როგორც <code>k8s/vllm-hpa.yaml</code>:</p>
+<pre><code>apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: vllm
+  namespace: llm
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: vllm
+  minReplicas: 1
+  maxReplicas: 2
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300</code></pre>
+<pre><code># let the HPA own replica count: set replicaCount back to 1 first
+helm upgrade slm charts/slm-stack --set vllm.replicaCount=1
+kubectl apply -f k8s/vllm-hpa.yaml
+kubectl get hpa -n llm -w</code></pre>
+<p class="expect">მოსალოდნელია: TARGETS აჩვენებს ცოცხალ cpu%-ს 70%-თან შედარებით; REPLICAS 1</p>
+</div>
+
+<div class="step">
+<h3>აამოქმედე</h3>
+<p>ტერმინალი 1: <code>kubectl get hpa,pods -n llm -w</code>. ტერმინალი 2: გაუშვი მე-9 გაკვეთილის k6 ტესტი (ან curl-ის ციკლი) 3–4 წუთის განმავლობაში.</p>
+<p class="expect">მოსალოდნელია: cpu% სცდება 70-ს → REPLICAS 1→2 → მეორე pod ტვირთავს მოდელს → router-ს ავტომატურად უერთდება (service discovery!) → დატვირთვა ნაწილდება. ტრაფიკის შეჩერების შემდეგ: ~5 წთ სტაბილიზაცია, შემდეგ ისევ 1</p>
+<div class="win"><strong>მოგება</strong>
+დატვირთვა იზრდება → HPA ამასშტაბებს → router აღმოაჩენს → Grafana ორივე engine-ს აჩვენებს → დაცლა → scale-in. კურსის ყველა ფენა ერთ ავტონომიურ უკუკავშირის ციკლში, ადამიანის გარეშე. სწორედ ეს არის production-სტეკი.</div>
+</div>
+
+<div class="step">
+<h3>Stretch (არასავალდებულო, ცალკე სესია): მასშტაბირება რიგის სიღრმეზე KEDA-თი</h3>
+<pre><code>helm repo add kedacore https://kedacore.github.io/charts
+helm install keda kedacore/keda -n keda --create-namespace</code></pre>
+<p>შემდეგ — <code>ScaledObject</code> prometheus-ტრიგერით <code>sum(vllm:num_requests_waiting)</code>-ზე, ზღვარი ~5. იხილე <a href="https://keda.sh/docs/latest/scalers/prometheus/">KEDA-ს prometheus scaler-ის დოკუმენტაცია</a>. ეს რეალური სამყაროს პატერნია — README-ში მაინც აღწერე, თუნდაც მხოლოდ პროტოტიპი გააკეთო.</p>
+</div>
+
+</div>
+
+<h2>ლაბორატორია, ნაწილი B: capstone-ის ჩანაწერი</h2>
+<p>პროექტი დასრულებულია; ახლა გახადე ის <em>წაკითხვადი</em>. ეს ნახევარ-ლაბორატორია checklist-ია — გაიარე ის რეპოზიტორიაში.</p>
+
+<div class="lab">
+
+<div class="step">
+<h3>რეპოზიტორიის ჰიგიენა</h3>
+<p>რეპოზიტორია ისე დაასტრუქტურირე, რომ უცხო ადამიანმა ყველაფრის თავიდან აწყობა შეძლოს:</p>
+<pre><code>llm-infra-playground/
+├── README.md            ← the showcase (next step)
+├── charts/slm-stack/    ← your Helm chart
+├── k8s/                 ← kind config, router, webui, servicemonitor, hpa
+├── load_tests/          ← k6 scripts + result tables
+├── lessons/  reference/ ← the course (leave it in — it shows learning process)
+└── docs/architecture.md ← diagram + design decisions</code></pre>
+<p>წაშალე <code>main.py</code> (PyCharm-ის boilerplate). Commit-ები გააკეთე conventional ფორმატით (<code>feat: helm chart for vllm serving</code>…).</p>
+</div>
+
+<div class="step">
+<h3>README, რომელიც ინტერვიუებს იშოვის</h3>
+<p>სტრუქტურა (აქ ნამდვილი დრო დახარჯე — შემფასებლები README-ებს კითხულობენ და არა templates/-ს):</p>
+<ol>
+<li><strong>ერთაბზაციანი pitch</strong>: „Production-style SLM inference stack on Kubernetes: vLLM engines behind a session-aware router, Prometheus/Grafana observability, Open WebUI frontend, k6-gated performance, HPA autoscaling. Runs entirely on a laptop."</li>
+<li><strong>არქიტექტურის დიაგრამა</strong> (mermaid: browser → NodePort → WebUI → router → engines; Prometheus ყველას scrape-ავს; HPA-ს უკუკავშირის ისარი)</li>
+<li><strong>Quickstart</strong>: <code>kind create cluster --config k8s/kind-config.yaml && helm install slm charts/slm-stack && ...</code> — ნულიდან თავად გამოცადე; გაფუჭებული quickstart არარსებულზე უარესია</li>
+<li><strong>ბენჩმარკის შედეგები</strong>: მე-9 გაკვეთილის ცხრილი + დატვირთვის ქვეშ გადაღებული Grafana-ს სქრინშოტი</li>
+<li><strong>დიზაინის გადაწყვეტილებები და შეზღუდვები</strong>: რატომ CPU backend, რატომ NodePort, რატომ არის CPU-ზე დაფუძნებული HPA არასწორი და რას გააკეთებდა KEDA, რა იცვლება რეალურ GPU-ებზე (image, <code>nvidia.com/gpu</code> რესურსი, node selector-ები, GPU operator)</li>
+</ol>
+<p>ეს ბოლო სექცია გამორჩევის წერტილია: ის ამტკიცებს, რომ გესმის სხვაობა შენს ლეპტოპსა და production-ს შორის — ეს კი ზუსტად ის განსჯის უნარია, რისთვისაც დამსაქმებლები გიხდიან.</p>
+</div>
+
+<div class="step">
+<h3>უთხარი შენს მასწავლებელს</h3>
+<p>როცა ჩანაწერი მზადაა, სთხოვე აგენტს: იმიტირებული ინტერვიუს „დაკითხვა" სტეკზე („მოთხოვნის გზა ამიწერე", „engine-ი ღამის 2 საათზე OOM-ავს — რას აკეთებ?", „მეორე მოდელს როგორ დაამატებდი?") და სასწავლო ჩანაწერის ბოლო ჩანაწერი. შემდეგ იფიქრე სიბრძნის ნაბიჯზე: გამოაქვეყნე რეპოზიტორია r/LocalLLaMA-ზე ან vLLM-ის Slack-ში რეალური უკუკავშირისთვის.</p>
+</div>
+
+</div>
+
+<h2>შეამოწმე შენი თავი</h2>
+<div class="quiz" data-quiz>
+  <div class="q">
+    <p class="stem">რატომ არის CPU-ს გამოყენება ცუდი autoscaling-სიგნალი LLM engine-ებისთვის?</p>
+    <button class="opt" data-correct>რიგმა შეიძლება იმატოს, სანამ CPU ზომიერ დონეზეა</button>
+    <button class="opt">CPU-ს მეტრიკები რამდენიმეწუთიანი დაგვიანებით მოდის</button>
+    <button class="opt">Engine-ები დაკონფიგურირებულ CPU-ლიმიტებს არასოდეს სცდებიან</button>
+    <p class="explain">Engine-ის სისავსე = მიღების/რიგის მდგომარეობა (მომლოდინე მოთხოვნები, KV cache), რომელიც CPU%-ისგან დამოუკიდებელია. იმასშტაბე <code>num_requests_waiting</code>-ზე KEDA/prometheus-adapter-ის მეშვეობით.</p>
+  </div>
+  <div class="q">
+    <p class="stem">რატომ ვაყენებთ HPA-ზე scale-down-ის სტაბილიზაციის ფანჯარას?</p>
+    <button class="opt" data-correct>რომ engine-ები მოკლე მიმდინარე შესვენებებზე არ დავხოცოთ</button>
+    <button class="opt">რომ metrics-server-ს scrape-ის დაწყების დრო მივცეთ</button>
+    <button class="opt">რომ HPA helm upgrade-ებს არ დაუპირისპირდეს</button>
+    <p class="explain">ტრაფიკი მოკლედ ეცემა → მყისიერი scale-in engine-ს გენერაციის შუაში მოკლავდა და ტრაფიკის დაბრუნებისას მოდელის რამდენიმეწუთიან ხელახალ ჩატვირთვას გამოიწვევდა. ფანჯარა scale-in-ს გააზრებულს ხდის.</p>
+  </div>
+  <div class="q">
+    <p class="stem">ახალი replica მასშტაბირებით ემატება, მაგრამ წუთების განმავლობაში ვერაფერს ემსახურება. რატომ?</p>
+    <button class="opt" data-correct>მოდელის ჩატვირთვა აკავებს readiness probe-ის გავლას</button>
+    <button class="opt">Router discovery-ს საათში ერთხელ აახლებს</button>
+    <button class="opt">HPA ტრაფიკს აკავებს, სანამ მეტრიკები დასტაბილურდება</button>
+    <p class="explain">Pod არ არის Ready, სანამ engine მოდელს არ ჩატვირთავს და /health არ გაივლის — ამიტომ ტრაფიკი მას ვერ აღწევს. მოდელის ჩატვირთვის ეს დაყოვნება არის LLM serving-ის მასშტაბირების მთავარი ვიწრო ადგილი (და ამიტომაც არის მნიშვნელოვანი წონების დამქეშავი PV-ები).</p>
+  </div>
+</div>
+
+<h2>პირველწყარო</h2>
+<p><a href="https://kubernetes.io/docs/tasks/run-application/horizontal-pod-autoscale/">HPA-ს დოკუმენტაცია</a> + <a href="https://keda.sh/docs/latest/scalers/prometheus/">KEDA-ს prometheus scaler</a>. საით მიდის დარგი: production-stack-ის <a href="https://github.com/vllm-project/production-stack/issues/855">2026 roadmap-ის დისკუსია</a>.</p>
+
+<h2>მორჩი — თითქმის</h2>
+<p>ოსტატობა გაკვეთილების დასრულება არ არის; ის მათ გარეშე თავიდან აწყობაა. საბოლოო გამოცდა, capstone-იდან ერთ კვირაში: <code>kind delete cluster --name llm-stack</code>, შემდეგ მთელი სტეკის აღდგენა მეხსიერებიდან + შენივე README-დან. ის, რასაც ხელს წაავლებ, გაჩვენებს, რა უნდა გაიმეორო.</p>
+
+<div class="lesson-footer">
+<p>კურსის მთავარი გვერდი: <a href="index.html">ყველა გაკვეთილი</a> · <a href="../../MISSION.md">მისია</a>.</p>
+<p>მზად ხარ იმიტირებული ინტერვიუსთვის? უთხარი შენს მასწავლებელს.</p>
+</div>
+
+</div>
+<script src="../../assets/quiz.js"></script>
+</body>
+</html>

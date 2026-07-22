@@ -1,0 +1,208 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lesson 7 · Caching, Deeply</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<div class="lesson">
+  <header class="lesson-header">
+    <p class="kicker">Lesson 0007 · Phase 1 — Distributed Systems Core · <a href="0007-caching-deep.ka.html">ქართული ვერსია</a></p>
+    <h1>Caching, Deeply</h1>
+    <p class="dek">Why a box of memory beats a database, where to put it, how to keep it honest — and the three failure modes that decide whether your interview answer survives.</p>
+  </header>
+
+  <div class="mission-tie">
+    <strong>Mission tie.</strong> Anthropic's design prompts — <em>"design a token-generation service at 100,000 RPS"</em> — are unaffordable without caching, and the follow-up is always the same: <em>"what happens when that cache entry expires under load?"</em> Candidates who say "add Redis" stall; candidates who name the update pattern, the eviction policy, the staleness bound, and the stampede fix keep going. This lesson gives you those names, with the classic systems (e-commerce catalogs, social feeds, payments) where each one earned its reputation. (<a href="https://www.tryexponent.com/blog/anthropic-system-design-interview">Exponent's 2026 Anthropic guide</a>)
+  </div>
+
+  <h2>1 · Why caching works: physics × skew</h2>
+  <p>Two facts multiply together, and every caching decision traces back to one of them.</p>
+  <p><strong>Fact one — physics.</strong> A main-memory reference is ~100 ns; a round trip inside a datacenter is ~500 µs — the <strong>5,000× cliff</strong> from the <a href="../reference/0002-estimation-kit.html">Estimation Kit</a>. Add a disk-backed database lookup behind that hop and you are comparing sub-millisecond in-memory reads against single-digit-millisecond (or worse) queries. Serving from memory instead of another hop-plus-disk is not an optimization; it is a different regime.</p>
+  <p><strong>Fact two — skew.</strong> Real traffic is <strong>Zipf-distributed</strong>: the k-th most popular key gets roughly 1/k<sup>s</sup> of the traffic, so a tiny fraction of keys receives most requests. Amazon sells millions of products, but today's front-page items dominate reads; Twitter hosts hundreds of millions of accounts, but a few thousand celebrities dominate timeline fan-in. That is why a cache holding <em>0.2%</em> of the keyspace can absorb nearly <em>half</em> of all reads — you will measure exactly this in the lab. Caching works because traffic is unfair; on uniform traffic a small cache is nearly useless.</p>
+  <p><strong>Worked example — the arithmetic interviewers want to hear.</strong> An e-commerce product page fans out to ~30 object reads (product, price, stock, reviews, seller…). At 5,000 pages/s that is 150,000 reads/s. A well-tuned relational primary is comfortable around 10,000 reads/s — so the cache tier must absorb ≥ 93% of reads before the database is even <em>viable</em>. And the latency win compounds: with hit rate <em>h</em>, effective read latency ≈ <code>h × 0.5 ms + (1 − h) × 8 ms</code>. At h = 0.9 that is 1.25 ms; at h = 0.99 it is 0.575 ms — and the DB sees 10× fewer reads at the first and 100× fewer at the second. Hit rate is simultaneously a latency number and a capacity number.</p>
+
+  <h2>2 · Where caches live, top to bottom</h2>
+  <p>Every layer of the stack caches; in an interview, walk the ladder before choosing your layer (<a href="https://github.com/donnemartin/system-design-primer#cache">Primer §Cache</a>):</p>
+  <table>
+    <tr><th>Layer</th><th>What it caches</th><th>You control it via</th><th>Typical win</th></tr>
+    <tr><td>Browser</td><td>Static assets, API responses</td><td>HTTP cache headers (<a href="https://www.rfc-editor.org/rfc/rfc9111">RFC 9111</a>)</td><td>Zero network at all</td></tr>
+    <tr><td>CDN</td><td>Static + cacheable dynamic content, at the edge</td><td>TTLs, cache keys, purge API (<a href="https://www.cloudflare.com/learning/cdn/what-is-a-cdn/">Cloudflare: what is a CDN</a>)</td><td>Ocean crossings avoided (~150 ms each)</td></tr>
+    <tr><td>Reverse proxy</td><td>Whole responses at your own edge</td><td>Nginx / <a href="https://varnish-cache.org/intro/">Varnish</a> config</td><td>App servers never touched</td></tr>
+    <tr><td>App-layer cache</td><td>Objects, query results, sessions, computed aggregates</td><td><a href="https://redis.io/">Redis</a> / <a href="https://memcached.org/">Memcached</a> — <em>your design space</em></td><td>DB reads avoided</td></tr>
+    <tr><td>Database internal</td><td>Pages, query plans</td><td>Buffer pool sizing — mostly automatic</td><td>Disk reads avoided</td></tr>
+  </table>
+  <p>Rules of thumb for the ladder: cache as high as the content's <em>shareability</em> allows (a logo is CDN material; "your cart" is not), and remember each layer has its own invalidation story — a CDN purge API and a Redis <code>DEL</code> are different systems that fail differently. Design interviews live almost entirely at the <strong>app layer</strong>: <em>what</em> do you key on, <em>how</em> does the cache learn about writes, and <em>what</em> gets evicted. The canonical large-scale reference is Facebook, which runs Memcached as a massive "look-aside" (cache-aside) tier in front of MySQL and treats it as core infrastructure, not an add-on (<a href="https://www.usenix.org/system/files/conference/nsdi13/nsdi13-final170_update.pdf">Scaling Memcache at Facebook, NSDI '13</a>).</p>
+
+  <h2>3 · What to cache, and what the key is</h2>
+  <p>Three granularities, coarse to fine — each with a classic home:</p>
+  <ul>
+    <li><strong>Full page / response caching.</strong> Anonymous content that renders the same for everyone: news article pages, product listings for logged-out users. Highest leverage, most fragile to personalization — one "Hello, Giorgi" in the corner ruins it (hence edge tricks like caching the page and filling the user fragment client-side).</li>
+    <li><strong>Query / aggregate caching.</strong> The result of an expensive computation keyed by its inputs: "top-10 trending posts", "average rating for product 4711". Watch out: keying on raw query strings is brittle — normalize inputs (sorted params, canonical casing) or identical questions become distinct cache entries.</li>
+    <li><strong>Object caching.</strong> One domain object per key: <code>user:8123</code>, <code>product:4711</code>, <code>session:abc</code>. The workhorse. Fine-grained keys invalidate precisely (a price change touches one entry, not every page containing it) at the cost of more round trips per screen — which batched multi-gets (<code>MGET</code>) claw back.</li>
+  </ul>
+  <p>Interview habit: whenever you say "I'll cache that," immediately say the <em>key</em> and the <em>value</em> out loud. "Key: <code>product:{id}:v2</code>, value: the serialized product JSON, ~2 KB." Vague caches cannot be invalidated; named ones can. (The <code>:v2</code> is a version prefix — bumping it is the cheapest whole-cache invalidation there is.)</p>
+
+  <h2>4 · The four update patterns</h2>
+  <p>The heart of the topic: when data changes, how do cache and database stay related? Four patterns, each a different answer (<a href="https://github.com/donnemartin/system-design-primer#when-to-update-the-cache">Primer §When to update the cache</a>):</p>
+  <table>
+    <tr><th>Pattern</th><th>Read/write path</th><th>Wins</th><th>Pays</th><th>Classic home</th></tr>
+    <tr><td><strong>Cache-aside</strong> (lazy / look-aside)</td><td>App checks cache; on miss reads DB, fills cache</td><td>Only requested data cached; cache failure ≠ outage</td><td>Miss costs 3 trips; staleness window after writes</td><td>Product catalogs; Facebook's memcache tier</td></tr>
+    <tr><td><strong>Write-through</strong></td><td>Every write goes to cache <em>and</em> DB synchronously</td><td>Cache never stale vs DB; reads always warm after writes</td><td>Slower writes; cold cache until first write; caches unread data</td><td>User profiles; <a href="https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/DAX.concepts.html">DynamoDB DAX</a></td></tr>
+    <tr><td><strong>Write-behind</strong> (write-back)</td><td>Write to cache, ack immediately; flush to DB asynchronously, often batched</td><td>Fast writes; absorbs write bursts; batches DB I/O</td><td><strong>Data loss</strong> if cache dies before flush; complex recovery</td><td>Like/view counters; social-metrics pipelines</td></tr>
+    <tr><td><strong>Refresh-ahead</strong></td><td>Cache re-fetches hot entries <em>before</em> expiry</td><td>Hot keys never expire in a user's face; smooths DB load</td><td>Wasted — extra load, even — when prediction is wrong</td><td>Homepages, leaderboards, exchange rates</td></tr>
+  </table>
+  <p><strong>Cache-aside in slow motion</strong> (know this cold): read → miss → read DB → write cache → return. Three trips on a miss, one on a hit. On writes the app updates the DB and then <em>invalidates</em> (deletes) the cache entry rather than updating it — deleting sidesteps the race where two concurrent writes update the cache in the wrong order and strand a stale value indefinitely. Even so, a narrow race remains (read miss reads old DB value, write lands, reader fills cache with the old value); Facebook closes it with <em>leases</em> — more in §6.</p>
+  <p><strong>Worked numbers.</strong> Mixed workload, 90% reads / 10% writes, hot keys. Cache-aside invalidation means every write evicts a hot key, and the next reader re-buys it from the DB: you pay staleness protection with extra misses. Write-through keeps those keys warm — in the lab this exact setup shows write-through winning read hit rate ~75% vs ~68% with identical DB write counts. Flip the ratio to write-heavy and write-through's discipline becomes a tax on keys nobody reads. There is no globally best pattern; there is a best pattern <em>per read/write mix</em> — say the mix first, then the pattern.</p>
+  <p><strong>Payments footnote.</strong> Write-behind is the pattern to treat with fear in anything money-shaped: a cache node dying with unflushed ledger writes is data loss, full stop. Payment systems either skip caching writes entirely or pair the cache with a durable log so the "behind" part is replayable. Counters of likes can shrug; balances cannot.</p>
+
+  <h2>5 · Eviction and sizing</h2>
+  <p>A full cache must throw something out. The three policies you must be able to contrast:</p>
+  <table>
+    <tr><th>Policy</th><th>Evicts</th><th>Strong against</th><th>Weak against</th></tr>
+    <tr><td><strong>LRU</strong></td><td>Least-recently-<em>used</em></td><td>Temporal locality (what was just read will be read again)</td><td>Scans — one bulk export flushes the whole working set</td></tr>
+    <tr><td><strong>LFU</strong></td><td>Least-frequently-<em>used</em></td><td>Scan pollution; stable popularity</td><td>Shifting popularity — slow to forget yesterday's hot keys</td></tr>
+    <tr><td><strong>TTL</strong></td><td>Whatever has <em>expired</em></td><td>Unbounded staleness — it is a freshness bound, not a space policy</td><td>Choosing the number (too short: misses; too long: staleness)</td></tr>
+  </table>
+  <p>In practice you compose them: TTL for freshness plus LRU/LFU for space. Production systems approximate: Redis samples a handful of keys and evicts the best candidate rather than maintaining a perfect global order — precision isn't worth the bookkeeping at that scale (<a href="https://redis.io/docs/latest/develop/reference/eviction/">Redis eviction docs</a>, which offer both <code>allkeys-lru</code> and <code>allkeys-lfu</code>).</p>
+  <p><strong>Sizing follows the hit-rate curve.</strong> Because of Zipf skew, the first slots buy huge hit-rate gains and each subsequent multiplication of size buys less. In the lab: 100 slots (0.2% of keys) → ~47% hit rate; 100× more memory → only ~86%. Size at the <em>knee</em> of the curve, then sanity-check memory: 20 M hot products × 2 KB ≈ 40 GB — a handful of cache nodes, entirely reasonable; 2 B keys × 2 KB = 4 TB — now you are sharding a cache cluster and should ask whether you actually need the cold 99%. Justify any size with the 5,000× cliff: every point of hit rate is that many requests moved across it.</p>
+
+  <h2>6 · Invalidation, honestly</h2>
+  <p>"There are only two hard things in computer science: cache invalidation and naming things" (Phil Karlton, canonized in every caching talk since). The reason it is hard: an invalidation is a message about a write, delivered to a different system, racing the reads. You have exactly two honest strategies:</p>
+  <ul>
+    <li><strong>Event-driven invalidation.</strong> Writes publish "key X changed" — via CDC on the database's replication log, or application-level pub/sub — and consumers delete or update cache entries. Precise and fast, but the invalidation pipeline is now itself a distributed system that can lag, reorder, or drop; Facebook drives memcache deletes from the MySQL commit stream precisely so an invalidation can never be lost ahead of the write it describes (<a href="https://www.usenix.org/system/files/conference/nsdi13/nsdi13-final170_update.pdf">NSDI '13, §4</a>). Their <em>leases</em> mechanism additionally fixes the stale-set race: a miss returns a token, and a fill is accepted only if no invalidation arrived in between.</li>
+    <li><strong>TTL-and-tolerate.</strong> Entries expire on a clock; between write and expiry, readers may see the old value — and you state that bound out loud: "prices may be up to 60 s stale; checkout re-reads the DB." Simple, no pipeline to operate, self-healing. Saying the bound is what makes this engineering rather than hoping.</li>
+    </ul>
+  <p>Most real systems mix them: TTL as the backstop, events for the keys where staleness is expensive. And note the e-commerce trick in the example above — tolerate staleness on the browse path, bypass the cache on the money path. Consistency budgets differ <em>within</em> one product.</p>
+
+  <h2>7 · The failure modes that decide interviews</h2>
+  <p>Adding a cache adds three new ways to fall over. Interviewers probe these because they separate "has used Redis" from "has been paged about Redis."</p>
+  <ul>
+    <li><strong>Cache stampede (thundering herd / dogpile).</strong> A hot key expires; every in-flight request misses <em>simultaneously</em> and every one recomputes from the DB. Do the math out loud: a key serving 1,000 RPS whose recompute takes 200 ms accumulates ~200 concurrent identical DB queries the instant it expires — a self-inflicted 200× spike, at peak traffic, on your hottest data, possibly slowing the DB so the herd grows further. Three fixes, in escalating sophistication:
+      <ol>
+        <li><strong>Per-key locking</strong> ("singleflight"): one request recomputes; the rest wait for its result. Instagram implements this as <em>promises</em> — the first miss stores a promise in the cache and the herd awaits it instead of the backend (<a href="https://instagram-engineering.com/thundering-herds-promises-82191c8af57d">Instagram: Thundering Herds &amp; Promises</a>). Facebook's leases have the same effect (<a href="https://www.usenix.org/system/files/conference/nsdi13/nsdi13-final170_update.pdf">NSDI '13</a>).</li>
+        <li><strong>TTL jitter</strong>: randomize expiries so many hot keys never expire in the same instant. This is the fix for the fleet-wide variant — <em>cache avalanche</em>, where a deploy or restart sets thousands of keys to the same TTL and they all expire together. Jitter does not reduce total reloads; it decorrelates them in time.</li>
+        <li><strong>Refresh-ahead</strong>: renew the entry before users can ever observe the expiry (§4). Strongest for the keys you can predict — which is exactly its limit.</li>
+      </ol></li>
+    <li><strong>Cache penetration.</strong> Requests for keys that <em>don't exist</em> miss forever and hammer the DB every time — accidentally (deleted product IDs in old links) or adversarially (scanning random IDs). Fixes: <strong>negative caching</strong> — cache the "not found" itself with a short TTL — and, for hostile or vast keyspaces, a <strong>Bloom filter</strong> in front that answers "definitely not present" without touching anything.</li>
+    <li><strong>Hot-key overload.</strong> One celebrity key exceeds what a single cache node can serve — the flash-sale item, the viral post. A cache <em>shard</em> handles ~100k ops/s; a viral key wanting 1 M ops/s needs more than one home. Fixes: <strong>replicate the key</strong> (append a random suffix from a small set — <code>post:99:{0..9}</code> — and fan reads across the copies), or add a tiny <strong>in-process cache</strong> in each app server for the top-N keys. Netflix's EVCache leans on replication across nodes and zones for exactly this class of problem (<a href="https://netflixtechblog.com/announcing-evcache-distributed-in-memory-datastore-for-cloud-c26a698c27f7">Netflix Tech Blog: EVCache</a>).</li>
+  </ul>
+
+  <h2>8 · Scaling the cache tier itself</h2>
+  <p>Once the cache outgrows one node, it becomes a distributed system with the same three questions as any other. <strong>Partitioning:</strong> spread keys across nodes with consistent hashing so adding a node remaps ~1/N of keys instead of all of them (you met the ring in earlier lessons; Memcached clients have shipped it since 2007). <strong>Replication:</strong> copies for read fan-out and for surviving node loss — losing a cache node is "only" a hit-rate crater, but at Facebook scale a cold cluster would flatten MySQL, which is why cluster warm-up and cross-region invalidation streams get their own sections in the memcache paper. <strong>Failure containment:</strong> when the cache tier degrades, the DB inherits the full read load exactly when things are worst — so cap DB concurrency (connection pools, load shedding) so a cache incident degrades latency rather than cascading into a full outage. A cache is a shock absorber; make sure removing it bends the system rather than breaking it.</p>
+
+  <h2>9 · One AI note, then back to fundamentals</h2>
+  <p>Everything above transfers unchanged to model serving: an inference gateway response cache is cache-aside with TTL-and-tolerate; a prefix/KV cache is object caching where the "object" is attention state and the system prompt is the ultimate hot key; and when a popular prompt's cached response expires, the dogpile math of §7 applies with GPU-sized recompute costs — which is why singleflight sits in front of inference. Same patterns, pricier misses. That is the whole note; the fundamentals in §1–§8 are what the interview is actually grading.</p>
+
+  <h2>10 · Interview talking points</h2>
+  <p>How to deploy this lesson live, in order:</p>
+  <ol>
+    <li><strong>Motivate with numbers, not vibes.</strong> "Reads are 150k/s against a DB good for 10k/s, so I need ≥ 93% of reads served from cache" beats "let's add caching for performance."</li>
+    <li><strong>Walk the ladder once</strong> (§2), then commit: "static assets to the CDN; the design problem is the app-layer cache."</li>
+    <li><strong>Name key and value.</strong> "Key <code>product:{id}:v2</code>, value ~2 KB JSON" — this unlocks concrete sizing and invalidation talk.</li>
+    <li><strong>State the read/write mix, then pick the pattern</strong> (§4) — cache-aside by default, and say why you're not using the others: "write-behind is off the table; this touches balances."</li>
+    <li><strong>Give the staleness bound out loud</strong> (§6): "60 s TTL on the browse path; checkout bypasses the cache." Unprompted staleness bounds are a strong-hire signal.</li>
+    <li><strong>Raise the failure modes before the interviewer does</strong> (§7): "the risk here is stampede on the flash-sale key — I'll put singleflight in front of recompute and jitter the TTLs." Then eviction (§5) and what happens when the cache tier dies (§8).</li>
+    <li><strong>Sizing sanity check to close:</strong> entries × bytes vs the hit-rate knee — "40 GB covers the hot set; past that we're buying single points of hit rate with doublings of memory."</li>
+  </ol>
+
+  <h2>11 · Lab — break a cache yourself</h2>
+  <div class="callout"><span class="label">Hands-on (do this before the quiz)</span>
+    Everything above is now verifiable in <code>labs/lab-0007-cache-lab/</code>:
+    <code>python3 cache_lab.py</code> runs three experiments — the LRU hit-rate curve on a zipf(1.1)
+    workload (watch diminishing returns appear in the table), cache-aside vs write-through under a
+    90/10 read/write mix, and a real 50-thread stampede: unprotected vs per-key lock vs TTL jitter.
+    Then do exercises E1–E4 in the lab README: <em>predict, edit config, re-run, compare.</em>
+    Wrong predictions are the deliverable — bring them to the next session.
+  </div>
+
+  <h2>12 · Project step</h2>
+  <p>Decision time for the <strong>LLM inference gateway</strong>: choose its response-cache design and defend it in two sentences. A defensible pick: <em>cache-aside with TTL-and-tolerate (responses keyed on a normalized prompt hash, 5-minute TTL, staleness stated) plus per-key singleflight and TTL jitter so an expiring popular entry never dogpiles the backends.</em> Write your own two sentences — pattern + stampede protection — and bring them to the next session for critique.</p>
+
+  <h2>Check yourself</h2>
+  <div class="quiz" id="quiz"></div>
+
+  <h2>Primary source</h2>
+  <p>Read the <strong>System Design Primer, section 13 — Cache</strong> (<a href="https://github.com/donnemartin/system-design-primer#cache">cache locations and levels</a>, then <a href="https://github.com/donnemartin/system-design-primer#when-to-update-the-cache">when to update the cache</a> for all four patterns with their disadvantages). It is the canonical free treatment and the exact vocabulary interviewers expect. For depth, <a href="https://www.usenix.org/system/files/conference/nsdi13/nsdi13-final170_update.pdf">Scaling Memcache at Facebook (NSDI '13)</a> is the single best real-world caching paper ever written — leases, invalidation streams, cold-cluster warm-up, all in 14 pages.</p>
+
+  <footer class="lesson-footer">
+    <p><strong>Stuck or curious?</strong> Ask your teacher (the agent) anything — "why does deleting on write beat updating on write in cache-aside?" is an excellent follow-up question.</p>
+    <nav class="lesson-nav">
+      <span><a href="0006-nosql-taxonomy.html">◀ Prev: 0006 · NoSQL Taxonomy</a></span>
+      <span><a href="0008-async-and-communication.html">Next: 0008 · Async and Communication ▶</a></span>
+    </nav>
+  </footer>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+renderQuiz(document.getElementById('quiz'), {
+  title: 'Check yourself',
+  questions: [
+    {
+      q: "A flash-sale item's cache entry expires and hundreds of concurrent requests all miss together, each reloading from the database. What is this failure called?",
+      options: [
+        'Cache penetration hitting the backing database',
+        'Cache stampede, also called thundering herd',
+        'Hot-key overload on a single shard',
+      ],
+      answer: 1,
+      explain: 'Simultaneous misses on one expired key dogpiling the backend is the stampede / thundering herd. Penetration is misses on keys that never existed; hot-key overload is one key exceeding a single node’s capacity.',
+    },
+    {
+      q: 'Which stampede fix guarantees that only one request recomputes the expired value while the others wait for its result?',
+      options: [
+        'Adding random jitter to every TTL',
+        'Negative caching of missing key lookups',
+        'Per-key locking in front of recompute',
+      ],
+      answer: 2,
+      explain: 'Per-key locking (singleflight — Instagram’s "promises", Facebook’s leases) serializes the recompute: one loader, everyone else reads the fresh entry. Jitter only decorrelates expiry times; negative caching addresses penetration, not stampedes.',
+    },
+    {
+      q: 'Why can a cache holding just 0.2% of an e-commerce keyspace serve nearly half of all read traffic?',
+      options: [
+        'Zipf skew concentrates requests on few keys',
+        'Memory hardware prefetches most keys ahead anyway',
+        'Databases push popular rows into caches automatically',
+      ],
+      answer: 0,
+      explain: 'Real access patterns are Zipf-distributed: the top handful of keys receive most requests, so a tiny cache covering them captures a huge share of traffic. On uniform traffic the same cache would hit ~0.2% of the time.',
+    },
+    {
+      q: 'Which update pattern keeps the cache consistent with the database at the price of slower writes and a cold start?',
+      options: [
+        'Write-behind updates cache first, database later',
+        'Write-through updates cache and database together',
+        'Cache-aside invalidates entries and reloads lazily',
+      ],
+      answer: 1,
+      explain: 'Write-through writes synchronously to both, so reads never see cache/DB divergence — but every write pays both costs, and nothing is cached until it has been written. DynamoDB DAX is the textbook production example.',
+    },
+    {
+      q: 'Scanners keep requesting product IDs that do not exist, so every lookup misses the cache and hits the database. What is the standard fix?',
+      options: [
+        'Replicate the missing key across nodes',
+        'Increase cache capacity until misses stop',
+        'Cache the miss itself: negative caching',
+      ],
+      answer: 2,
+      explain: 'This is cache penetration. Since nonexistent keys can never be filled by a real value, you cache the "not found" result with a short TTL (or screen with a Bloom filter). No amount of capacity or replication helps a key that has no value.',
+    },
+    {
+      q: 'In the lab, the first 100 cache slots bought a ~47% hit rate, but growing the cache 100× only reached ~86%. What does this illustrate?',
+      options: [
+        'Hit-rate curves flatten with diminishing returns',
+        'Eviction policies stop working at scale',
+        'Bigger caches always pay off proportionally',
+      ],
+      answer: 0,
+      explain: 'Zipf skew front-loads the value of a cache: the hottest keys fit in the first slots, and each additional slot caches a colder key. Size at the knee of the hit-rate curve, not at the top.',
+    },
+  ],
+});
+</script>
+</body>
+</html>

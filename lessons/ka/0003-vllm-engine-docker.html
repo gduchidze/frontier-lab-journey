@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html lang="ka">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>გაკვეთილი 3 — ძრავა: vLLM Docker-ში</title>
+<link rel="stylesheet" href="../../assets/course.css">
+</head>
+<body>
+<div class="page">
+<p class="lang-switch"><a href="../0003-vllm-engine-docker.html">🇬🇧 English</a></p>
+
+<p class="lesson-kicker">SLM Production Stack · გაკვეთილი 3 · ფაზა 3 · ~2 სთ (ფონური build-ის ჩათვლით)</p>
+<h1>ძრავა: vLLM Docker-ში</h1>
+<p class="lesson-lede">ერთი სესია Kubernetes-ის გარეშე. თავად vLLM-ს გაიცნობ — რატომ არის ის ინდუსტრიის default, როგორ მუშაობს continuous batching (უწყვეტი დაჯგუფება) და PagedAttention, და Qwen-ს OpenAI-თან თავსებადი API-ის გავლით დაელაპარაკები საკუთარ მანქანაზე.</p>
+
+<h2>ცოდნა: რატომ გაიმარჯვა vLLM-მა</h2>
+
+<h3>1. პრობლემა: GPU-ებს (და CPU-ებს) სძულთ წვრილმანი საუბრები</h3>
+<p>გულუბრყვილო serving ერთ მოთხოვნას ერთდროულად ამუშავებს; ტოკენებს შორის აპარატურა უსაქმოდ ზის. <strong>Continuous batching</strong> ამას ასწორებს: <em>ყოველ decoding ნაბიჯზე</em> scheduler-ს შეუძლია მიმდინარე batch-ში ახალი მოთხოვნების ჩამატება და დასრულებულების ამოგდება. batch-ის დაცლის ლოდინი აღარ არის. ეს არის ერთადერთი ყველაზე დიდი throughput-იდეა LLM serving-ში.</p>
+
+<h3>2. PagedAttention: ვირტუალური მეხსიერება KV cache-ისთვის</h3>
+<p>ყოველ დაგენერირებულ ტოკენს attention სჭირდება ყველა წინა ტოკენზე — ეს ინახება <strong>KV cache</strong>-ად, მეხსიერების მთავარ მომხმარებლად. vLLM-ის ფუძემდებლური იდეა (<a href="https://arxiv.org/abs/2309.06180">SOSP 2023 ნაშრომი</a>): KV cache იმართოს ფიქსირებული ზომის <em>ბლოკებით</em> და მიმართვის ცხრილით, OS-ის ვირტუალური მეხსიერების გვერდების მსგავსად. შედეგი: თითქმის ნულოვანი ფრაგმენტაცია, საერთო პრეფიქსების მქონე მოთხოვნებს შორის გაზიარებული მეხსიერება, ბევრად დიდი batch-ები.</p>
+
+<h3>3. ერთი სერვერი, OpenAI-ის API</h3>
+<p><code>vllm serve MODEL</code> უშვებს HTTP სერვერს, რომელიც ახორციელებს <code>/v1/chat/completions</code>, <code>/v1/completions</code>, <code>/v1/models</code> — <a href="https://docs.vllm.ai/en/latest/serving/openai_compatible_server.html">OpenAI-თან თავსებად API-ს</a>. ნებისმიერი OpenAI კლიენტი მუშაობს ერთი base URL-ის შეცვლით. სწორედ ამიტომ ერთვება ყველა UI, router და SDK უფასოდ — და ამიტომ არ სჭირდება ფაზა 8-ის ჩატის UI-ს არანაირი custom კოდი.</p>
+
+<h3>4. CPU backend: იგივე ძრავა, სხვა რკინა</h3>
+<p>vLLM-ის CPU backend (<a href="https://docs.vllm.ai/en/latest/getting_started/installation/cpu.html">დოკუმენტაცია</a>) იმავე scheduler-სა და API-ს უშვებს x86/ARM-ზე. დღეს ორ ბერკეტს აქვს მნიშვნელობა:</p>
+<table>
+<tr><th>ბერკეტი</th><th>მნიშვნელობა</th><th>ჩვენი მნიშვნელობა</th></tr>
+<tr><td><code>VLLM_CPU_KVCACHE_SPACE</code></td><td>KV cache-ისთვის დაჯავშნილი GiB</td><td><code>4</code></td></tr>
+<tr><td><code>--dtype bfloat16</code></td><td>წონების სიზუსტე (M4 bf16-ს უჭერს მხარს)</td><td>bfloat16</td></tr>
+<tr><td><code>--max-model-len</code></td><td>ზღუდავს კონტექსტის სიგრძეს → ზღუდავს KV მეხსიერებას</td><td><code>4096</code></td></tr>
+</table>
+<div class="warning"><strong>რეალობის შემოწმება</strong>
+CPU inference ~10–50-ჯერ ნელია GPU-ზე. 0.8B მოდელისთვის ეს მაინც რამდენიმე token/წმ-ია — საკმარისი ყველა production პატერნის სასწავლად. არქიტექტურა, რომელსაც ააგებ, GPU ვერსიის იდენტურია; მხოლოდ image და ერთი resource ხაზი განსხვავდება.</div>
+
+<h2>ლაბორატორია: build, serve, ჩატი</h2>
+
+<div class="lab">
+
+<div class="step">
+<h3>დაიწყე image-ის build ფონურად (ეს ᲞᲘᲠᲕᲔᲚᲘ გააკეთე)</h3>
+<p>ოფიციალური ARM CPU image არ არსებობს, ამიტომ მას ვაშენებთ vLLM-ის საკუთარი <code>Dockerfile.cpu</code>-დან. 30–60 წთ სჭირდება — გაუშვი და სანამ მუშაობს, კითხვა განაგრძე:</p>
+<pre><code>cd ~/PycharmProjects/AI
+git clone https://github.com/vllm-project/vllm.git
+cd vllm
+docker build -f docker/Dockerfile.cpu -t vllm-cpu:local . &gt; /tmp/vllm-build.log 2&gt;&amp;1 &amp;
+tail -f /tmp/vllm-build.log     # Ctrl+C anytime; build continues</code></pre>
+<div class="note"><strong>რატომ build და არა pull?</strong>
+doronmak-ის რეპო საკუთარ <code>doronmak/vllm-cpu-image</code>-ს იმავე მიზეზით აქვეყნებს — ყველა პლატფორმისთვის ოფიციალური CPU image არ არსებობს. ნებისმიერი image-ის არქიტექტურა შეამოწმე <code>docker manifest inspect IMAGE | grep architecture</code>-ით. amd64 image შენს M4-ზე ემულაციით მუშაობს: მუშაობს, მაგრამ ~5-ჯერ ნელა.</div>
+</div>
+
+<div class="step">
+<h3>სანამ build მიმდინარეობს: წაიკითხე ძრავის შესახებ</h3>
+<p>წაიკითხე <a href="https://blog.vllm.ai/2023/06/20/vllm.html">vLLM-ის ორიგინალი საანონსო ბლოგი</a> (10 წთ) — PagedAttention-ის ყველაზე ნათელი ახსნა ილუსტრაციებით. შემდეგ გადაათვალიერე <a href="../../reference/vllm-cheatsheet.html">vLLM reference ბარათი</a>, რომელსაც კურსის დარჩენილ ნაწილში გამოიყენებ.</p>
+</div>
+
+<div class="step">
+<h3>გაუშვი სერვერი</h3>
+<p>როცა build დასრულდება (<code>docker images | grep vllm-cpu</code>):</p>
+<pre><code>docker run -d --name vllm \
+  -p 8000:8000 \
+  -v hf-cache:/root/.cache/huggingface \
+  -e VLLM_CPU_KVCACHE_SPACE=4 \
+  vllm-cpu:local \
+  --model Qwen/Qwen3.5-0.8B \
+  --max-model-len 4096 \
+  --dtype bfloat16
+
+docker logs -f vllm      # watch model download + engine init; Ctrl+C when "Uvicorn running"</code></pre>
+<p class="expect">მოსალოდნელია (პირველ გაშვებაზე): წონების ჩამოტვირთვა (~2 GB), შემდეგ "Application startup complete"</p>
+<div class="warning"><strong>თუ Qwen3.5-0.8B ჩავარდება unsupported architecture შეცდომით</strong>
+<code>qwen3_5</code> 2026 წლის მულტიმოდალური არქიტექტურაა; შენი აშენებული image vLLM main-ს მიჰყვება, ასე რომ, უნდა იმუშაოს. თუ არა: გადადი <code>--model Qwen/Qwen3-0.6B</code>-ზე (მხოლოდ ტექსტური, დიდი ხანია მხარდაჭერილი), ჩაინიშნე ეს სასწავლო ჩანაწერში და სამიზნე მოდელი მოგვიანებით სცადე <code>git pull</code> + rebuild-ის შემდეგ. ყველა სხვა გაკვეთილი ორივე მოდელით იდენტურად მუშაობს.</div>
+</div>
+
+<div class="step">
+<h3>დაელაპარაკე — სამი endpoint</h3>
+<pre><code># 1. What models are loaded?
+curl -s localhost:8000/v1/models | python3 -m json.tool
+
+# 2. Chat (the endpoint everything else in this course uses)
+curl -s localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Qwen/Qwen3.5-0.8B",
+    "messages": [{"role":"user","content":"In one sentence: what is PagedAttention?"}],
+    "max_tokens": 60
+  }' | python3 -m json.tool
+
+# 3. Metrics — Prometheus format, phase 7 lives here
+curl -s localhost:8000/metrics | grep -E "^vllm:" | head -20</code></pre>
+<p class="expect">მოსალოდნელია: JSON პასუხი Qwen-ისგან; მეტრიკების ხაზები, როგორიცაა vllm:num_requests_running</p>
+</div>
+
+<div class="step">
+<h3>ნახე continuous batching საკუთარი თვალით</h3>
+<p>გაუშვი 5 პარალელური მოთხოვნა, შემდეგ შეამოწმე მიმდინარე მოთხოვნების gauge:</p>
+<pre><code>for i in 1 2 3 4 5; do
+  curl -s localhost:8000/v1/chat/completions -H "Content-Type: application/json" \
+    -d '{"model":"Qwen/Qwen3.5-0.8B","messages":[{"role":"user","content":"Count to 30 slowly."}],"max_tokens":200}' &gt; /dev/null &amp;
+done
+sleep 3
+curl -s localhost:8000/metrics | grep -E "num_requests_(running|waiting)"</code></pre>
+<p class="expect">მოსალოდნელია: num_requests_running &gt; 1 — რამდენიმე მოთხოვნა ᲔᲠᲗ batch-ში, ერთდროულად</p>
+<div class="win"><strong>მოგება</strong>
+შენ ააგე inference ძრავის image, რომელსაც ყველა შემდეგი ფაზა დააპლოებს, დაელაპარაკე Qwen-ს ზუსტად იმ API-ით, რომელსაც შენი UI გამოიყენებს, და უყურე, როგორ მოემსახურა continuous batching 5 მოთხოვნას ერთდროულად. ძრავა შავი ყუთი აღარ არის.</div>
+</div>
+
+<div class="step">
+<h3>გაჩერება (image + მოდელის cache დაიტოვე)</h3>
+<pre><code>docker stop vllm && docker rm vllm
+# model weights persist in the named volume:
+docker volume ls | grep hf-cache</code></pre>
+</div>
+
+</div>
+
+<h2>შეამოწმე საკუთარი თავი</h2>
+<div class="quiz" data-quiz>
+  <div class="q">
+    <p class="stem">მოთხოვნა B მოდის მაშინ, როცა მოთხოვნა A გენერაციის შუაშია. continuous batching ნიშნავს…</p>
+    <button class="opt" data-correct>B batch-ს შემდეგ ნაბიჯზე უერთდება</button>
+    <button class="opt">B ელოდება, სანამ A სრულად დასრულდება</button>
+    <button class="opt">B აჩერებს A-ს, რომელიც მოგვიანებით თავიდან იწყება</button>
+    <p class="explain">scheduler batch-ს ყოველ decoding ნაბიჯზე ხელახლა აწყობს. არც დაცლა, არც preemption ნორმალურ გზაზე.</p>
+  </div>
+  <div class="q">
+    <p class="stem">რას აღმოფხვრის PagedAttention უპირველესად?</p>
+    <button class="opt" data-correct>KV cache-ის მეხსიერების ფრაგმენტაციას მოთხოვნებს შორის</button>
+    <button class="opt">attention-ის გამოთვლის ღირებულებას გრძელი გენერაციებისას</button>
+    <button class="opt">მოდელის წონების დუბლირებას batch-ის რეპლიკებს შორის</button>
+    <p class="explain">ბლოკებზე დაფუძნებული KV შენახვა მიმართვის ცხრილით = თითქმის ნულოვანი ფრაგმენტაცია და პრეფიქსების გაზიარება. გამოთვლის ღირებულება და წონები უცვლელია.</p>
+  </div>
+  <div class="q">
+    <p class="stem">რატომ ეხმარება --max-model-len-ის შეზღუდვა მეხსიერებაში შეზღუდულ მანქანას?</p>
+    <button class="opt" data-correct>ის ზღუდავს თითოეული მოთხოვნის KV cache-ს</button>
+    <button class="opt">ის ამცირებს მოდელის წონების ზომას</button>
+    <button class="opt">ის ამცირებს tokenizer-ის ლექსიკონის ზომას</button>
+    <p class="explain">KV cache იზრდება sequence-ის სიგრძესთან ერთად. სიგრძის შეზღუდვა ზღუდავს თითო მოთხოვნის ყველაზე ცუდ შემთხვევას და scheduler-ს მეტი მოთხოვნის უსაფრთხოდ მიღების საშუალებას აძლევს. წონები ხელუხლებელია.</p>
+  </div>
+</div>
+
+<h2>პირველადი წყარო</h2>
+<p><a href="https://blog.vllm.ai/2023/06/20/vllm.html">vLLM: Easy, Fast, and Cheap LLM Serving with PagedAttention</a> — საანონსო ბლოგი. სიღრმისთვის: <a href="https://arxiv.org/abs/2309.06180">SOSP ნაშრომი</a>, §3–4.</p>
+
+<h2>შემდეგი</h2>
+<p><a href="0004-vllm-on-k8s.html">გაკვეთილი 4</a>: ორი ნახევარი ერთმანეთს ხვდება — ეს image, დაპლოებული შენს cluster-ში გაკვეთილ 2-ის manifests-with-probes პატერნით.</p>
+
+<div class="lesson-footer">
+<p>Reference მასალები: <a href="../../reference/vllm-cheatsheet.html">vLLM cheat sheet</a>.</p>
+<p>Build-ის შეცდომები, უცნაური ლოგები? ჩაუსვი შენს მასწავლებელს — debugging-ის სწავლის ეს ყველაზე სწრაფი გზაა.</p>
+</div>
+
+</div>
+<script src="../../assets/quiz.js"></script>
+</body>
+</html>

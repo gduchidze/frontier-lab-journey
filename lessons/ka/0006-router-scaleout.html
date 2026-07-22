@@ -1,0 +1,216 @@
+<!DOCTYPE html>
+<html lang="ka">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>გაკვეთილი 6 — მასშტაბირება: რეპლიკები და მოთხოვნების Router</title>
+<link rel="stylesheet" href="../../assets/course.css">
+</head>
+<body>
+<div class="page">
+
+<p class="lang-switch"><a href="../0006-router-scaleout.html">🇬🇧 English</a></p>
+
+<p class="lesson-kicker">SLM Production Stack · გაკვეთილი 6 · ფაზა 6 · ~2 სთ</p>
+<h1>მასშტაბირება: რეპლიკები და მოთხოვნების Router</h1>
+<p class="lesson-lede">ერთ engine-ს (ინფერენსის ძრავას) მომსახურების ზღვარი აქვს. დღეს ორს გაუშვებ და გაიგებ, რატომ სჭირდება LLM serving-ს უბრალო Service-ზე ჭკვიანი load balancer-ი — მოთხოვნების router-ი (მარშრუტიზატორი), vLLM production-stack-ის გული.</p>
+
+<div class="warning"><strong>ჯერ მეხსიერება შეამოწმე</strong>
+ორი vLLM რეპლიკა ≈ 12–16 Gi მოთხოვნილი 16 Gi Mac-ზე. ამ ლაბორატორიამდე: Docker Desktop → Settings → Resources → მიეცი Docker-ს ≥ 12 GB. ასევე შეამცირე რესურსები თითო რეპლიკაზე (ნაბიჯი 1). თუ შენი მანქანა ძლიერ swap-ავს, გაიარე ეს გაკვეთილი მოდელად <code>facebook/opt-125m</code>-ით — მარშრუტიზაციის გაკვეთილები იდენტურია.</div>
+
+<h2>ცოდნა: რატომ არ კმარა უბრალო Service</h2>
+
+<h3>1. LLM მოთხოვნები ვებ-მოთხოვნები არ არის</h3>
+<p>ვებ-მოთხოვნა მილიწამები ღირს; LLM მოთხოვნა — წამებიდან წუთებამდე მდგომარეობის მქონე გამოთვლა, მზარდი KV cache-ით. შემთხვევითი round-robin (რასაც Service აკეთებს) უგულებელყოფს: engine-ის დატვირთვას (რიგის სიღრმეს), KV cache-ის ხელახლა გამოყენებას (ერთი და იმავე მომხმარებლის საუბრის პრეფიქსი უკვე დაქეშილია engine A-ზე) და მოდელის განთავსებას (engine B სხვა მოდელს ემსახურება). შედეგი: თავიდან აცილებადი დაყოვნება (latency) და cache-იდან გამოდევნები.</p>
+
+<h3>2. Router აპლიკაციის დონის load balancer-ია</h3>
+<p>production-stack-ის <a href="https://github.com/vllm-project/production-stack/tree/main/src/vllm_router">vllm-router</a> engine-ების წინ დგას და ამატებს იმას, რაც Service-ს არ შეუძლია:</p>
+<table>
+<tr><th>შესაძლებლობა</th><th>რატომ არის მნიშვნელოვანი</th></tr>
+<tr><td>K8s service discovery</td><td>API-ს უყურებს engine Pod-ების label-ის მიხედვით — რეპლიკები ავტომატურად ერთვებიან/გამოდიან</td></tr>
+<tr><td>მარშრუტიზაციის ალგორითმები</td><td>round-robin, session-ID affinity, prefix-aware (ერთი პრეფიქსი → ერთი engine → KV cache-ის მოხვედრა)</td></tr>
+<tr><td>მეტრიკები თითო engine-ზე</td><td>QPS, TTFT, pending requests თითოეულ engine-ზე — კვებავს მე-7 ფაზის dashboard-ებს</td></tr>
+<tr><td>მოდელის მარშრუტიზაცია</td><td>ერთი endpoint-ი, ბევრი მოდელი: მოთხოვნის <code>model</code> ველი ირჩევს backend-ს</td></tr>
+</table>
+
+<h3>3. Session affinity = KV cache-ის ეკონომიკა</h3>
+<p>ჩატის საუბარი ყოველ სვლაზე მთელ ისტორიას ხელახლა აგზავნის. თუ N-ური სვლა იმ engine-ზე მოხვდება, რომელმაც N−1-ური მოემსახურა, პრეფიქსი უკვე KV cache-შია (prefix caching-ის ჩართვისას) → TTFT მკვეთრად ეცემა. მიბმული (sticky) მარშრუტიზაცია სასიამოვნო წვრილმანი კი არა, გამოთვლითი ხარჯების ბერკეტია. სწორედ ეს არის "KV cache reuse" ფრაზა production-stack-ის README-ში — და ML infra ვაკანსიების აღწერებში.</p>
+
+<h2>ლაბორატორია: ორი engine, ერთი router</h2>
+
+<div class="lab">
+
+<div class="step">
+<h3>შეამცირე რესურსები რეპლიკაზე, გაზარდე 2-მდე</h3>
+<p>დაარედაქტირე <code>charts/slm-stack/values.yaml</code>: <code>replicaCount: 2</code>, resources → <code>requests: { cpu: "2", memory: 5Gi }, limits: { cpu: "4", memory: 6Gi }</code>, <code>kvCacheSpaceGiB: 2</code>. კიდევ ერთი ცვლილება — ორი Pod-ი ვერ გაიზიარებს ReadWriteOnce PVC-ს სხვადასხვა node-ზე. უმარტივესი ლოკალური გამოსავალი: deployment template-ში PVC volume ჩაანაცვლე per-pod emptyDir-ით (წონები თითო Pod-ზე ერთხელ ხელახლა ჩამოიტვირთება; ლოკალურად შეიგუე) — ან ორივე რეპლიკა ერთ node-ზე მიამაგრე <code>nodeSelector</code>-ით. აირჩიე, შემდეგ:</p>
+<pre><code>helm upgrade slm charts/slm-stack
+kubectl get pods -n llm -o wide -w    # wait for both READY 1/1 (patience: CPU load × 2)</code></pre>
+<p class="expect">მოსალოდნელია: vllm-xxxx და vllm-yyyy — ორივე Running READY 1/1</p>
+</div>
+
+<div class="step">
+<h3>დააკვირდი უბრალო Service-ის round-robin-ს</h3>
+<pre><code>kubectl port-forward -n llm svc/vllm 8000:8000 &amp;
+for i in 1 2 3 4 5 6; do
+  curl -s localhost:8000/v1/chat/completions -H "Content-Type: application/json" \
+    -d '{"model":"Qwen/Qwen3.5-0.8B","messages":[{"role":"user","content":"hi"}],"max_tokens":5}' &gt; /dev/null
+done
+kubectl logs -n llm -l app=vllm --tail=5 --prefix | grep "POST /v1"</code></pre>
+<p class="expect">მოსალოდნელია: მოთხოვნები ჩანს ორივე Pod-ის ლოგებში (შენიშვნა: port-forward ერთ Pod-ს ემაგრება — კლასტერშიდა ტრაფიკი ნაწილდება; შესადარებლად ორივე ლოგი შეამოწმე)</p>
+</div>
+
+<div class="step">
+<h3>გაუშვი router-ი</h3>
+<p>შეინახე როგორც <code>k8s/router.yaml</code>:</p>
+<pre><code>apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: vllm-router
+  namespace: llm
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: pod-reader
+  namespace: llm
+rules:
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: vllm-router-pod-reader
+  namespace: llm
+subjects:
+- kind: ServiceAccount
+  name: vllm-router
+  namespace: llm
+roleRef:
+  kind: Role
+  name: pod-reader
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm-router
+  namespace: llm
+  labels: { app: vllm-router }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: vllm-router }
+  template:
+    metadata:
+      labels: { app: vllm-router }
+    spec:
+      serviceAccountName: vllm-router
+      containers:
+      - name: router
+        image: lmcache/lmstack-router:latest
+        args:
+          - "--host"
+          - "0.0.0.0"
+          - "--port"
+          - "8000"
+          - "--service-discovery"
+          - "k8s"
+          - "--k8s-namespace"
+          - "llm"
+          - "--k8s-label-selector"
+          - "app=vllm"
+          - "--routing-logic"
+          - "roundrobin"
+          - "--engine-scrape-interval"
+          - "15"
+          - "--request-stats-window"
+          - "60"
+        ports:
+        - containerPort: 8000
+        resources:
+          requests: { cpu: 250m, memory: 256Mi }
+          limits:   { cpu: "1",  memory: 512Mi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-router
+  namespace: llm
+spec:
+  selector: { app: vllm-router }
+  ports:
+  - port: 80
+    targetPort: 8000</code></pre>
+<div class="note"><strong>ორ რამეს მიაქციე ყურადღება</strong>
+(1) RBAC ბლოკი: router-ი Pod-ებს K8s API-ით უყურებს, ამიტომ მას ცხადი ნებართვა სჭირდება — შენი პირველი შეხება კლასტერის უსაფრთხოებასთან. (2) Image tag: apply-მდე გადაამოწმე მიმდინარე image/args <a href="https://github.com/vllm-project/production-stack/tree/main/src/vllm_router">router-ის README-სთან</a> — flag-ები იცვლება. თუ დაეჭვდები, სთხოვე მასწავლებელს გადამოწმება.</div>
+<pre><code>kubectl apply -f k8s/router.yaml
+kubectl logs -n llm -l app=vllm-router -f    # expect: discovers 2 engine pods</code></pre>
+</div>
+
+<div class="step">
+<h3>გაატარე ტრაფიკი მასში</h3>
+<pre><code>kill %1 2>/dev/null   # stop old port-forward
+kubectl port-forward -n llm svc/vllm-router 8080:80</code></pre>
+<p>მეორე ტერმინალი — იგივე API, ახლა router-ის უკან:</p>
+<pre><code>curl -s localhost:8080/v1/models | python3 -m json.tool
+for i in 1 2 3 4; do
+  curl -s localhost:8080/v1/chat/completions -H "Content-Type: application/json" \
+    -d '{"model":"Qwen/Qwen3.5-0.8B","messages":[{"role":"user","content":"one word: ping"}],"max_tokens":5}' | python3 -c "import json,sys; print(json.load(sys.stdin)['choices'][0]['message']['content'])"
+done</code></pre>
+<p class="expect">მოსალოდნელია: 4 პასუხი; router-ის ლოგებში ჩანს, რომ მოთხოვნები engine-ებს შორის მონაცვლეობს</p>
+</div>
+
+<div class="step">
+<h3>გადადი სესიაზე მიბმულ მარშრუტიზაციაზე</h3>
+<p><code>k8s/router.yaml</code>-ში შეცვალე <code>--routing-logic</code> მნიშვნელობით <code>session</code> და დაამატე <code>--session-key</code> / <code>x-user-id</code> არგუმენტები, შემდეგ:</p>
+<pre><code>kubectl apply -f k8s/router.yaml
+kubectl rollout status deployment/vllm-router -n llm
+# same header → same engine every time:
+for i in 1 2 3 4; do
+  curl -s localhost:8080/v1/chat/completions -H "Content-Type: application/json" \
+    -H "x-user-id: giorgi" \
+    -d '{"model":"Qwen/Qwen3.5-0.8B","messages":[{"role":"user","content":"ping"}],"max_tokens":5}' &gt; /dev/null
+done
+kubectl logs -n llm -l app=vllm --tail=10 --prefix | grep "POST /v1"</code></pre>
+<p class="expect">მოსალოდნელია: ოთხივე მოთხოვნა ერთი Pod-ის ლოგში — affinity მუშაობს</p>
+<div class="win"><strong>მოგება</strong>
+ახლა production-stack-ის საბაზისო არქიტექტურას უშვებ: N engine + აღმომჩენი, affinity-ს მცოდნე router-ი. აქედან მოყოლებული ყველაფერი (UI, მონიტორინგი, დატვირთვის ტესტები) <code>vllm-router.llm.svc.cluster.local</code>-ს ელაპარაკება.</div>
+</div>
+
+</div>
+
+<h2>შეამოწმე საკუთარი თავი</h2>
+<div class="quiz" data-quiz>
+  <div class="q">
+    <p class="stem">რატომ ამცირებს session affinity time-to-first-token-ს ჩატში?</p>
+    <button class="opt" data-correct>საუბრის პრეფიქსი უკვე დაქეშილია engine-ზე</button>
+    <button class="opt">engine ქსელურ კავშირს უფრო დიდხანს ინახავს თბილად</button>
+    <button class="opt">router-ი სესიისთვის discovery-ს ძებნას გამოტოვებს</button>
+    <p class="explain">ჩატი ისტორიას ყოველ სვლაზე ხელახლა აგზავნის; იმავე engine-ზე მოხვედრა ნიშნავს, რომ საზიარო პრეფიქსის KV cache ხელახლა გამოიყენება ხელახალი გამოთვლის ნაცვლად — და სწორედ ეს ხელახალი გამოთვლაა TTFT-ის უმეტესი ნაწილი.</p>
+  </div>
+  <div class="q">
+    <p class="stem">რატომ დასჭირდა router-ის Deployment-ს ServiceAccount + Role?</p>
+    <button class="opt" data-correct>ის Pod-ებს API-ით ჩამოთვლის და უყურებს</button>
+    <button class="opt">მან უნდა გადატვირთოს გაუმართავი engine-ები</button>
+    <button class="opt">ყველა Deployment-ს ცხადი RBAC როლები სჭირდება</button>
+    <p class="explain">service discovery = K8s API-სთან შეკითხვა label-ს შესაბამისი Pod-ების შესახებ. ნაგულისხმევ service account-ებს ეს არ შეუძლიათ. router-ი engine-ებს არასოდეს გადატვირთავს — ეს Deployment controller-ის საქმეა.</p>
+  </div>
+</div>
+
+<h2>პირველწყარო</h2>
+<p><a href="https://github.com/vllm-project/production-stack/tree/main/src/vllm_router">vllm-router README</a> (production-stack) — მარშრუტიზაციის ლოგიკები, flag-ები, მეტრიკები. გადაათვალიერე <a href="https://docs.vllm.ai/en/latest/features/automatic_prefix_caching.html">Automatic Prefix Caching</a>, რომ affinity → cache-ის მოხვედრები ერთმანეთს დაუკავშირო.</p>
+
+<h2>შემდეგი</h2>
+<p><a href="0007-observability.html">გაკვეთილი 7</a>: ვერ მართავ იმას, რასაც ვერ ხედავ. Prometheus ყველა engine-სა და router-ს scrape-ავს; Grafana ამას აქცევს production-stack-ის README-ს dashboard-ად.</p>
+
+<div class="lesson-footer">
+<p>მასალები: <a href="../../reference/vllm-cheatsheet.html">vLLM-ის შპარგალკა</a> · <a href="../../reference/helm-cheatsheet.html">Helm-ის შპარგალკა</a>.</p>
+<p>router-ის flag-ები upstream-ში შეიცვალა? გაუგზავნე მასწავლებელს მისი --help ან crash-ლოგი.</p>
+</div>
+
+</div>
+<script src="../../assets/quiz.js"></script>
+</body>
+</html>

@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="ka">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>გაკვეთილი 19 — Kubernetes-ის ატლასი: ყველაფერი დანარჩენი, რაც AI-ინჟინერს სჭირდება</title>
+<link rel="stylesheet" href="../../assets/course.css">
+</head>
+<body>
+<div class="page">
+<p class="lang-switch"><a href="../0019-k8s-atlas.html">🇬🇧 English</a></p>
+
+<p class="lesson-kicker">SLM Production Stack · ფინალური · გაკვეთილი 19 · ~2.5 სთ (ატლასი + ლაბორატორია)</p>
+<h1>Kubernetes-ის ატლასი</h1>
+<p class="lesson-lede">ყველაფერი, რაც კურსმა გამოიყენა, მაგრამ არ გასწავლა, და ყველაფერი, რასაც რეალური AI-ინფრასტრუქტურის სამუშაო შემდეგ შემოგიგდებს. ფორმატი: ჯერ რუკა (თემა → რა არის → როდის დაგჭირდება), შემდეგ დეტალური განხილვა იმ ხუთ ხარვეზზე, რომლებიც AI-სამუშაოებისთვის ყველაზე მნიშვნელოვანია, ბოლოს კი ლაბორატორია, რომელიც მათგან ოთხს ეხება.</p>
+
+<h2>რუკა — workload-ები Deployment-ების მიღმა</h2>
+<table>
+<tr><th>თემა</th><th>რა არის</th><th>როდის სჭირდება AI-ინჟინერს</th></tr>
+<tr><td><strong>StatefulSet</strong></td><td>Deployment სტაბილური იდენტობით: pod-0, pod-1, თითოეულს საკუთარი PVC აქვს, მოწესრიგებული rollout</td><td>განაწილებული inference/training-ის rank-ები, ვექტორული ბაზები, ყველაფერი, სადაც „რომელი რეპლიკა ვარ" მნიშვნელოვანია</td></tr>
+<tr><td><strong>Headless Service</strong></td><td><code>clusterIP: None</code> — DNS პირდაპირ pod-ის IP-ებს აბრუნებს, pod-ის ინდივიდუალური სახელებით (<code>pod-0.svc…</code>)</td><td>Rank-to-rank კომუნიკაცია (Ray, NCCL bootstrap); StatefulSet-თან წყვილში მუშაობს</td></tr>
+<tr><td><strong>Job</strong></td><td>ეშვება დასრულებამდე; <code>completions</code>/<code>parallelism</code>/<code>backoffLimit</code></td><td>Batch inference, eval-ების გაშვება, მოდელების ჩამოტვირთვა, მონაცემთა წინასწარი დამუშავება — ML-გამოთვლების ნახევარი Job-ებია</td></tr>
+<tr><td><strong>CronJob</strong></td><td>Job განრიგით</td><td>ღამის eval-ები, cache warmer-ები, ანგარიშების გენერაცია</td></tr>
+<tr><td><strong>DaemonSet</strong></td><td>ერთი pod თითო (შესაბამის) node-ზე</td><td>ასე ეშვება რეალურად NVIDIA device plugin, node-exporter, CNI-აგენტები, log shipper-ები — მათგან ოთხს უკვე იყენებდი</td></tr>
+<tr><td><strong>LeaderWorkerSet (LWS)</strong></td><td>CRD: leader+worker ჯგუფები, რომლებიც ერთ ერთეულად იგეგმება/მასშტაბირდება</td><td>ეს არის ჩამოყალიბებადი API მრავალ-node-იანი inference-ისთვის (TP×PP node-ებს შორის, გაკვეთილი 16) — vLLM-ის დოკუმენტაცია მას ცალკე გამოყოფს</td></tr>
+<tr><td><strong>Kueue</strong></td><td>Job-ების რიგები: კვოტები, პრიორიტეტები, gang admission batch-ისთვის</td><td>საზიარო GPU-კლასტერი, სადაც training და batch ერთმანეთს ეჯიბრებიან — ვინ გაეშვება შემდეგი და რამდენი GPU-თი</td></tr>
+<tr><td><strong>KubeRay / Ray on K8s</strong></td><td>Operator (ოპერატორი), რომელიც Ray-კლასტერებს მართავს</td><td>vLLM-ის მრავალ-node-იანი backend; განაწილებული მონაცემთა დამუშავება; RLHF pipeline-ები</td></tr>
+</table>
+
+<h2>რუკა — pod-ის შიდა მექანიზმები, რომლებიც გამოტოვე</h2>
+<table>
+<tr><th>თემა</th><th>რა</th><th>AI-ინჟინრის ტრიგერი</th></tr>
+<tr><td><strong>Init containers</strong></td><td>ეშვება დასრულებამდე, სანამ მთავარი კონტეინერები დაიწყებენ</td><td>მოდელის წონების წინასწარი ჩამოტვირთვა, რომ engine-კონტეინერი „ცხლად" აეწყოს; უფლებების გასწორება</td></tr>
+<tr><td><strong>Sidecar containers</strong></td><td>ხანგრძლივად მომუშავე დამხმარეები (native მხარდაჭერა restartPolicy: Always init-ის მეშვეობით)</td><td>Log shipper-ები, proxy-ები, LMCache-ის ტიპის cache-აგენტები engine-ების გვერდით</td></tr>
+<tr><td><strong>kubectl debug</strong> / ephemeral containers</td><td>Debug-კონტეინერის ჩასმა უკვე გაშვებულ pod-ში</td><td>Distroless/მინიმალური image-ები shell-ის გარეშე — შესვლის ერთადერთი გზა. <code>kubectl debug -it POD --image=busybox --target=vllm</code></td></tr>
+<tr><td><strong>Lifecycle hooks</strong> (preStop) + <code>terminationGracePeriodSeconds</code></td><td>ბრძანებები გამორთვისას; რამდენ ხანს ელოდება K8s SIGKILL-ამდე</td><td><em>კრიტიკულია LLM-ებისთვის:</em> მიმდინარე გენერაციებს დრენირება (draining) სჭირდება — ნაგულისხმევი 30 წმ გრძელ გენერაციებს შუა ტოკენზე კლავს (განხილვა ქვემოთ)</td></tr>
+<tr><td><strong>PodDisruptionBudget</strong></td><td>„ნებაყოფლობით არასდროს გამორთო N-ზე მეტი ამათგან"</td><td>Node-ის drain-ები/განახლებები ვერ გამორთავენ მთელ engine-ფლოტს ერთბაშად</td></tr>
+<tr><td><strong>Rolling-update პარამეტრები</strong> (maxSurge / maxUnavailable)</td><td>რამდენი ზედმეტი/დაკლებული pod rollout-ისას</td><td>GPU pod-ები: maxSurge=1 სათადარიგო GPU ღირს; maxUnavailable=1 — სიმძლავრე. აირჩიე გააზრებულად</td></tr>
+<tr><td><strong>Downward API</strong></td><td>Pod-ის სახელის/IP-ის/label-ების/რესურსების გამოტანა env-ად ან ფაილებად</td><td>Engine, რომელიც საკუთარ pod-იდენტობას ლოგავს; rank-ის გამოყვანა</td></tr>
+<tr><td><strong>Security context</strong> (runAsNonRoot, capabilities, seccomp)</td><td>პრივილეგიების საზღვრები pod-ის/კონტეინერის დონეზე</td><td>SOC2 checklist-ები; doronmak-ის chart ამათ აყენებს — ახლა უკვე იცი, რატომ</td></tr>
+</table>
+
+<h2>რუკა — პლატფორმის მექანიზმები</h2>
+<table>
+<tr><th>თემა</th><th>რა</th><th>ტრიგერი</th></tr>
+<tr><td><strong>CRDs + operators</strong></td><td>API-ის გაფართოება საკუთარი ტიპებით + controller, რომელიც მათ reconcile-ს უკეთებს</td><td>უკვე ხუთი გირბის (Prometheus, cert-manager, Argo, Cilium, ServiceMonitor). production-stack-საც operator მოჰყვება. განხილვა ქვემოთ</td></tr>
+<tr><td><strong>Admission webhooks / policy</strong> (Kyverno, OPA, ValidatingAdmissionPolicy)</td><td>API-ჩანაწერების დაჭერა: შეცვლა ან უარყოფა</td><td>„GPU-node-ებზე ყველა pod-ს limits ᲣᲜᲓᲐ ჰქონდეს" — აღსრულებული admission-ის დონეზე და არა code review-ში</td></tr>
+<tr><td><strong>Finalizers, ownerReferences, GC</strong></td><td>წაშლის პროტოკოლი; მშობელი-შვილის გასუფთავება</td><td>რატომ ეკიდება namespace Terminating-ში; რატომ კლავს Deployment-ის წაშლა მის pod-ებს</td></tr>
+<tr><td><strong>API machinery: watch/informers</strong></td><td>მოვლენების ნაკადი, რომელსაც ყველა controller (და შენი router-იც!) მოიხმარს</td><td>ნებისმიერი რამის წერა, რაც კლასტერის მდგომარეობაზე რეაგირებს; ინტერვიუს სიღრმე</td></tr>
+<tr><td><strong>Kustomize</strong></td><td>YAML-ის overlay-ები შაბლონების გარეშე (base + per-env patch-ები); ჩაშენებულია kubectl-ში</td><td>Deploy-ინსტრუმენტების სამყაროს მეორე ნახევარი; Argo ორივეს ესმის. იცოდე Helm-vs-Kustomize კომპრომისი</td></tr>
+<tr><td><strong>StorageClass / CSI / RWX</strong></td><td>Storage-დრაივერები; ReadWriteMany (NFS/EFS-ის კლასის) volume-ები</td><td>Lab-06-ის RWO ტკივილის სუფთა გამოსავალი: მოდელების საზიარო cache, რომელსაც ყველა რეპლიკა კითხულობს</td></tr>
+<tr><td><strong>DRA (Dynamic Resource Allocation)</strong></td><td>ახალი device API, რომელიც რაოდენობაზე დაფუძნებულ GPU-მოთხოვნებს ანაცვლებს: ResourceClaim-ები პარამეტრებით</td><td>„მომეცი H100 ≥40 GB თავისუფლით" — მომავალი, რომელიც 2025–2026 წლების კლასტერებში მკვიდრდება; თვალი ადევნე</td></tr>
+<tr><td><strong>VPA</strong></td><td>ვერტიკალური autoscaler — request-ებს დაკვირვებული მოხმარებიდან ასწორებს</td><td>CPU/mem request-ების სწორი ზომა მთელ ფლოტში; არასდროს HPA-სთან ერთად ერთსა და იმავე მეტრიკაზე</td></tr>
+<tr><td><strong>Cluster Autoscaler / Karpenter</strong></td><td>Node-ის დონის autoscaling (ნახსენები მე-11 გაკვეთილში)</td><td>Scale-to-zero ეკონომიკის მეორე ნახევარი</td></tr>
+<tr><td><strong>Node ops: cordon / drain / განახლებები</strong></td><td>მონიშვნა როგორც unschedulable; eviction PDB-ების დაცვით</td><td>ყოველი managed-კლასტერის განახლება; შენი ლაბორატორია ამას ვარჯიშობს</td></tr>
+<tr><td><strong>kube-proxy / CoreDNS / eBPF dataplane</strong></td><td>როგორ ხდება Service-ების რეალური მარშრუტიზაცია; როგორ იხსნება DNS სინამდვილეში</td><td>„Service არსებობს, მაგრამ connection refused"-ის debug-ი; შენს კლასტერზე Cilium-მა kube-proxy ჩაანაცვლა</td></tr>
+<tr><td><strong>Service mesh (Istio/Linkerd) + mTLS</strong></td><td>Proxy თითო pod-ზე: შიფრაცია, retry-ები, ტრაფიკის პოლიტიკა</td><td>Enterprise-მოთხოვნები; შენს netpol+ingress-ს ფარავს — იცოდე, როდის არის ზედმეტი</td></tr>
+<tr><td><strong>ლოგირების/ტრეისინგის არქიტექტურა</strong> (Loki/EFK, OpenTelemetry)</td><td>Observability-ის დანარჩენი ორი სვეტი მეტრიკების გვერდით</td><td>ნელი მოთხოვნის დაკავშირება ჯაჭვში UI → router → engine; vLLM-ს OTel hook-ები აქვს (გაკვეთილი 20)</td></tr>
+<tr><td><strong>Multi-cluster / fleet</strong></td><td>ბევრი კლასტერი, ერთი მართვის ფენა (Argo multi-dest, Fleet, Karmada)</td><td>რეგიონული იზოლაცია, მე-13 გაკვეთილის hard-tenancy პასუხი</td></tr>
+<tr><td><strong>API deprecation-ები და განახლებები</strong></td><td>Version skew policy, <code>kubectl convert</code>, deprecation-გაფრთხილებები</td><td>კვარტალური სავარჯიშო „ხომ არ გაგვიტეხს განახლება"</td></tr>
+</table>
+
+<h2>განხილვა 1 — Graceful shutdown LLM-engine-ებისთვის</h2>
+<p>შეწყვეტის თანმიმდევრობა: pod მოინიშნება Terminating-ად → ამოღება Service-ის endpoint-ებიდან → <strong>ეშვება preStop hook</strong> → SIGTERM → grace period → SIGKILL. ნაგულისხმევი grace: 30 წმ. 70B engine-ს გრძელი გამონატანის შუაში წუთები სჭირდება. Production-პატერნი:</p>
+<pre><code>terminationGracePeriodSeconds: 300
+lifecycle:
+  preStop:
+    exec:
+      command: ["/bin/sh","-c","sleep 15"]  # let endpoint removal propagate
+                                            # before the engine even sees SIGTERM</code></pre>
+<p>პლუს PDB, რომ drain-ებმა ფლოტი N−1-ზე დაბლა არასდროს ჩამოიყვანონ. ამის გარეშე ყოველი node-ის განახლება = მომხმარებლისთვის ხილული ჩავარდნები. ეს 10-ხაზიანი diff-ია, რომელიც შენს დიზაინის დოკუმენტში ცალკე აბზაცად ღირს.</p>
+
+<h2>განხილვა 2 — Job-ები AI-გამოთვლების ნახევარია</h2>
+<p>Eval-ები, batch scoring, embedding-ების backfill-ები, distillation-მონაცემების გენერაცია — არცერთ მათგანს Deployment არ უნდა. Job-ები გაძლევენ დასრულების თვალყურის დევნებას, retry-ს <code>backoffLimit</code>-ით, parallelism-ის fan-out-ს და (<code>Indexed</code> completion mode-ით) ინდექსს თითო pod-ზე — ღარიბის rank-ს. დაამატე Kueue, როცა რამდენიმე გუნდის Job-ები ერთსა და იმავე GPU-ებზე კონკურირებენ. შენი ლაბორატორია სტეკზე ნამდვილ batch-inference Job-ს უშვებს.</p>
+
+<h2>განხილვა 3 — Operator-ები: პატერნი ყველაფრის უკან, რაც დააყენე</h2>
+<p>CRD = ახალი არსებითი სახელი API-ში (<code>ServiceMonitor</code>, <code>Certificate</code>, <code>Application</code>). Operator = controller, რომელიც ამ არსებით სახელს ჭეშმარიტად აქცევს — ციკლში, სამუდამოდ. მთელი ხრიკი ეს არის — იგივე reconciliation (შეთანხმების ციკლი), რომელსაც პირველ გაკვეთილში აკვირდებოდი, მიმართული დომენის ლოგიკაზე. production-stack-ის <code>operator/</code> დირექტორია engine-ფლოტებს სწორედ ასე მართავს. ლაბორატორიაში სათამაშო CRD-ს დაწერ, რომ მისტიკა გაქარწყლდეს; kubebuilder კი ნამდვილი ინსტრუმენტია, როცა გუნდს ის დასჭირდება.</p>
+
+<h2>განხილვა 4 — Init containers წონების წინასწარი ჩატვირთვისთვის</h2>
+<p>Scaling-ის დაყოვნება (მე-10 გაკვეთილის ტკივილი) ძირითადად წონების ჩატვირთვაა. Init-container-ის პატერნი: downloader-image PVC/hostPath cache-ს ავსებს, ᲡᲐᲜᲐᲛ engine-კონტეინერი დაიწყება; RWX storage-თან ან node-ლოკალურ cache-ებთან კომბინაციაში ახალი რეპლიკები ჩამოტვირთვას საერთოდ გამოტოვებენ. Streaming loader-ები (Run:ai model streamer, tensorizer — გაკვეთილი 20) იმავე წამებს ესხმიან თავს.</p>
+
+<h2>განხილვა 5 — Helm vs Kustomize (ინტერვიუს მარადიული კითხვა)</h2>
+<p>Helm: packaging + templating + lifecycle (დაინსტალირებადი პროდუქტი, values API — ის, რაც შენ ააგე). Kustomize: patch-ებზე დაფუძნებული env-overlay-ები ნულოვანი შაბლონებით (ფლოტის კონფიგები, შესანარჩუნებელი chart-ის გარეშე). რეალური პლატფორმები: Helm მესამე მხარის software-ისთვის, Kustomize-ის overlay-ები (ზოგჯერ დარენდერებული Helm-ის ᲖᲔᲛᲝᲓᲐᲜ) env-სპეციფიკური ცვლილებებისთვის. ზუსტად ამ წინადადების თქმა უმეტეს ოთახში დებატს ხურავს.</p>
+
+<h2>ლაბორატორია (labs/lab-19): შეეხე ოთხ ხარვეზს</h2>
+<div class="lab">
+<div class="step"><h3>Batch inference Job</h3><p>Job (parallelism 2, completions 6), რომლის pod-ები router-ს ConfigMap-იდან აღებული prompt-ებით curl-ავენ და გამონატანს საზიარო emptyDir→log-ში წერენ. უყურე, როგორ ითვლის <code>kubectl get jobs -w</code> completion-ებს. ამოხსნა: <code>solutions/k8s-advanced/batch-job.yaml</code>.</p></div>
+<div class="step"><h3>Graceful drain-ის წვრთნა</h3><p>დაამატე preStop + 300 წმ grace + PDB (<code>minAvailable: 1</code>) engine-ის chart-ს. შემდეგ <code>kubectl drain llm-stack-worker --ignore-daemonsets --delete-emptydir-data</code> დატვირთვის შუაგულში: PDB eviction-ის ტემპს არეგულირებს, engine ზრდილობიანად იცლება. ბოლოს <code>kubectl uncordon</code>.</p></div>
+<div class="step"><h3>kubectl debug</h3><p><code>kubectl debug -it &lt;engine-pod&gt; -n llm --image=busybox --target=vllm</code> — ჩაიხედე <code>/proc</code>-ში, ნახე engine-ის სამყარო sidecar-იდან, რომელიც წამის წინ არ არსებობდა.</p></div>
+<div class="step"><h3>სათამაშო CRD</h3><p>Apply-ით დააყენე <code>ModelEndpoint</code> CRD + ერთი CR (ამოხსნა მოცემულია). <code>kubectl get modelendpoints</code> — შენი საკუთარი არსებითი სახელი API-ში. Controller ჯერ არ არის; მასწავლებელთან განიხილე, რას გააკეთებდა reconcile-ციკლი (ეს საუბარი სწორედ operator-ის ინტერვიუა).</p></div>
+<div class="step"><h3>ხარვეზების რუკა</h3><p><code>docs/k8s-gap-map.md</code>: ატლასის ყოველ სტრიქონზე — <em>ვიცი / შემიძლია გამოვიყენო / სასწავლი მაქვს</em> + ერთი წინადადება იმაზე, როდის დასჭირდებოდა ეს შენს სტეკს. ეს გულახდილი დოკუმენტი შენს გამეორების გეგმას მართავს.</p></div>
+</div>
+
+<h2>შეამოწმე შენი თავი</h2>
+<div class="quiz" data-quiz>
+  <div class="q">
+    <p class="stem">Node-ის განახლებამ გენერაციები შუა ტოკენზე მოკლა, PDB-ის მიუხედავად. რა აკლია?</p>
+    <button class="opt" data-correct>Grace period-ისა და preStop-drain-ის დროითი აწყობა</button>
+    <button class="opt">მეორე PDB, რომელიც router-ის pod-ებს ფარავს</button>
+    <button class="opt">Anti-affinity, რომელიც რეპლიკებს node-ებზე ინახავს</button>
+    <p class="explain">PDB არეგულირებს, ᲠᲐᲛᲓᲔᲜᲘ pod გამოირიცხება — და არა რამდენად ნაზად კვდება თითოეული. მიმდინარე სამუშაოს terminationGracePeriodSeconds + preStop-drain სჭირდება.</p>
+  </div>
+  <div class="q">
+    <p class="stem">ღამის eval 10k prompt-ზე 4 worker-ით. სწორი პრიმიტივი?</p>
+    <button class="opt" data-correct>Indexed Job CronJob-ის ქვეშ</button>
+    <button class="opt">Deployment ოთხ რეპლიკამდე გაზრდილი</button>
+    <button class="opt">StatefulSet ოთხი მოწესრიგებული pod-ით</button>
+    <p class="explain">დასრულებამდე გაშვება + parallelism + pod-ის ინდექსი sharding-ისთვის = Job; CronJob მას განრიგში სვამს. Deployment-ები არასდროს მთავრდებიან; StatefulSet-ები იდენტობას ხსნიან და არა დასრულებას.</p>
+  </div>
+  <div class="q">
+    <p class="stem">რა აქცევს CRD-ს operator-ად?</p>
+    <button class="opt" data-correct>Controller, რომელიც custom resource-ებს reconcile-ს უკეთებს</button>
+    <button class="opt">Admission webhook, რომელიც სქემას ამოწმებს</button>
+    <button class="opt">რეგისტრაცია operator-ების marketplace-კატალოგში</button>
+    <p class="explain">CRD ცალკე ინერტული საცავია (შენი ლაბორატორია ამას ამტკიცებს). Operator ᲡᲬᲝᲠᲔᲓ reconcile-ციკლია, რომელიც ამ ობიექტებს უყურებს და რეალობას მათ არგებს.</p>
+  </div>
+</div>
+
+<h2>პირველწყარო</h2>
+<p>ამ გაკვეთილის რუკა ᲗᲐᲕᲐᲓ არის საკითხავი სია. პრიორიტეტების რიგი AI-ინჟინრისთვის: <a href="https://kubernetes.io/docs/concepts/workloads/controllers/job/">Jobs</a> → <a href="https://kubernetes.io/docs/tasks/run-application/configure-pdb/">PDBs</a> → <a href="https://kubernetes.io/docs/concepts/extend-kubernetes/api-extension/custom-resources/">Custom Resources</a> → <a href="https://lws.sigs.k8s.io/">LeaderWorkerSet</a> → <a href="https://kueue.sigs.k8s.io/">Kueue</a> → <a href="https://kubernetes.io/docs/concepts/scheduling-eviction/dynamic-resource-allocation/">DRA</a>.</p>
+
+<h2>შემდეგი</h2>
+<p><a href="0020-vllm-atlas.html">გაკვეთილი 20</a> — უკანასკნელი: vLLM-ის ატლასი.</p>
+
+<div class="lesson-footer"><p><a href="index.html">კურსის მთავარი</a> · ლაბორატორია: <code>labs/lab-19/</code></p></div>
+</div>
+<script src="../../assets/quiz.js"></script>
+</body>
+</html>

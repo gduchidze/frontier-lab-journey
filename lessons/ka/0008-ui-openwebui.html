@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html lang="ka">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>გაკვეთილი 8 — UI: Open WebUI სტეკზე</title>
+<link rel="stylesheet" href="../../assets/course.css">
+</head>
+<body>
+<div class="page">
+
+<p class="lang-switch"><a href="../0008-ui-openwebui.html">🇬🇧 English</a></p>
+
+<p class="lesson-kicker">SLM Production Stack · გაკვეთილი 8 · ფაზა 8 · ~75 წთ</p>
+<h1>UI: Open WebUI სტეკზე</h1>
+<p class="lesson-lede">აქამდე ყველაფერი curl-ის ენაზე ლაპარაკობდა. დღეს სტეკი სახეს იძენს: Open WebUI — სრულფასოვანი ჩატის frontend-ი — კლასტერში გაშლილი, router-ზე მიერთებული და შენს ბრაუზერამდე მიწვდენილი იმ NodePort-ით, რომელიც ჯერ კიდევ 1-ელ გაკვეთილში დააკონფიგურირე.</p>
+
+<h2>ცოდნა: სამი იდეა</h2>
+
+<h3>1. OpenAI API-ის დივიდენდი ანაზღაურდება</h3>
+<p><a href="https://github.com/open-webui/open-webui">Open WebUI</a> OpenAI API-ზე ლაპარაკობს. მიმართე <code>OPENAI_API_BASE_URL</code> ნებისმიერ თავსებად სერვერზე — vLLM, შენი router — და ის ჩამოთვლის მოდელებს, ასტრიმებს ჩატს, მართავს საუბრებს. ნულოვანი მორგებული კოდი. სწორედ ამიტომ უწოდა მე-3 გაკვეთილმა ამ API-ს "დივიდენდი": ეკოსისტემის ყველა ინსტრუმენტი უფასოდ ერთვება. (ამ წყვილს vLLM-ის საკუთარი დოკუმენტაციაც აჩვენებს: <a href="https://docs.vllm.ai/en/latest/deployment/frameworks/open-webui.html">Open WebUI deployment guide</a>.)</p>
+
+<h3>2. კლასტერშიდა DNS აკეთებს გადაბმას</h3>
+<p>UI router-ს Service-ის DNS-ით სწვდება: <code>http://vllm-router.llm.svc.cluster.local/v1</code>. არც IP-ები, არც კონფიგურაციის ძებნა — მე-2 გაკვეთილის პატერნი, რომელიც ახლა namespace-ებს შორისაც ამართლებს.</p>
+
+<h3>3. NodePort: მიწვდომადობის მესამე გზა</h3>
+<p><code>port-forward</code> (dev გვირაბი) და ClusterIP (მხოლოდ კლასტერშიდა) უკვე იცი. <strong>NodePort</strong> (კვანძის პორტი) ხსნის პორტს (30000–32767) ყველა node-ზე. შენი 1-ელი გაკვეთილის kind კონფიგმა node-ის პორტი 30080 → Mac-ის პორტ 30080-ზე გადაანაწილა — ზუსტად დღევანდელი დღისთვის ჩათესილი. production-ში Ingress/LoadBalancer იქნებოდა; NodePort ამის პატიოსანი ლოკალური ეკვივალენტია. (<a href="https://kubernetes.io/docs/concepts/services-networking/service/#type-nodeport">დოკუმენტაცია</a>)</p>
+
+<h2>ლაბორატორია: მიაწოდე სახე</h2>
+
+<div class="lab">
+
+<div class="step">
+<h3>გაუშვი Open WebUI</h3>
+<p>შეინახე როგორც <code>k8s/webui.yaml</code>:</p>
+<pre><code>apiVersion: v1
+kind: Namespace
+metadata:
+  name: ui
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: webui-data
+  namespace: ui
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 2Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: open-webui
+  namespace: ui
+  labels: { app: open-webui }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: open-webui }
+  template:
+    metadata:
+      labels: { app: open-webui }
+    spec:
+      containers:
+      - name: open-webui
+        image: ghcr.io/open-webui/open-webui:main
+        env:
+        - name: OPENAI_API_BASE_URL
+          value: "http://vllm-router.llm.svc.cluster.local/v1"
+        - name: OPENAI_API_KEY
+          value: "not-needed-locally"
+        - name: WEBUI_AUTH
+          value: "False"
+        - name: ENABLE_OLLAMA_API
+          value: "False"
+        ports:
+        - containerPort: 8080
+        resources:
+          requests: { cpu: 250m, memory: 512Mi }
+          limits:   { cpu: "1",  memory: 1Gi }
+        readinessProbe:
+          httpGet: { path: /health, port: 8080 }
+          periodSeconds: 10
+        volumeMounts:
+        - name: data
+          mountPath: /app/backend/data
+      volumes:
+      - name: data
+        persistentVolumeClaim: { claimName: webui-data }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: open-webui
+  namespace: ui
+spec:
+  type: NodePort
+  selector: { app: open-webui }
+  ports:
+  - port: 8080
+    targetPort: 8080
+    nodePort: 30080</code></pre>
+<div class="warning"><strong>WEBUI_AUTH=False მხოლოდ ლოკალურადაა დასაშვები</strong>
+შენს ლეპტოპზე ნორმალურია, მაგრამ დისკვალიფიკაციაა ყველგან, სადაც სხვები წვდებიან. თუ ამას ოდესმე საკუთარი მანქანის გარეთ აჩვენებ, ჩართე ავთენტიფიკაცია და TLS-ის უკან დააყენე. აღნიშნე ეს პორტფოლიოს README-ში — შემფასებლები უსაფრთხოების გააზრებას ამჩნევენ.</div>
+<pre><code>kubectl apply -f k8s/webui.yaml
+kubectl get pods -n ui -w</code></pre>
+<p class="expect">მოსალოდნელია: open-webui Pod-ი READY 1/1 ~1 წუთში (პირველი image pull ~1 GB-ია, მოთმინება)</p>
+</div>
+
+<div class="step">
+<h3>გახსენი — port-forward აღარ გჭირდება</h3>
+<p>ბრაუზერი → <a href="http://localhost:30080">http://localhost:30080</a>. მიჰყევი, რატომ მუშაობს ეს, ნაბიჯ-ნაბიჯ: ბრაუზერი → Mac:30080 → kind extraPortMapping → control-plane node:30080 → NodePort Service → UI Pod. ხმამაღლა თქვი; K8s ქსელში მოთხოვნის გზის კვალდაკვალ გავლა გასაუბრებების კლასიკაა.</p>
+<p class="expect">მოსალოდნელია: Open WebUI იტვირთება; მოდელის ამრჩევში ჩანს Qwen/Qwen3.5-0.8B (წამოღებული router-ის /v1/models-იდან)</p>
+</div>
+
+<div class="step">
+<h3>ისაუბრე ჩატში, მერე ფარდის უკან ჩაიხედე</h3>
+<p>UI-ში მოკლე საუბარი გამართე. შემდეგ, გაყოფილი ეკრანით Grafana-სთან ერთად (მე-7 გაკვეთილის dashboard-ი):</p>
+<pre><code>kubectl logs -n llm -l app=vllm-router -f --tail=5</code></pre>
+<p class="expect">მოსალოდნელია: UI-ს ყოველი შეტყობინება = POST /v1/chat/completions router-ის ლოგებში; Grafana-ში TTFT პანელი ინძრევა</p>
+<div class="win"><strong>მოგება</strong>
+მომხმარებლისკენ მიმართული პროდუქტი შენივე ინფერენსის ინფრასტრუქტურაზე: ბრაუზერი → NodePort → UI → router → engine-ები, წონები PVC-ებზე და მეტრიკები Grafana-სკენ მიედინება. ეს წინადადება — რომლის დაცვაც ახლა სტრიქონ-სტრიქონ შეგიძლია — შენი CV-ის პროექტის რეზიუმეა.</div>
+</div>
+
+<div class="step">
+<h3>მდგრადობის დემო (5 წთ, გააკეთე — სახალისოა)</h3>
+<p>საუბრის შუაში მოკალი ერთი engine:</p>
+<pre><code>kubectl delete pod -n llm $(kubectl get pods -n llm -l app=vllm -o name | head -1 | cut -d/ -f2)</code></pre>
+<p>განაგრძე ჩატი. router-ი აღმოაჩენს მკვდარ engine-ს და გადარჩენილზე ამისამართებს; Deployment-ი მსხვერპლს აღადგენს. მომხმარებელი ვერაფერს ამჩნევს. ყველა ფენა, რომელიც ააგე, ახლა თვალსაჩინოდ აკეთებს თავის საქმეს.</p>
+</div>
+
+</div>
+
+<h2>შეამოწმე საკუთარი თავი</h2>
+<div class="quiz" data-quiz>
+  <div class="q">
+    <p class="stem">როგორ პოულობს Open WebUI მოდელებს თავის ამრჩევში საჩვენებლად?</p>
+    <button class="opt" data-correct>GET /v1/models დაკონფიგურირებულ base URL-ზე</button>
+    <button class="opt">K8s API-ით app=vllm label-იანი Pod-ების ჩამოთვლით</button>
+    <button class="opt">მის ConfigMap-ში დაკონფიგურირებული სტატიკური სიით</button>
+    <p class="explain">წმინდა OpenAI-API კლიენტის ქცევაა — ის endpoint-ს ეკითხება, რა მოდელები არსებობს. K8s API-ს მხოლოდ router-ი ეხება.</p>
+  </div>
+  <div class="q">
+    <p class="stem">რატომ აღწევს localhost:30080 UI-მდე port-forward-ის გარეშე?</p>
+    <button class="opt" data-correct>kind node-ის პორტს host-ზე ანაწილებს</button>
+    <button class="opt">NodePort service-ები ყოველთვის host-ის localhost-ს იბამენ</button>
+    <button class="opt">Open WebUI host network-ში მუშაობს</button>
+    <p class="explain">ორი მექანიზმის ჯაჭვია: NodePort ხსნის 30080-ს node-ზე; 1-ელი გაკვეთილის <code>extraPortMappings</code> Mac:30080 → node:30080-ზე ამისამართებს. kind-ის ამ გადანაწილების გარეშე NodePort მხოლოდ node-ის კონტეინერებიდან იქნებოდა მიწვდომადი.</p>
+  </div>
+</div>
+
+<h2>პირველწყარო</h2>
+<p><a href="https://docs.vllm.ai/en/latest/deployment/frameworks/open-webui.html">vLLM-ის დოკუმენტაცია — Open WebUI</a> და <a href="https://docs.openwebui.com/">Open WebUI-ის დოკუმენტაცია</a> (env ცვლადების ცნობარი).</p>
+
+<h2>შემდეგი</h2>
+<p><a href="0009-load-testing.html">გაკვეთილი 9</a>: ციფრები. k6 და <code>vllm bench serve</code> შენს სტეკს დატვირთვის ქვეშ აყენებენ; შედეგებს infra ინჟინერივით კითხულობ.</p>
+
+<div class="lesson-footer">
+<p>UI მოდელებს ვერ ხედავს? შეამოწმე router-ის Service DNS შიგნიდან: <code>kubectl exec -n ui deploy/open-webui -- curl -s http://vllm-router.llm.svc.cluster.local/v1/models</code> — შემდეგ ჰკითხე მასწავლებელს.</p>
+</div>
+
+</div>
+<script src="../../assets/quiz.js"></script>
+</body>
+</html>

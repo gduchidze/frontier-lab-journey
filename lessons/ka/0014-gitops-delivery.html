@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="ka">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>გაკვეთილი 14 — GitOps და მოდელების პროგრესული მიწოდება</title>
+<link rel="stylesheet" href="../../assets/course.css">
+</head>
+<body>
+<div class="page">
+<p class="lang-switch"><a href="../0014-gitops-delivery.html">🇬🇧 English</a></p>
+
+<p class="lesson-kicker">SLM Production Stack · გაძლიერებული · გაკვეთილი 14 · ~2 სთ</p>
+<h1>GitOps და მოდელების პროგრესული მიწოდება</h1>
+<p class="lesson-lede">აქამდე deploy-ინსტრუმენტი შენ იყავი: helm upgrade ხელით. პროდაქშენი ადამიანს პროცესიდან იღებს: git არის სასურველი მდგომარეობა, controller კლასტერს მას უჯერებს (reconciliation), ახალი მოდელის გამოშვება კი ხდება განხილვადი pull request rollback-ღილაკით.</p>
+
+<h2>ცოდნა</h2>
+
+<h3>1. GitOps = reconciliation-ციკლი, ერთი დონით მაღლა</h3>
+<p>Deployment pod-ებს spec-ს უჯერებს. <a href="https://argo-cd.readthedocs.io/">Argo CD</a> კი <em>მთელ კლასტერს</em> უჯერებს git-რეპოზიტორიას: უყურებს repo-ს → ადარებს ცოცხალ მდგომარეობას (<em>drift detection</em> — გადახრის აღმოჩენა) → sync. შედეგები: ყველა ცვლილება commit-ია (აუდიტის ლოგი უფასოდ), rollback = <code>git revert</code>, კლასტერის credentials ლეპტოპებს ტოვებს, კლასტერები კი მხოლოდ repo + secrets-ისგან აღდგენადია. შენი capstone README-ის quickstart პროტო-GitOps იყო; ეს გაკვეთილი მას აავტომატებს.</p>
+
+<h3>2. Application CRD და app-of-apps</h3>
+<pre><code>spec:
+  source:  { repoURL: …, path: charts/slm-stack, targetRevision: main }
+  destination: { server: https://kubernetes.default.svc, namespace: llm }
+  syncPolicy:
+    automated: { prune: true, selfHeal: true }   # drift gets reverted</code></pre>
+<p><code>selfHeal</code> ნიშნავს, რომ შენს ხელით გაკეთებულ <code>kubectl edit</code>-ს წუთებში გადააწერენ — სწორი ქცევაა, თუმცა პირველად თავბრუდამხვევი. პლატფორმები იყენებენ <strong>app-of-apps</strong>-ს: ერთი root Application შვილებს აჩენს (engines, monitoring, edge) — მთელი პლატფორმა ერთ ხედ.</p>
+
+<h3>3. მოდელები ვერსიონირებული არტეფაქტებია — rollout-ებს კოდის deploy-სავით მოექეცი</h3>
+<p>მოდელის ცვლილება (ახალი წონები, ახალი revision, ახალი quantization) კოდზე <em>უფრო სარისკო</em> deploy-ია: ხარისხის რეგრესიები exception-ებს არ ისვრიან. production-stack-ის values ააშკარავებს <code>modelURL</code> + <code>modelRevision</code>-ს — დააფიქსირე revision (HF commit hash), არასდროს "იტივტივო" repo-ს main-ზე. Rollout-სტრატეგიები, აფეთქების რადიუსის მიხედვით:</p>
+<table>
+<tr><th>სტრატეგია</th><th>მექანიკა</th><th>ხრიკი LLM-ებისთვის</th></tr>
+<tr><td>Rolling</td><td>Deployment-ის ნაგულისხმევი, pod-ის მიყოლებით</td><td>Roll-ის შუაში მოდელის შერეული ვერსიები ერთდროულად ემსახურება მომხმარებლებს</td></tr>
+<tr><td>Blue/green</td><td>სრული v2 სტეკი, გადართე Service/route</td><td>2× GPU-ხარჯი გადაფარვისას — ნამდვილი ფული</td></tr>
+<tr><td>Canary</td><td>შეწონილი მარშრუტები (Gateway API / Argo Rollouts): 5% → 50% → 100%</td><td>სჭირდება ხარისხის მეტრიკები თითო arm-ზე და არა მხოლოდ error rate</td></tr>
+<tr><td>Shadow</td><td>v2 იღებს დაზერკალებულ ტრაფიკს, პასუხები იყრება</td><td>სრული დუბლირებული compute; ოქროა eval-ისთვის, უხილავია მომხმარებლებისთვის</td></tr>
+</table>
+<p>სენიორული ინსაითი: მოდელების canary-<em>ანალიზი</em> უნდა მოიცავდეს ხარისხის სიგნალებს (eval-set ქულები, thumbs-down-ის მაჩვენებელი, უარის თქმის მაჩვენებელი) TTFT/error rate-ის გვერდით. ლატენტურობით ჯანმრთელი ნაგავი გულუბრყვილო canary-ს იოლად გაივლის.</p>
+
+<h3>4. CI/CD ციკლის გარშემო</h3>
+<p>CI აწყობს/ასკანერებს image-ს, უშვებს offline eval-ებს კანდიდატ მოდელზე და chart-ის values-ს PR-ში ცვლის. CD უბრალოდ ის არის, რომ Argo merge-ს ამჩნევს. Pipeline-ს კლასტერის credentials არასდროს უჭირავს — უსაფრთხოების ის მოგება, რომელიც GitOps-ს აუდიტორებთან ყიდის.</p>
+
+<h2>ლაბორატორია (labs/lab-14): კლასტერი git-ს მიჰყვება</h2>
+<div class="lab">
+<div class="step"><h3>Push და ინსტალაცია</h3><p>ატვირთე ეს repo GitHub-ზე (ის უკვე git-რეპოზიტორიაა). დააინსტალირე Argo CD, გახსენი მისი UI (port-forward, საწყისი admin secret).</p></div>
+<div class="step"><h3>Application → შენი chart</h3><p>Application, რომელიც <code>charts/slm-stack</code>-ზე მიუთითებს, automated sync + selfHeal. უყურე, როგორ იშვილებს არსებულ release-ს; tree view = მთელი შენი სტეკი გრაფად.</p></div>
+<div class="step"><h3>Deploy commit-ით</h3><p>შეცვალე <code>maxModelLen</code> values.yaml-ში → commit → push → უყურე, როგორ ამჩნევს Argo ცვლილებას, ადარებს, sync-ავს და Deployment-ს გადაატრიალებს. kubectl საერთოდ არ მონაწილეობს. შემდეგ <code>git revert</code> → push → rollback თავისით deploy-დება.</p></div>
+<div class="step"><h3>იგრძენი selfHeal</h3><p><code>kubectl scale deployment vllm -n llm --replicas=3</code> ხელით → უყურე, როგორ აბრუნებს Argo შენს drift-ს უკან. განიხილე მასწავლებელთან: როდის არის selfHeal არასწორი? (HPA მას ებრძვის — ამიტომაც replicas არ უნდა იყოს tracked, როცა მას HPA ფლობს; Argo-ს ზუსტად ამისთვის აქვს <code>ignoreDifferences</code>.)</p></div>
+<div class="step"><h3>დააპროექტე მოდელის canary (ქაღალდზე)</h3><p>დაწერე <code>docs/model-rollout.md</code>: როგორ გააკეთებდი canary-ს Qwen3.5-0.8B → ჰიპოთეტური 1.5B ამ სტეკზე — მარშრუტების წონები, მეტრიკები თითო arm-ზე, დაწინაურების კრიტერიუმები, შეწყვეტის კრიტერიუმები. 1 გვერდი. ეს დოკუმენტი ინტერვიუს პასუხია, რომელსაც სიტყვასიტყვით გამოიყენებ.</p></div>
+</div>
+
+<h2>შეამოწმე შენი თავი</h2>
+<div class="quiz" data-quiz>
+  <div class="q">
+    <p class="stem">Argo მუდმივად აბრუნებს უკან შენი HPA-ის replica-ცვლილებებს. ძირეული მიზეზი?</p>
+    <button class="opt" data-correct>selfHeal HPA-ის სკეილინგს drift-ად აღიქვამს</button>
+    <button class="opt">HPA-ს არ აქვს RBAC, რომ Argo-ს გადააჭარბოს</button>
+    <button class="opt">Chart replicas-ს hook-ში აფიქსირებს</button>
+    <p class="explain">ორი controller ერთ ველს ფლობს. გამოსავალი: ამოიღე replicas chart-იდან, როცა HPA განაგებს, ან ignoreDifferences ამ path-ზე. კლასიკური საპროდაქშენო შეჯახება.</p>
+  </div>
+  <div class="q">
+    <p class="stem">რატომ უნდა აკონტროლებდეს მოდელის canary მეტს, ვიდრე ლატენტურობა და შეცდომებია?</p>
+    <button class="opt" data-correct>ცუდი მოდელები სწრაფად და წარმატებით პასუხობენ</button>
+    <button class="opt">ლატენტურობის პროცენტილები ტრაფიკის ცვლილებებს ჩამორჩება</button>
+    <button class="opt">Error rate-ებს უფრო დიდი ამონარჩევი სჭირდება</button>
+    <p class="explain">ხარისხის რეგრესია 200-ებს აბრუნებს შესანიშნავი TTFT-ით. Canary-ანალიზს ხარისხის სიგნალები სჭირდება — eval-ქულები, უკუკავშირის მაჩვენებელი — თორემ ნაგავს დააწინაურებს.</p>
+  </div>
+  <div class="q">
+    <p class="stem">დააფიქსირე modelRevision commit hash-ზე, რადგან…</p>
+    <button class="opt" data-correct>Upstream repo-ს განახლებები შენს deploy-ებს ცვლის</button>
+    <button class="opt">HF ზღუდავს მოძრავი revision-ების ჩამოტვირთვას</button>
+    <button class="opt">vLLM-ის cache-ები revision-ებს შორის ფუჭდება</button>
+    <p class="explain">მოძრავი revision-ები ნიშნავს, რომ იგივე მანიფესტი მომავალ კვირას სხვა წონებს deploy-ავს — არარეპროდუცირებადი, არააუდიტირებადი. იმავე მიზეზით, რითაც image-ები digest-ებს აფიქსირებენ.</p>
+  </div>
+</div>
+
+<h2>პირველწყარო</h2>
+<p><a href="https://argo-cd.readthedocs.io/en/stable/getting_started/">Argo CD getting started</a> + <a href="https://argoproj.github.io/rollouts/">Argo Rollouts</a> (canary-კონცეფციები). გადაამოწმე <a href="https://github.com/vllm-project/production-stack/blob/main/helm/values.yaml">production-stack values</a> modelRevision-ისთვის.</p>
+
+<h2>შემდეგი</h2>
+<p><a href="0015-vllm-performance.html">გაკვეთილი 15</a>: engine-ის შიგნით — quantization, chunked prefill, speculative decoding და რეალური tuning-კვლევა შენს სტეკზე.</p>
+
+<div class="lesson-footer"><p><a href="index.html">კურსის მთავარი გვერდი</a> · ლაბორატორია: <code>labs/lab-14/</code></p></div>
+</div>
+<script src="../../assets/quiz.js"></script>
+</body>
+</html>

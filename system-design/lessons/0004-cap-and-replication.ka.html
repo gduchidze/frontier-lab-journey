@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="ka">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>გაკვეთილი 4 · CAP, Consistency და Replication</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<div class="lesson">
+  <header class="lesson-header">
+    <p class="kicker">გაკვეთილი 0004 · ფაზა 1 — განაწილებული სისტემების საფუძვლები · <a href="0004-cap-and-replication.html">English version</a></p>
+    <h1>CAP, Consistency და Replication</h1>
+    <p class="dek">რას ირჩევ სინამდვილეში partition-ის დროს — და რას უშვრება replication lag შენს მომხმარებლებს დანარჩენ დროს.</p>
+  </header>
+
+  <div class="mission-tie">
+    <strong>მისიასთან კავშირი.</strong> Anthropic-ის ამოცანები, როგორიცაა <em>„დააპროექტე Claude-ის chat-history store"</em> ან <em>„მოემსახურე ერთ მოდელს სამი რეგიონიდან"</em>, შენიღბული consistency-ის (თანმიმდევრულობის) კითხვებია. დამატებითი კითხვა ყოველთვის ერთია: <em>„რეგიონი ჩაქრა — რას ხედავენ შენი მომხმარებლები?"</em> ძლიერი კანდიდატები კომპონენტების მიხედვით პასუხობენ: ეს store არის CP, ის — AP read-your-writes-ით, და აი lag-ის ბიუჯეტიც. ეს გაკვეთილი გაძლევს ამ პასუხს. (<a href="https://www.tryexponent.com/blog/anthropic-system-design-interview">Exponent-ის 2026 Anthropic გზამკვლევი</a>)
+  </div>
+
+  <h2>1 · CAP, სწორად ჩამოყალიბებული</h2>
+  <p>CAP <em>არ არის</em> „აირჩიე ორი სამიდან." რეალურ ქსელში partition-ები (ქსელის გახლეჩა) არჩევანი არ არის — კაბელები წყდება, switch-ები კვდება. თეორემის ნამდვილი შინაარსი: <strong>სანამ partition მიმდინარეობს, თითოეულმა მოთხოვნამ უნდა აირჩიოს Consistency ან Availability</strong>. (<a href="https://github.com/donnemartin/system-design-primer#cap-theorem">Primer: CAP theorem</a>)</p>
+  <ul>
+    <li><strong>CP</strong> — უარი თქვი ან timeout-ზე გადი, ოღონდ შესაძლოდ-მცდარი პასუხი არ გასცე: ZooKeeper/etcd (კლასტერის კოორდინაცია), გადახდების ledger — ყველაფერი, სადაც ორი node-ის უთანხმოება მონაცემების დაზიანებაა.</li>
+    <li><strong>AP</strong> — განაგრძე პასუხის გაცემა, შესაძლოა მოძველებულის, და მოგვიანებით შეაჯერე: DNS, Cassandra/Dynamo-სტილის კალათები, like-მთვლელები, presence ინდიკატორები.</li>
+  </ul>
+  <p><strong>PACELC</strong> ამას აფართოებს დროის იმ 99.99%-ზე, როცა partition არ არის: <em>თუ Partitioned — აირჩიე A ან C; Else (სხვა შემთხვევაში) — აირჩიე Latency ან Consistency</em>. ყოველი write-ის replica-ებით დადასტურების ლოდინი მილიწამები ღირს ყოველ მოთხოვნაზე — სრულიად ჯანმრთელი სისტემაც კი C-vs-L გადასახადს განუწყვეტლივ იხდის.</p>
+
+  <h2>2 · Consistency-ის სპექტრი</h2>
+  <p>„Consistency" ჩამრთველი კი არა, სახელურია: <strong>weak</strong> (არავითარი დაპირება) → <strong>eventual</strong> (replica-ები საბოლოოდ თანხვდებიან, ვადის გარეშე) → <strong>strong</strong> (ყოველი read ხედავს უახლეს write-ს, თითქოს ერთი ასლი არსებობდეს). ძვირი ბოლო latency-სა და availability-ს ღირს, ამიტომ პრაქტიკული შუალედი <strong>session guarantees</strong>-ია:</p>
+  <ul>
+    <li><strong>Read-your-writes</strong> — <em>შენ</em> ყოველთვის ხედავ საკუთარ write-ებს (ამ მომხმარებლის read-ები leader-ზე ან უახლეს replica-ზე მიმართე). სხვები შეიძლება ჩამორჩნენ.</li>
+    <li><strong>Monotonic reads</strong> — ორ read-ს შორის დრო უკან არასდროს ბრუნდება (სესია ერთ replica-ზე მიაბი).</li>
+  </ul>
+  <p>AI-ინფრასტრუქტურის ლაკმუსის ტესტი — სამი store, სამი სხვადასხვა სახელური:</p>
+  <table>
+    <tr><th>Store</th><th>სჭირდება</th><th>რატომ</th></tr>
+    <tr><td>KV-cache-aware router-ის ცხრილი</td><td>Eventual (weak-იც კმარა)</td><td>მოძველებული routing მინიშნება = cache miss = latency-ის ჯარიმა, არასდროს მცდარი პასუხი</td></tr>
+    <tr><td>Chat-history store</td><td>Read-your-writes</td><td>მომხმარებელმა უნდა ნახოს ახლახან გაგზავნილი თავისი შეტყობინება; უცხოების replica-ები წამებით ჩამორჩნენ — არაუშავს</td></tr>
+    <tr><td>Model-weights registry</td><td>Strong (CP)</td><td>ორი replica, რომლებიც „მიმდინარე prod წონებზე" ვერ თანხმდებიან, ჩუმად სხვადასხვა მოდელს ემსახურება</td></tr>
+  </table>
+
+  <div class="callout"><span class="label">ლექსიკონი</span>
+    <strong>Replication lag</strong>, <strong>quorum</strong>, <strong>split-brain</strong> და მათი მეგობრები სრულად განმარტებულია <a href="../reference/0001-glossary.html">გლოსარიუმში</a>. „Eventual consistency"-ს ინტერვიუერი ყველასგან ისმენს; „read-your-writes session pinning-ით, აი მისი ფასიც" — სწორედ ეს გამოგარჩევს.
+  </div>
+
+  <h2>3 · Replication: სამი ტოპოლოგია</h2>
+  <p><a href="https://www.oreilly.com/library/view/designing-data-intensive-applications/9781098119058/">DDIA-ს მე-5 თავიდან</a>, N ასლის შენახვის სამი გზა:</p>
+  <ul>
+    <li><strong>Leader–follower</strong> (ნაგულისხმევი): ყველა write leader-ს ხვდება, follower-ები <em>ასინქრონულად</em> იმეორებენ — ამიტომ ყოველი follower-ის read lag-ს ეჯიბრება. Failover ნიშნავს follower-ის დაწინაურებას (promotion); თუ ის ჩამორჩებოდა, <strong>დადასტურებული write-ები იკარგება</strong>. ზედმეტად სწრაფად დააწინაურე — და ძველი leader დაბრუნდება იმ რწმენით, რომ ისევ ის მართავს.</li>
+    <li><strong>Leader–leader</strong>: ორივე მხარე იღებს write-ებს — რეგიონებს შორის აუცილებელია, ყველგან სხვაგან მტკივნეული, რადგან ერთსა და იმავე key-ზე ერთდროული write-ები <em>კონფლიქტობენ</em>. „Last-write-wins" გადაწყვეტა მონაცემებს ჩუმად ყრის; ნამდვილი გადაწყვეტა (CRDT-ები, აპლიკაციის დონის merge) მართლაც რთულია.</li>
+    <li><strong>Quorum</strong> (leader-ის გარეშე, Dynamo-სტილი): ჩაწერე ყველა N-ზე, დაადასტურე როცა <strong>W</strong> დაადასტურებს; წაიკითხე <strong>R</strong>-დან, დაიტოვე უახლესი. თუ <code>R + W &gt; N</code>, read-ის სიმრავლე write-ის სიმრავლეს <em>აუცილებლად</em> გადაკვეთს — ეს pigeonhole-ია და არა ალბათობა. N=3, W=2, R=2 კლასიკური ბალანსია.</li>
+  </ul>
+
+  <h2>4 · Availability-ის მათემატიკა და failover</h2>
+  <p>ცხრიანები (nines) საათის დროზე გადათარგმნილი (525,600 წუთი/წელი):</p>
+  <table>
+    <tr><th>Availability</th><th class="num">Downtime / წელი</th></tr>
+    <tr><td>99.9% („სამი ცხრიანი")</td><td class="num">8.8 საათი</td></tr>
+    <tr><td>99.99% („ოთხი ცხრიანი")</td><td class="num">52.6 წუთი</td></tr>
+    <tr><td>99.999% („ხუთი ცხრიანი")</td><td class="num">5.3 წუთი</td></tr>
+  </table>
+  <p>კომპოზიცია არის ადგილი, სადაც დიზაინები ჩუმად კვდებიან. <strong>მიმდევრობით</strong> (A ეძახის B-ს) availability-ები <em>მრავლდება</em>: ორი 99.9%-იანი სერვისი ჯაჭვში იძლევა 0.999 × 0.999 ≈ <strong>99.8%</strong>-ს — ყოველი დამოკიდებულება ცხრიანებს აკლებს. <strong>პარალელურად</strong> (A ან B საკმარისია) სამაგიეროდ ჩავარდნის ალბათობები მრავლდება: <code>1 − (1 − a)²</code> = 1 − 0.001² ≈ <strong>99.9999%</strong>. (<a href="https://github.com/donnemartin/system-design-primer#availability-patterns">Primer: availability patterns</a>)</p>
+  <p>Redundancy-ს (რეზერვირებას) failover-ის შაბლონი სჭირდება: <strong>active-passive</strong> (სათადარიგო node იბარებს heartbeat-ის დაკარგვისას — მარტივია, მაგრამ იხდი უქმად მდგომ აპარატურაში და promotion-ის დაყოვნებაში) vs <strong>active-active</strong> (ორივე ემსახურება ტრაფიკს — უკეთესი ათვისება, მაგრამ ახლა leader-leader-ის კონფლიქტების პრობლემა შენია). ორივეს კოშმარი: <strong>split-brain</strong> — „მკვდარი" node მკვდარი არ ყოფილა, და ორი leader ურთიერთსაწინააღმდეგო write-ებს იღებს. დაცვა: quorum-ზე დაფუძნებული leader-ის არჩევნები და fencing (ძველ leader-ს ფიზიკურად წაართვი ჩაწერის უნარი).</p>
+
+  <h2>5 · ლაბი — უყურე lag-ს შენი თვალით</h2>
+  <div class="callout"><span class="label">პრაქტიკა (ქვიზამდე გააკეთე)</span>
+    ყველაფერი ზემოთქმული ახლა შემოწმებადია: <code>labs/lab-0004-replication-lag/</code>-ში
+    <code>python3 replication_lab.py</code> უშვებს ოთხ ექსპერიმენტს — stale read-ების % vs
+    write-ის შემდეგ ლოდინის დრო leader + 3 follower-ზე, read-your-writes leader-ზე
+    მიბმით (staleness ნულდება; უყურე, რა ემართება leader-ის დატვირთვას),
+    <code>R + W &gt; N</code> quorum-ის სრული ცხრილი (გარანტირებული სტრიქონები ზუსტად 0.000%-ს
+    აჩვენებს) და ცხრიანების/serial/parallel არითმეტიკა. შემდეგ README-ს E1–E4 სავარჯიშოები:
+    <em>იწინასწარმეტყველე, შეცვალე კონფიგი, გაუშვი თავიდან, შეადარე.</em>
+  </div>
+
+  <h2>6 · პროექტის ნაბიჯი</h2>
+  <p>ვუბრუნდებით <strong>LLM inference gateway</strong>-ს. მას (სულ მცირე) სამი stateful store აქვს; თითოეულს მიეცი consistency-ის დონე, replication-ის ტოპოლოგია და ერთწინადადებიანი დასაბუთება: <strong>request queue</strong> (მიმდინარე გენერაციის ამოცანები — ერთის ჩუმად დაკარგვა ცუდია, ორჯერ დამუშავება უსაფრთხო უნდა იყოს: იფიქრე availability + idempotent მომხმარებლები), <strong>chat-history store</strong> (მე-2 სექციამ read-your-writes უკვე დაასაბუთა — ახლა აირჩიე ტოპოლოგია, რომელიც ამას მიიტანს) და <strong>model registry</strong> (strong/CP — თქვი, კონკრეტულად რომელ სისტემას გამოიყენებდი და რა დაემართება deploy-ებს, მაგრამ <em>არა</em> inference-ს, partition-ის დროს). სამი სტრიქონი, სამი წინადადება. მოიტანე ცხრილი შემდეგ სესიაზე და მასწავლებელი შეუტევს.</p>
+
+  <h2>შეამოწმე შენი თავი</h2>
+  <div class="quiz" id="quiz"></div>
+
+  <h2>ძირითადი წყარო</h2>
+  <p>წაიკითხე <strong>DDIA, თავი 5 — Replication</strong> (<a href="https://www.oreilly.com/library/view/designing-data-intensive-applications/9781098119058/">მე-2 გამოცემა, O'Reilly</a>) — leader-follower lag, სექცია „Problems with Replication Lag" და quorum-ები. უფასო ალტერნატივა იმავე მასალაზე: Primer-ის <a href="https://github.com/donnemartin/system-design-primer#cap-theorem">CAP theorem</a>, <a href="https://github.com/donnemartin/system-design-primer#consistency-patterns">consistency patterns</a> და <a href="https://github.com/donnemartin/system-design-primer#availability-patterns">availability patterns</a> სექციები.</p>
+
+  <footer class="lesson-footer">
+    <p><strong>გაიჭედე ან გაინტერესებს?</strong> ჰკითხე მასწავლებელს (აგენტს) ნებისმიერი რამ — „რატომ არის მოძველებული KV-cache routing მინიშნება უწყინარი, ხოლო მოძველებული weights pointer კატასტროფული?" შესანიშნავი დამატებითი კითხვაა.</p>
+    <nav class="lesson-nav">
+      <a href="0003-traffic-edge.ka.html">◀ წინა: 0003 · Traffic &amp; the Edge</a>
+      <a href="0005-rdbms-scaling.ka.html">შემდეგი: 0005 · RDBMS Scaling ▶</a>
+    </nav>
+  </footer>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+renderQuiz(document.getElementById('quiz'), {
+  title: 'შეამოწმე შენი თავი',
+  questions: [
+    {
+      q: 'ქსელური partition შენს ორ დატაცენტრს ხლეჩს. რას შორის აიძულებს CAP თეორემა თითოეულ მოთხოვნას არჩევანს?',
+      options: [
+        'აირჩიე consistency-ს, availability-სა და partition tolerance-ს შორის',
+        'გაეცი consistent პასუხები ან განაგრძე მოთხოვნების მიღება',
+        'აირჩიე მაღალ throughput-სა და დაბალ latency-ს შორის',
+      ],
+      answer: 1,
+      explain: 'CAP არ არის „აირჩიე ორი სამიდან" მენიუ — partition-ები ხდება, გინდა თუ არა. მის დროს ან ზოგ მოთხოვნას ეუბნები უარს (CP), ან შესაძლოდ მოძველებული მონაცემებით პასუხობ (AP).',
+    },
+    {
+      q: 'შენი სისტემა ნორმალურად მუშაობს — partition არსად არის. PACELC-ის მიხედვით რომელ გაცვლას მაინც აკეთებ?',
+      options: [
+        'Durability წერის throughput-ის წინააღმდეგ',
+        'Availability partition tolerance-ის წინააღმდეგ',
+        'Latency მონაცემთა consistency-ის წინააღმდეგ',
+      ],
+      answer: 2,
+      explain: 'PACELC-ის ELC ნაწილი: Else (partition-ის გარეშე), აირჩიე Latency ან Consistency. ყოველი write-ის replica-ებით დადასტურების ლოდინი მილიწამები ღირს; არლოდინი — სიახლე.',
+    },
+    {
+      q: 'მომხმარებელი ჩატს სახელს უცვლის, გვერდს აახლებს და ძველ სახელს ხედავს. რომელი გარანტია აკლდა?',
+      options: [
+        'Read-your-writes გარანტია ამ მომხმარებლის საკუთარი სესიისთვის',
+        'Strong linearizable consistency ყველა replica-ზე ერთდროულად',
+        'Monotonic reads გარანტია ყველა replica-ზე ყველგან',
+      ],
+      answer: 0,
+      explain: 'მისი read მოხვდა follower-ზე, რომელსაც მისივე write ჯერ არ ჰქონდა მიღებული. Read-your-writes (სესიის მიბმა leader-ზე ან უახლეს replica-ზე) ზუსტად ამას ასწორებს — სრულ strong consistency-ზე ბევრად იაფად.',
+    },
+    {
+      q: 'N = 3 replica. რომელი (W, R) წყვილი იძლევა გარანტიას, რომ read გადაკვეთს უახლეს დადასტურებულ write-ს?',
+      options: [
+        'W = 1, R = 2',
+        'W = 2, R = 1',
+        'W = 2, R = 2',
+      ],
+      answer: 2,
+      explain: 'გარანტია არის R + W > N. N = 3-ზე (2, 2) იძლევა 4 > 3-ს, ამიტომ read-ის სიმრავლე write-ის სიმრავლესთან საერთო replica-ს აუცილებლად შეიცავს. დანარჩენი წყვილების ჯამი 3-ია, რაც უშვებს არაგადამკვეთ სიმრავლეებს — ლაბში ისინი stale read-ებს უშვებენ.',
+    },
+    {
+      q: 'ორი სერვისი თითო 99.9%-ით ხელმისაწვდომია და მოთხოვნა ორივეს მიმდევრობით უნდა გაიაროს. ჯამური availability დაახლოებით რამდენია?',
+      options: [
+        'დაახლოებით 99.95 პროცენტი',
+        'დაახლოებით 99.8 პროცენტი',
+        'დაახლოებით 99.99 პროცენტი',
+      ],
+      answer: 1,
+      explain: 'მიმდევრობითი კომპოზიცია მრავლდება: 0.999 × 0.999 ≈ 0.998, დაახლოებით 17.5 საათი downtime წელიწადში. პარალელური redundancy საპირისპირო სვლაა: 1 − 0.001² ≈ 99.9999%.',
+    },
+    {
+      q: 'Failover-ის დროს ძველი leader სინამდვილეში არ მომკვდარა და ახლად დაწინაურებულის გვერდით write-ების მიღებას განაგრძობს. რა ჰქვია ამ ჩავარდნას?',
+      options: [
+        'Split brain',
+        'Cascading failure',
+        'Thundering herd',
+      ],
+      answer: 0,
+      explain: 'ორ node-ს თითოეულს სჯერა, რომ leader-ია, და ურთიერთსაწინააღმდეგო write-ებს იღებს — ეს split-brain-ია. ამის თავიდან ასაცილებლად არსებობს quorum-ზე დაფუძნებული leader-ის არჩევნები და fencing (ძველი leader-ისთვის ჩაწერის უნარის წართმევა).',
+    },
+  ],
+});
+</script>
+</body>
+</html>
