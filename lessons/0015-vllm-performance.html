@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lesson 15 — vLLM Performance Engineering</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<div class="page">
+
+<p class="lesson-kicker">SLM Production Stack · ADVANCED · Lesson 15 · ~2.5 h</p>
+<h1>vLLM Performance Engineering</h1>
+<p class="lesson-lede">Basics track treated the engine as a good black box. Seniors get paid to open it: quantization, batching knobs, chunked prefill, speculative decoding — and above all, a disciplined method for tuning instead of flag-flailing.</p>
+
+<h2>Knowledge</h2>
+
+<h3>1. First principles: prefill is compute-bound, decode is bandwidth-bound</h3>
+<p>Prefill crunches the whole prompt in parallel — FLOPs-limited. Decode produces one token per step per sequence, re-reading weights + KV every step — memory-bandwidth-limited. Every optimization below attacks one side or their interference. Say which, and you sound senior; miss it, and knobs are astrology.</p>
+
+<h3>2. Quantization taxonomy</h3>
+<table>
+<tr><th>Family</th><th>What shrinks</th><th>Effect</th><th>Notes</th></tr>
+<tr><td><strong>FP8 (W8A8)</strong></td><td>Weights + activations</td><td>~2× memory, prefill speedup on H100+</td><td>Near-lossless; production default on Hopper</td></tr>
+<tr><td><strong>AWQ / GPTQ (4-bit)</strong></td><td>Weights only</td><td>~4× weight memory, decode speedup (less to read)</td><td>Calibration-based; small quality tax; great for fitting big models</td></tr>
+<tr><td><strong>KV cache FP8</strong> (<code>--kv-cache-dtype fp8</code>)</td><td>The KV cache</td><td>~2× cache → ~2× batch/context capacity</td><td>Attacks the capacity bottleneck directly</td></tr>
+<tr><td><strong>GGUF</strong></td><td>Weights (llama.cpp world)</td><td>CPU-friendly formats</td><td>vLLM support exists; mind the source quality</td></tr>
+</table>
+<p>Decision shape: memory-starved → weight quant; batch/context-starved → KV quant; Hopper GPUs → FP8 by default; always re-run YOUR evals after — quantization quality loss is workload-dependent. (<a href="https://docs.vllm.ai/en/latest/features/quantization/">docs</a>)</p>
+
+<h3>3. The batching knobs</h3>
+<table>
+<tr><th>Knob</th><th>Governs</th><th>Raise it when</th></tr>
+<tr><td><code>--max-num-seqs</code></td><td>Max sequences per step</td><td>Queue grows while KV usage is low</td></tr>
+<tr><td><code>--max-num-batched-tokens</code></td><td>Token budget per step</td><td>Throughput-first workloads; lower to protect TPOT</td></tr>
+<tr><td><code>--gpu-memory-utilization</code></td><td>Fraction pre-allocated (weights+KV)</td><td>Default 0.9; leave headroom for spikes/other pods</td></tr>
+<tr><td><code>--max-model-len</code></td><td>Worst-case per-seq KV</td><td>Shrink to admit more concurrent sequences</td></tr>
+</table>
+
+<h3>4. Chunked prefill: stop long prompts from starving decode</h3>
+<p>Naive scheduling runs a giant prefill as one step — every decoding user stalls (TPOT spike). <strong>Chunked prefill</strong> slices prompts into budget-sized chunks and mixes them WITH decode tokens each step: slightly slower prefill completion, dramatically smoother ITL. Default-on in modern vLLM (V1); knob is the token budget. This is the canonical "throughput vs tail latency" interview question in one feature. (<a href="https://docs.vllm.ai/en/latest/configuration/optimization.html">optimization docs</a>)</p>
+
+<h3>5. Speculative decoding: spend FLOPs to buy latency</h3>
+<p>Decode wastes parallel hardware on one token at a time. Fix: a cheap <em>drafter</em> (small model, n-gram lookup, or trained heads: EAGLE/MTP) proposes k tokens; the big model verifies all k in ONE parallel pass; accepted prefix keeps, mispredictions truncate — output provably identical in greedy mode. Wins when acceptance is high (code, templated text) and batch is small (latency-critical); loses at saturation (verify FLOPs compete with batch throughput). (<a href="https://docs.vllm.ai/en/latest/features/spec_decode/">docs</a>)</p>
+
+<h3>6. The method (this is the actual lesson)</h3>
+<pre><code>1. Fix a workload (input/output lens, concurrency) — bench is meaningless otherwise
+2. Baseline: vllm bench serve → save JSON
+3. ONE knob per run. Re-bench. Log: knob, TTFT P50/P90, TPOT, tok/s, KV usage
+4. Accept/revert against YOUR SLO (not "bigger number")
+5. Write the tuning report — the artifact that outlives the cluster</code></pre>
+
+<h2>Lab (labs/lab-15): a real tuning study on CPU</h2>
+<p>CPU numbers differ from GPU; the METHOD is identical — that's what you're drilling.</p>
+<div class="lab">
+<div class="step"><h3>Baseline</h3><p>Single engine, fixed workload (128 in / 64 out, rate 0.5): bench, save JSON, record the table row.</p></div>
+<div class="step"><h3>Knob 1: max-num-seqs sweep</h3><p>4 → 8 → 16. Watch TPOT degrade as batch grows while tok/s rises — the fundamental trade, measured by your own hands.</p></div>
+<div class="step"><h3>Knob 2: prefix caching</h3><p><code>--enable-prefix-caching</code> + a shared-prefix workload (same 400-token system prompt, different questions). Compare TTFT distributions on/off. Use the <code>vllm-prefix-cache-bench</code> skill for the harness.</p></div>
+<div class="step"><h3>Knob 3: max-model-len as capacity lever</h3><p>4096 → 2048 with concurrency pushed high; watch admission improve (waiting queue drains faster) at the cost of context ceiling.</p></div>
+<div class="step"><h3>The report</h3><p><code>docs/tuning-report.md</code>: workload spec, table of runs, one chart (even ASCII), 3 conclusions, and a "what I'd try on H100s" section (FP8, kv fp8, spec decode — with predicted effects and why). The GPU section proves the theory transferred.</p></div>
+</div>
+
+<h2>Check yourself</h2>
+<div class="quiz" data-quiz>
+  <div class="q">
+    <p class="stem">TPOT spikes whenever a long-prompt request arrives. Best-fit feature?</p>
+    <button class="opt" data-correct>Chunked prefill mixing chunks with decode</button>
+    <button class="opt">Speculative decoding with n-gram drafter</button>
+    <button class="opt">KV cache quantization to fp8</button>
+    <p class="explain">The spike is prefill monopolizing steps. Chunking bounds per-step prefill so decode tokens keep flowing. Spec decode and KV quant don't touch prefill interference.</p>
+  </div>
+  <div class="q">
+    <p class="stem">70B model fits but batch stays tiny; queue grows. First lever?</p>
+    <button class="opt" data-correct>Quantize KV cache, freeing batch memory</button>
+    <button class="opt">Quantize weights harder, to 2-bit</button>
+    <button class="opt">Raise max-num-seqs above memory limit</button>
+    <p class="explain">Weights fit — the constraint is KV memory per sequence. fp8 KV ≈ doubles concurrent capacity. Raising max-num-seqs without memory does nothing (admission is KV-bound); 2-bit weights torch quality.</p>
+  </div>
+  <div class="q">
+    <p class="stem">Speculative decoding helps least when…</p>
+    <button class="opt" data-correct>Engine already saturated with large batches</button>
+    <button class="opt">Output is repetitive templated JSON</button>
+    <button class="opt">Traffic is sparse single-user chat</button>
+    <p class="explain">At saturation the "idle parallel FLOPs" spec decode exploits don't exist — verification competes with batch throughput. Templated output (high acceptance) and sparse traffic are its best cases.</p>
+  </div>
+</div>
+
+<h2>Primary source</h2>
+<p><a href="https://docs.vllm.ai/en/latest/configuration/optimization.html">vLLM optimization guide</a> + <a href="https://docs.vllm.ai/en/latest/features/quantization/">quantization docs</a>. Deep cut: the EAGLE paper if spec decode hooked you.</p>
+
+<h2>Next</h2>
+<p><a href="0016-distributed-inference.html">Lesson 16</a>: past one machine — tensor/pipeline parallelism, disaggregated prefill, and KV offloading.</p>
+
+<div class="lesson-footer"><p><a href="index.html">Course home</a> · lab: <code>labs/lab-15/</code></p></div>
+</div>
+<script src="../assets/quiz.js"></script>
+</body>
+</html>

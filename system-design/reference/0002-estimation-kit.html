@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Estimation Kit — Numbers to Memorize</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<div class="lesson">
+  <header class="lesson-header">
+    <p class="kicker">Reference · Estimation Kit</p>
+    <h1>Numbers to Memorize</h1>
+    <p class="dek">The back-of-envelope toolkit. Print this. Every design interview starts here. Sources: <a href="https://github.com/donnemartin/system-design-primer#latency-numbers-every-programmer-should-know">System Design Primer appendix</a>.</p>
+  </header>
+
+  <h2>Latency numbers every programmer should know</h2>
+  <table>
+    <tr><th>Operation</th><th class="num">Time</th><th>Anchor</th></tr>
+    <tr><td>L1 cache reference</td><td class="num">0.5 ns</td><td>baseline</td></tr>
+    <tr><td>Branch mispredict</td><td class="num">5 ns</td><td>10× L1</td></tr>
+    <tr><td>L2 cache reference</td><td class="num">7 ns</td><td>14× L1</td></tr>
+    <tr><td>Mutex lock/unlock</td><td class="num">25 ns</td><td>—</td></tr>
+    <tr><td>Main memory reference</td><td class="num">100 ns</td><td>200× L1</td></tr>
+    <tr><td>Compress 1 KB (Zippy)</td><td class="num">10 µs</td><td>—</td></tr>
+    <tr><td>Send 1 KB over 1 Gbps network</td><td class="num">10 µs</td><td>—</td></tr>
+    <tr><td>Random SSD read (4 KB)</td><td class="num">150 µs</td><td>1,500× memory</td></tr>
+    <tr><td>Read 1 MB sequentially from memory</td><td class="num">250 µs</td><td>4 GB/s</td></tr>
+    <tr><td>Round trip within same datacenter</td><td class="num">500 µs</td><td>5,000× memory ref</td></tr>
+    <tr><td>Read 1 MB sequentially from SSD</td><td class="num">1 ms</td><td>1 GB/s</td></tr>
+    <tr><td>HDD disk seek</td><td class="num">10 ms</td><td>20× DC round trip</td></tr>
+    <tr><td>Read 1 MB sequentially from HDD</td><td class="num">30 ms</td><td>30 MB/s</td></tr>
+    <tr><td>Round trip CA → Netherlands → CA</td><td class="num">150 ms</td><td>the speed of light</td></tr>
+  </table>
+
+  <div class="callout"><span class="label">Rules of thumb</span>
+    Memory is ~4 GB/s sequential · SSD ~1 GB/s · 1 Gbps network ~100 MB/s · HDD ~30 MB/s.
+    ~2,000 round trips/second inside a datacenter; only 6–7 cross-ocean round trips/second.
+  </div>
+
+  <h2>Powers of two</h2>
+  <table>
+    <tr><th>Power</th><th class="num">Value</th><th>≈</th></tr>
+    <tr><td>2<sup>10</sup></td><td class="num">1,024</td><td>1 KB (thousand)</td></tr>
+    <tr><td>2<sup>20</sup></td><td class="num">1,048,576</td><td>1 MB (million)</td></tr>
+    <tr><td>2<sup>30</sup></td><td class="num">~10<sup>9</sup></td><td>1 GB (billion)</td></tr>
+    <tr><td>2<sup>40</sup></td><td class="num">~10<sup>12</sup></td><td>1 TB (trillion)</td></tr>
+  </table>
+
+  <h2>Traffic math</h2>
+  <table>
+    <tr><th>Fact</th><th>Value</th></tr>
+    <tr><td>Seconds per day</td><td>86,400 → round to <strong>10<sup>5</sup></strong> for napkin math</td></tr>
+    <tr><td>1M requests/day</td><td>≈ 12 RPS average</td></tr>
+    <tr><td>Peak factor</td><td>assume 2–10× average unless told otherwise</td></tr>
+  </table>
+
+  <h2>GPU numbers (preview — Phase 4 goes deep)</h2>
+  <table>
+    <tr><th>Fact</th><th>Value</th></tr>
+    <tr><td>fp16/bf16 parameter</td><td>2 bytes → 70B model ≈ 140 GB weights</td></tr>
+    <tr><td>H100 HBM capacity / bandwidth</td><td>80 GB / ~3.35 TB/s</td></tr>
+    <tr><td>Decode speed ceiling (single stream)</td><td>≈ bandwidth ÷ bytes-of-weights-read per token</td></tr>
+  </table>
+
+  <footer class="lesson-footer">
+    <p>Used from <a href="../lessons/0001-performance-vocabulary.html">Lesson 0001</a> onward. See also the <a href="0001-glossary.html">Glossary</a>.</p>
+  </footer>
+</div>
+</body>
+</html>

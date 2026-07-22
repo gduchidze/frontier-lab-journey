@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Reference — vLLM Cheat Sheet</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<div class="page">
+
+<p class="lesson-kicker">SLM Production Stack · Reference</p>
+<h1>vLLM Cheat Sheet</h1>
+<p class="lesson-lede">Serve flags, CPU knobs, API calls, and metrics used across the course. Canonical: <a href="https://docs.vllm.ai/">docs.vllm.ai</a>.</p>
+
+<h2>Serving</h2>
+<pre><code># native
+vllm serve Qwen/Qwen3.5-0.8B --max-model-len 4096 --dtype bfloat16
+
+# docker (our CPU image; args after image go to `vllm serve`)
+docker run -d --name vllm -p 8000:8000 \
+  -v hf-cache:/root/.cache/huggingface \
+  -e VLLM_CPU_KVCACHE_SPACE=4 \
+  vllm-cpu:local \
+  --model Qwen/Qwen3.5-0.8B --max-model-len 4096 --dtype bfloat16</code></pre>
+
+<h2>Flags that matter here</h2>
+<table>
+<tr><th>Flag</th><th>Effect</th></tr>
+<tr><td><code>--model</code></td><td>HF repo ID; downloads to HF cache on first run</td></tr>
+<tr><td><code>--max-model-len</code></td><td>Context cap → bounds per-request KV memory</td></tr>
+<tr><td><code>--dtype bfloat16</code></td><td>Weight/activation precision (M4-friendly)</td></tr>
+<tr><td><code>--port</code></td><td>API port (default 8000)</td></tr>
+<tr><td><code>--api-key</code></td><td>Require bearer token on all endpoints</td></tr>
+<tr><td><code>--served-model-name</code></td><td>Alias returned by /v1/models</td></tr>
+<tr><td><code>--enable-prefix-caching</code></td><td>Reuse KV across shared prefixes (pairs with session routing)</td></tr>
+<tr><td><code>--max-num-seqs</code></td><td>Max concurrent sequences in a batch</td></tr>
+<tr><td><code>--enforce-eager</code></td><td>Skip graph compile; faster start, slower serve — debugging aid</td></tr>
+<tr><td><code>--tensor-parallel-size</code></td><td>Shard model across N GPUs (GPU world; =GPU count)</td></tr>
+</table>
+
+<h2>CPU backend env vars</h2>
+<table>
+<tr><th>Var</th><th>Meaning</th><th>Course value</th></tr>
+<tr><td><code>VLLM_CPU_KVCACHE_SPACE</code></td><td>GiB reserved for KV cache</td><td>4 (2 when running 2 replicas)</td></tr>
+<tr><td><code>VLLM_CPU_OMP_THREADS_BIND</code></td><td>Pin OpenMP threads to cores</td><td>leave default locally</td></tr>
+<tr><td><code>VLLM_LOGGING_LEVEL</code></td><td>DEBUG when confused</td><td>INFO</td></tr>
+</table>
+
+<h2>API calls (OpenAI-compatible)</h2>
+<pre><code># list models
+curl -s localhost:8000/v1/models
+
+# chat
+curl -s localhost:8000/v1/chat/completions -H "Content-Type: application/json" -d '{
+  "model": "Qwen/Qwen3.5-0.8B",
+  "messages": [{"role":"user","content":"Hello"}],
+  "max_tokens": 60,
+  "temperature": 0.7
+}'
+
+# streaming (tokens as they generate — what UIs use)
+curl -sN localhost:8000/v1/chat/completions -H "Content-Type: application/json" \
+  -d '{"model":"Qwen/Qwen3.5-0.8B","messages":[{"role":"user","content":"Hi"}],"stream":true,"max_tokens":30}'
+
+# health + metrics
+curl -s localhost:8000/health          # 200 = engine up
+curl -s localhost:8000/metrics | grep ^vllm:</code></pre>
+<pre><code># python — official openai client, one line changed
+from openai import OpenAI
+client = OpenAI(base_url="http://localhost:8000/v1", api_key="unused")
+r = client.chat.completions.create(model="Qwen/Qwen3.5-0.8B",
+    messages=[{"role":"user","content":"Hello"}], max_tokens=60)
+print(r.choices[0].message.content)</code></pre>
+
+<h2>Key metrics (Prometheus names)</h2>
+<table>
+<tr><th>Metric</th><th>Type</th><th>Meaning</th></tr>
+<tr><td><code>vllm:num_requests_running</code></td><td>gauge</td><td>In the active batch now</td></tr>
+<tr><td><code>vllm:num_requests_waiting</code></td><td>gauge</td><td>Queued — growth = saturation</td></tr>
+<tr><td><code>vllm:kv_cache_usage_perc</code></td><td>gauge</td><td>KV block usage 0–1</td></tr>
+<tr><td><code>vllm:prompt_tokens_total</code></td><td>counter</td><td>Prefill tokens → wrap in rate()</td></tr>
+<tr><td><code>vllm:generation_tokens_total</code></td><td>counter</td><td>Decode tokens → rate() = tok/s</td></tr>
+<tr><td><code>vllm:time_to_first_token_seconds</code></td><td>histogram</td><td>TTFT → histogram_quantile()</td></tr>
+<tr><td><code>vllm:time_per_output_token_seconds</code></td><td>histogram</td><td>TPOT / inter-token latency</td></tr>
+<tr><td><code>vllm:e2e_request_latency_seconds</code></td><td>histogram</td><td>Whole request wall time</td></tr>
+<tr><td><code>vllm:request_success_total</code></td><td>counter</td><td>Completed OK (label: finished reason)</td></tr>
+</table>
+<p>Names drift between versions — verify against your build: <code>curl -s :8000/metrics | grep ^vllm:</code>. Full list: <a href="https://docs.vllm.ai/en/latest/usage/metrics.html">metrics docs</a>.</p>
+
+<h2>Glossary</h2>
+<table>
+<tr><td>Continuous batching</td><td>Batch recomposed every decode step; new requests join mid-flight</td></tr>
+<tr><td>KV cache</td><td>Stored attention keys/values for generated context; the memory hog</td></tr>
+<tr><td>PagedAttention</td><td>Block-based KV allocation via indirection table — no fragmentation</td></tr>
+<tr><td>Prefill</td><td>Processing the prompt (parallel, compute-bound) → produces TTFT</td></tr>
+<tr><td>Decode</td><td>Token-by-token generation (memory-bandwidth-bound) → produces TPOT</td></tr>
+<tr><td>Prefix caching</td><td>Reusing KV of identical prompt prefixes across requests</td></tr>
+<tr><td>TTFT / TPOT</td><td>Time to first token / time per output token</td></tr>
+</table>
+
+<div class="lesson-footer">
+<p><a href="../lessons/index.html">Course home</a> · workspace skills: <code>vllm-deploy-k8s</code>, <code>vllm-bench-serve</code></p>
+</div>
+
+</div>
+</body>
+</html>

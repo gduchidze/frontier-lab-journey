@@ -1,0 +1,54 @@
+# Lab 19 — toy CRD: your own noun in the K8s API.
+# No controller exists — objects are inert until an operator reconciles them.
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: modelendpoints.llm.example.com
+spec:
+  group: llm.example.com
+  scope: Namespaced
+  names:
+    kind: ModelEndpoint
+    plural: modelendpoints
+    singular: modelendpoint
+    shortNames: [mep]
+  versions:
+  - name: v1alpha1
+    served: true
+    storage: true
+    additionalPrinterColumns:
+    - name: Model
+      type: string
+      jsonPath: .spec.model
+    - name: Replicas
+      type: integer
+      jsonPath: .spec.replicas
+    schema:
+      openAPIV3Schema:
+        type: object
+        properties:
+          spec:
+            type: object
+            required: [model]
+            properties:
+              model:
+                type: string
+              revision:
+                type: string
+              replicas:
+                type: integer
+                minimum: 0
+              tier:
+                type: string
+                enum: [interactive, batch]
+---
+apiVersion: llm.example.com/v1alpha1
+kind: ModelEndpoint
+metadata:
+  name: qwen-prod
+  namespace: llm
+spec:
+  model: Qwen/Qwen3.5-0.8B
+  revision: "2fc0636"
+  replicas: 2
+  tier: interactive

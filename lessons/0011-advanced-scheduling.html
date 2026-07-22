@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lesson 11 — Advanced Scheduling and the GPU Fleet</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<div class="page">
+
+<p class="lesson-kicker">SLM Production Stack · ADVANCED · Lesson 11 · ~2 h</p>
+<h1>Advanced Scheduling and the GPU Fleet</h1>
+<p class="lesson-lede">The advanced track begins. In production, WHERE a pod lands is a cost and reliability decision — especially when nodes carry $30k GPUs. Today: how the scheduler really decides, and every knob that overrides it. You'll simulate a GPU fleet on your Mac.</p>
+
+<div class="note"><strong>Advanced track ground rules</strong>
+Prereq: lessons 1–10 done. GPU-only mechanics are taught honestly: theory + simulation + capacity math here; the concepts transfer 1:1 the day you touch real A100s. Lab 11 rebuilds your cluster with an advanced config (3 nodes, Cilium CNI, ingress ports) — rebuilding from your own chart IS the first exercise.</div>
+
+<h2>Knowledge</h2>
+
+<h3>1. The scheduler is a two-phase pipeline</h3>
+<p>For each pending pod: <strong>Filter</strong> (drop nodes that can't host it: insufficient resources, taints, affinity misses, volume zone) → <strong>Score</strong> (rank survivors: least/most-allocated, spread, image locality) → bind. Everything below is you injecting constraints into those phases. (<a href="https://kubernetes.io/docs/concepts/scheduling-eviction/kube-scheduler/">docs</a>)</p>
+
+<h3>2. Taints repel, tolerations permit, affinity attracts</h3>
+<table>
+<tr><th>Mechanism</th><th>Direction</th><th>GPU-fleet use</th></tr>
+<tr><td>Taint + toleration</td><td>Node says "keep off unless invited"</td><td><code>nvidia.com/gpu:NoSchedule</code> on GPU nodes so web pods never occupy them</td></tr>
+<tr><td>Node affinity</td><td>Pod says "I need nodes like this"</td><td>Pin to <code>gpu-type=h100</code> pools; prefer cheaper A10 pools when possible</td></tr>
+<tr><td>Pod anti-affinity</td><td>Pod says "not next to those pods"</td><td>Spread replicas across nodes/zones for failure isolation</td></tr>
+<tr><td>Topology spread</td><td>"Even distribution across a topology key"</td><td>Cheaper, more flexible successor to anti-affinity for spreading</td></tr>
+<tr><td>PriorityClass + preemption</td><td>"Evict lesser pods if I don't fit"</td><td>Prod inference preempts batch/experiment jobs on the GPU pool</td></tr>
+</table>
+
+<h3>3. GPUs are extended resources served by device plugins</h3>
+<p><code>nvidia.com/gpu: 1</code> is not built into K8s — the <strong>NVIDIA device plugin</strong> (DaemonSet) discovers GPUs and advertises them on the node's status; the scheduler then treats them like any countable resource: integer-only, no overcommit, request = limit. Fractional sharing exists one level down:</p>
+<table>
+<tr><th>Sharing tech</th><th>What it is</th><th>Trade</th></tr>
+<tr><td><strong>MIG</strong></td><td>Hardware partition of A100/H100 into isolated slices (e.g. <code>nvidia.com/mig-3g.20gb</code>)</td><td>True isolation; fixed slice sizes</td></tr>
+<tr><td><strong>Time-slicing</strong></td><td>Device plugin advertises N virtual GPUs per physical</td><td>No isolation — noisy neighbors; fine for dev</td></tr>
+<tr><td><strong>MPS</strong></td><td>CUDA-level concurrent process sharing</td><td>Better utilization, shared fault domain</td></tr>
+</table>
+<p>You saw <code>requestGPUType: "nvidia.com/mig-4g.71gb"</code> in production-stack's values.yaml — now you know what it means. (<a href="https://docs.nvidia.com/datacenter/cloud-native/gpu-operator/latest/index.html">GPU Operator docs</a>)</p>
+
+<h3>4. Bin-pack or spread? The $ question</h3>
+<p>Web workloads spread (resilience). GPU inference usually <strong>bin-packs</strong>: fill node 1 completely before waking node 2, so the cluster autoscaler / <a href="https://karpenter.sh/">Karpenter</a> can scale empty $30/hr nodes to zero. Wrong default = five nodes each 20% busy = 5× the bill. Senior answer: bin-pack fleets per pool, anti-affinity only across failure domains you actually pay to protect.</p>
+
+<h2>Lab (labs/lab-11): simulate the fleet</h2>
+<p>Full worksheet + verify: <code>labs/lab-11/</code>. Outline:</p>
+<div class="lab">
+<div class="step"><h3>Rebuild: advanced cluster</h3><p><code>kind delete cluster --name llm-stack</code> → create from <code>k8s/kind-advanced.yaml</code> (1 control-plane + 2 workers, default CNI disabled, ports 80/443/30080) → install <a href="https://docs.cilium.io/">Cilium</a> as CNI → redeploy your whole stack from the chart. Reproducibility exam: how long does it take you? Note it.</p></div>
+<div class="step"><h3>Fake a GPU pool</h3><p>Label + taint worker2 (<code>gpu=true:NoSchedule</code>), then advertise a fake extended resource <code>example.com/gpu: 2</code> by PATCHing node status through <code>kubectl proxy</code>. The scheduler treats it exactly like real GPUs.</p></div>
+<div class="step"><h3>Schedule against it</h3><p>Deploy "gpu" pods requesting <code>example.com/gpu: 1</code> with toleration + affinity → both land on worker2 → third stays <code>Pending: Insufficient example.com/gpu</code>. The exact failure you'll debug in every GPU cluster.</p></div>
+<div class="step"><h3>Preempt</h3><p>PriorityClasses <code>prod-inference</code> &gt; <code>batch-experiment</code>; fill the "GPU" node with batch pods; deploy a prod pod → watch eviction in Events.</p></div>
+<div class="step"><h3>Spread the engines</h3><p>Add <code>topologySpreadConstraints</code> (zone key = hostname here) to your vLLM chart template; 2 replicas land on different workers; verify with <code>-o wide</code>.</p></div>
+</div>
+
+<h2>Check yourself</h2>
+<div class="quiz" data-quiz>
+  <div class="q">
+    <p class="stem">GPU pods request nvidia.com/gpu but sit Pending on a node WITH free GPUs. Classic cause?</p>
+    <button class="opt" data-correct>Missing toleration for the GPU taint</button>
+    <button class="opt">GPU memory fragmented by earlier pods</button>
+    <button class="opt">Scheduler ignores extended resource requests</button>
+    <p class="explain">GPU pools are almost always tainted; a pod without the matching toleration is filtered out before scoring. Extended resources aren't fragmentable — they're integers.</p>
+  </div>
+  <div class="q">
+    <p class="stem">Why bin-pack GPU inference instead of spreading?</p>
+    <button class="opt" data-correct>Empty nodes can scale to zero</button>
+    <button class="opt">Colocated pods share model weight memory</button>
+    <button class="opt">Spreading breaks tensor parallel communication</button>
+    <p class="explain">Packed = whole idle nodes = autoscaler reclaims them = money. Pods never share weights across containers, and TP happens inside one pod's GPUs.</p>
+  </div>
+  <div class="q">
+    <p class="stem">MIG vs time-slicing for two paying tenants on one A100?</p>
+    <button class="opt" data-correct>MIG: hardware isolation between tenants</button>
+    <button class="opt">Time-slicing: higher aggregate GPU throughput</button>
+    <button class="opt">Either: both give equivalent guarantees</button>
+    <p class="explain">Tenants need isolation — MIG partitions memory/SMs in hardware. Time-slicing shares everything: one tenant's OOM or burst hits the other.</p>
+  </div>
+</div>
+
+<h2>Primary source</h2>
+<p><a href="https://kubernetes.io/docs/concepts/scheduling-eviction/">K8s docs — Scheduling and Eviction</a> (the whole section, it's the senior syllabus) + <a href="https://docs.nvidia.com/datacenter/cloud-native/gpu-operator/latest/index.html">NVIDIA GPU Operator overview</a>.</p>
+
+<h2>Next</h2>
+<p><a href="0012-production-edge.html">Lesson 12</a>: the edge — Ingress, Gateway API, TLS, and why LLM streaming breaks default proxies.</p>
+
+<div class="lesson-footer"><p><a href="index.html">Course home</a> · lab: <code>labs/lab-11/</code></p></div>
+</div>
+<script src="../assets/quiz.js"></script>
+</body>
+</html>

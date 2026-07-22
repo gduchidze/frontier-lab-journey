@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lesson 14 — GitOps and Progressive Model Delivery</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<div class="page">
+
+<p class="lesson-kicker">SLM Production Stack · ADVANCED · Lesson 14 · ~2 h</p>
+<h1>GitOps and Progressive Model Delivery</h1>
+<p class="lesson-lede">You've been the deployment tool: helm upgrade by hand. Production removes the human: git is the desired state, a controller reconciles the cluster to it, and shipping a new model becomes a reviewable pull request with a rollback button.</p>
+
+<h2>Knowledge</h2>
+
+<h3>1. GitOps = the reconciliation loop, one level up</h3>
+<p>A Deployment reconciles pods to spec. <a href="https://argo-cd.readthedocs.io/">Argo CD</a> reconciles the <em>whole cluster</em> to a git repo: watch repo → diff live state (<em>drift detection</em>) → sync. Consequences: every change is a commit (audit log for free), rollback = <code>git revert</code>, cluster credentials leave laptops, and clusters are rebuildable from repo + secrets alone. Your capstone README quickstart was proto-GitOps; this automates it.</p>
+
+<h3>2. The Application CRD and app-of-apps</h3>
+<pre><code>spec:
+  source:  { repoURL: …, path: charts/slm-stack, targetRevision: main }
+  destination: { server: https://kubernetes.default.svc, namespace: llm }
+  syncPolicy:
+    automated: { prune: true, selfHeal: true }   # drift gets reverted</code></pre>
+<p><code>selfHeal</code> means your manual <code>kubectl edit</code> gets stomped within minutes — correct behavior, disorienting the first time. Platforms use <strong>app-of-apps</strong>: one root Application spawning children (engines, monitoring, edge) — the whole platform as one tree.</p>
+
+<h3>3. Models are versioned artifacts — treat rollouts like code deploys</h3>
+<p>A model change (new weights, new revision, new quantization) is a <em>riskier</em> deploy than code: quality regressions don't throw exceptions. production-stack's values expose <code>modelURL</code> + <code>modelRevision</code> — pin the revision (HF commit hash), never float on a repo's main. Rollout strategies, in order of blast radius:</p>
+<table>
+<tr><th>Strategy</th><th>Mechanics</th><th>Catch for LLMs</th></tr>
+<tr><td>Rolling</td><td>Deployment default, pod by pod</td><td>Mixed model versions serve simultaneously mid-roll</td></tr>
+<tr><td>Blue/green</td><td>Full v2 stack, flip the Service/route</td><td>2× GPU cost during overlap — real money</td></tr>
+<tr><td>Canary</td><td>Weighted routes (Gateway API / Argo Rollouts): 5% → 50% → 100%</td><td>Needs quality metrics per arm, not just error rate</td></tr>
+<tr><td>Shadow</td><td>v2 gets mirrored traffic, responses discarded</td><td>Full duplicate compute; gold for eval, silent to users</td></tr>
+</table>
+<p>The senior insight: canary <em>analysis</em> for models must include quality signals (eval-set scores, thumbs-down rate, refusal rate) alongside TTFT/error rate. Latency-healthy garbage passes a naive canary.</p>
+
+<h3>4. CI/CD around the loop</h3>
+<p>CI builds/scans the image, runs offline evals on the candidate model, bumps the chart values in a PR. CD is just Argo noticing the merge. The pipeline never holds cluster credentials — the security win that sells GitOps to auditors.</p>
+
+<h2>Lab (labs/lab-14): the cluster follows git</h2>
+<div class="lab">
+<div class="step"><h3>Push and install</h3><p>Push this repo to GitHub (it's already a git repo). Install Argo CD, open its UI (port-forward, initial admin secret).</p></div>
+<div class="step"><h3>Application → your chart</h3><p>Application pointing at <code>charts/slm-stack</code>, automated sync + selfHeal. Watch it adopt the existing release; tree view = your whole stack as a graph.</p></div>
+<div class="step"><h3>Deploy via commit</h3><p>Change <code>maxModelLen</code> in values.yaml → commit → push → watch Argo detect, diff, sync, roll the Deployment. No kubectl involved. Then <code>git revert</code> → push → the rollback deploys itself.</p></div>
+<div class="step"><h3>Feel selfHeal</h3><p><code>kubectl scale deployment vllm -n llm --replicas=3</code> by hand → watch Argo revert your drift. Discuss with your teacher: when is selfHeal wrong? (HPA fights it — that's why replicas should be un-tracked when HPA owns them; Argo has <code>ignoreDifferences</code> for exactly this.)</p></div>
+<div class="step"><h3>Design a model canary (paper)</h3><p>Write <code>docs/model-rollout.md</code>: how you'd canary Qwen3.5-0.8B → a hypothetical 1.5B on this stack — route weights, metrics per arm, promotion criteria, abort criteria. 1 page. This doc is an interview answer you'll reuse verbatim.</p></div>
+</div>
+
+<h2>Check yourself</h2>
+<div class="quiz" data-quiz>
+  <div class="q">
+    <p class="stem">Argo keeps reverting your HPA's replica changes. Root cause?</p>
+    <button class="opt" data-correct>selfHeal treats HPA scaling as drift</button>
+    <button class="opt">HPA lacks RBAC to override Argo</button>
+    <button class="opt">Chart pins replicas in a hook</button>
+    <p class="explain">Two controllers own one field. Fix: remove replicas from the chart when HPA rules, or ignoreDifferences on that path. Classic production collision.</p>
+  </div>
+  <div class="q">
+    <p class="stem">Why must model canaries track more than latency and errors?</p>
+    <button class="opt" data-correct>Bad models answer quickly and successfully</button>
+    <button class="opt">Latency percentiles lag traffic shifts</button>
+    <button class="opt">Error rates need bigger sample sizes</button>
+    <p class="explain">A quality regression returns 200s at great TTFT. Canary analysis needs quality signals — eval scores, feedback rate — or it promotes garbage.</p>
+  </div>
+  <div class="q">
+    <p class="stem">Pin modelRevision to a commit hash because…</p>
+    <button class="opt" data-correct>Upstream repo updates change your deploys</button>
+    <button class="opt">HF rate limits floating revision pulls</button>
+    <button class="opt">vLLM caches poison across revisions</button>
+    <p class="explain">Floating revisions mean the same manifest deploys different weights next week — unreproducible, unauditable. Same reason images pin digests.</p>
+  </div>
+</div>
+
+<h2>Primary source</h2>
+<p><a href="https://argo-cd.readthedocs.io/en/stable/getting_started/">Argo CD getting started</a> + <a href="https://argoproj.github.io/rollouts/">Argo Rollouts</a> (canary concepts). Cross-check <a href="https://github.com/vllm-project/production-stack/blob/main/helm/values.yaml">production-stack values</a> for modelRevision.</p>
+
+<h2>Next</h2>
+<p><a href="0015-vllm-performance.html">Lesson 15</a>: inside the engine — quantization, chunked prefill, speculative decoding, and a real tuning study on your stack.</p>
+
+<div class="lesson-footer"><p><a href="index.html">Course home</a> · lab: <code>labs/lab-14/</code></p></div>
+</div>
+<script src="../assets/quiz.js"></script>
+</body>
+</html>

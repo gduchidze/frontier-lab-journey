@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lesson 12 — The Production Edge: Ingress, Gateway, TLS</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<div class="page">
+
+<p class="lesson-kicker">SLM Production Stack · ADVANCED · Lesson 12 · ~2 h</p>
+<h1>The Production Edge: Ingress, Gateway, TLS</h1>
+<p class="lesson-lede">NodePort got you to the demo. Production traffic arrives at one hardened entry point with hostnames, TLS, timeouts, and auth — and LLM streaming breaks the default settings of every proxy ever shipped. Today you build a real edge.</p>
+
+<h2>Knowledge</h2>
+
+<h3>1. The edge stack, bottom to top</h3>
+<p><strong>Service (L4)</strong> → <strong>Ingress (L7 rules: host/path → Service)</strong> interpreted by an <strong>ingress controller</strong> (nginx, Traefik, Envoy) → fronted in cloud by a <strong>LoadBalancer</strong>. One controller, one IP, N services behind hostnames: <code>api.company.com</code> → router, <code>chat.company.com</code> → UI. (<a href="https://kubernetes.io/docs/concepts/services-networking/ingress/">docs</a>)</p>
+
+<h3>2. Gateway API is the successor — learn both</h3>
+<p><a href="https://gateway-api.sigs.k8s.io/">Gateway API</a> splits the Ingress monolith into role-oriented resources: <code>GatewayClass</code> (infra provider) → <code>Gateway</code> (ops: listeners, TLS) → <code>HTTPRoute</code> (app teams: routing, traffic weights). Weighted <code>backendRefs</code> give you canary at the edge — remember that for lesson 14. New platforms are Gateway-API-first; existing fleets still run Ingress. Interview-ready = both.</p>
+
+<h3>3. TLS: cert-manager turns certificates into a controller problem</h3>
+<p><a href="https://cert-manager.io/">cert-manager</a> watches <code>Certificate</code>/Issuer CRDs and keeps Secrets filled with valid certs (Let's Encrypt via ACME in prod, self-signed CA locally). The Ingress references the Secret; renewal is nobody's pager. Same reconciliation pattern as everything else in K8s — that's the deep lesson.</p>
+
+<h3>4. LLM traffic breaks default proxy settings</h3>
+<p>This table is half the value of this lesson — it's what "AI infra experience" means at the edge:</p>
+<table>
+<tr><th>Default</th><th>Breaks</th><th>Fix (nginx-ingress annotations)</th></tr>
+<tr><td>60 s read timeout</td><td>Long generations die mid-stream</td><td><code>proxy-read-timeout: "600"</code></td></tr>
+<tr><td>Response buffering ON</td><td>SSE tokens arrive in one lump at the end — streaming visually dead</td><td><code>proxy-buffering: "off"</code></td></tr>
+<tr><td>1 MB body limit</td><td>Long-context / multimodal payloads rejected 413</td><td><code>proxy-body-size: "10m"</code></td></tr>
+<tr><td>Round-robin LB</td><td>Fights your session-affinity router</td><td>Route to the router Service and let IT balance engines</td></tr>
+<tr><td>Retries on timeout</td><td>Duplicate expensive generations</td><td>Idempotency keys / disable retry for POST</td></tr>
+</table>
+
+<h3>5. The edge is where auth lives</h3>
+<p>Engines stay dumb; the edge (or an AI gateway like LiteLLM in front of the router) enforces API keys, per-tenant rate limits, and usage metering. vLLM's <code>--api-key</code> is the last line, not the first — lesson 13 wires it.</p>
+
+<h2>Lab (labs/lab-12): hostnames and TLS on your stack</h2>
+<div class="lab">
+<div class="step"><h3>Install ingress-nginx (kind flavor)</h3><p>The advanced cluster maps 80/443. Apply the kind-specific manifest, wait for the controller.</p></div>
+<div class="step"><h3>Route by hostname</h3><p>Ingress with LLM-tuned annotations: <code>chat.llm.local</code> → open-webui, <code>api.llm.local</code> → vllm-router. Add both hosts to <code>/etc/hosts</code> → 127.0.0.1. Chat in the browser at <code>http://chat.llm.local</code> — no port numbers, like a real product.</p></div>
+<div class="step"><h3>cert-manager + self-signed CA</h3><p>Install cert-manager, create a CA <code>ClusterIssuer</code>, annotate the Ingress — TLS Secrets appear. <code>curl -k https://api.llm.local/v1/models</code>, then inspect the cert chain with <code>openssl s_client</code>.</p></div>
+<div class="step"><h3>Prove the streaming fix</h3><p>Stream a long generation through the edge with buffering ON vs OFF (flip the annotation) — watch tokens lump vs flow. This 2-minute demo is the whole "LLM edge" war story, self-inflicted safely.</p></div>
+</div>
+
+<h2>Check yourself</h2>
+<div class="quiz" data-quiz>
+  <div class="q">
+    <p class="stem">Users say "the answer appears all at once at the end". Edge suspect #1?</p>
+    <button class="opt" data-correct>Proxy buffering swallowing the SSE stream</button>
+    <button class="opt">Engine batching delaying the first token</button>
+    <button class="opt">TLS handshake overhead on each chunk</button>
+    <p class="explain">Buffering proxies hold the response until complete — streaming works end-to-end but LOOKS broken. Engine delay would push TTFT, not lump the whole answer.</p>
+  </div>
+  <div class="q">
+    <p class="stem">Gateway API over Ingress — the structural win?</p>
+    <button class="opt" data-correct>Role separation and typed routing resources</button>
+    <button class="opt">Faster data plane than Ingress controllers</button>
+    <button class="opt">Built-in certificate issuance without cert-manager</button>
+    <p class="explain">Gateway/HTTPRoute split ops from app teams and make weights/matches first-class API — no annotation soup. Data plane is the same proxies; certs still need an issuer.</p>
+  </div>
+  <div class="q">
+    <p class="stem">Where should per-tenant rate limiting live?</p>
+    <button class="opt" data-correct>Edge or gateway, before engines</button>
+    <button class="opt">Inside vLLM via engine arguments</button>
+    <button class="opt">In the client SDK by convention</button>
+    <p class="explain">Reject cheap at the edge before a request consumes expensive prefill compute. Engines can't see tenants; clients can't be trusted.</p>
+  </div>
+</div>
+
+<h2>Primary source</h2>
+<p><a href="https://kubernetes.github.io/ingress-nginx/user-guide/nginx-configuration/annotations/">ingress-nginx annotations reference</a> (skim, bookmark) + <a href="https://gateway-api.sigs.k8s.io/concepts/api-overview/">Gateway API overview</a>.</p>
+
+<h2>Next</h2>
+<p><a href="0013-security-multitenancy.html">Lesson 13</a>: lock it down — NetworkPolicy default-deny, RBAC audits, quotas, and engine auth.</p>
+
+<div class="lesson-footer"><p><a href="index.html">Course home</a> · lab: <code>labs/lab-12/</code></p></div>
+</div>
+<script src="../assets/quiz.js"></script>
+</body>
+</html>

@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lesson 19 — The Kubernetes Atlas: Everything Else an AI Engineer Needs</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<div class="page">
+
+<p class="lesson-kicker">SLM Production Stack · FINAL · Lesson 19 · ~2.5 h (atlas + lab)</p>
+<h1>The Kubernetes Atlas</h1>
+<p class="lesson-lede">Everything the course used but didn't teach, and everything real AI-infra work will throw at you next. Format: the map first (topic → what → when YOU need it), then deep spotlights on the five gaps that matter most for AI workloads, then a lab that touches four of them.</p>
+
+<h2>The map — workloads beyond Deployments</h2>
+<table>
+<tr><th>Topic</th><th>What it is</th><th>When an AI engineer needs it</th></tr>
+<tr><td><strong>StatefulSet</strong></td><td>Deployment with stable identity: pod-0, pod-1, each with its own PVC, ordered rollout</td><td>Distributed inference/training ranks, vector DBs, anything where "which replica am I" matters</td></tr>
+<tr><td><strong>Headless Service</strong></td><td><code>clusterIP: None</code> — DNS returns pod IPs directly, per-pod names (<code>pod-0.svc…</code>)</td><td>Rank-to-rank communication (Ray, NCCL bootstrap); pairs with StatefulSet</td></tr>
+<tr><td><strong>Job</strong></td><td>Run to completion; <code>completions</code>/<code>parallelism</code>/<code>backoffLimit</code></td><td>Batch inference, eval runs, model downloads, dataset preprocessing — half of ML compute is Jobs</td></tr>
+<tr><td><strong>CronJob</strong></td><td>Job on a schedule</td><td>Nightly evals, cache warmers, report generation</td></tr>
+<tr><td><strong>DaemonSet</strong></td><td>One pod per (matching) node</td><td>How the NVIDIA device plugin, node-exporter, CNI agents, log shippers actually run — you've been using four of them</td></tr>
+<tr><td><strong>LeaderWorkerSet (LWS)</strong></td><td>CRD: groups of leader+workers scheduled/scaled as a unit</td><td>THE emerging API for multi-node inference (TP×PP across nodes, lesson 16) — vLLM docs feature it</td></tr>
+<tr><td><strong>Kueue</strong></td><td>Job queueing: quotas, priorities, gang admission for batch</td><td>Shared GPU cluster with training + batch competing — who runs next and with how many GPUs</td></tr>
+<tr><td><strong>KubeRay / Ray on K8s</strong></td><td>Operator managing Ray clusters</td><td>vLLM multi-node backend; distributed data preprocessing; RLHF pipelines</td></tr>
+</table>
+
+<h2>The map — pod internals you skipped</h2>
+<table>
+<tr><th>Topic</th><th>What</th><th>AI-engineer trigger</th></tr>
+<tr><td><strong>Init containers</strong></td><td>Run-to-completion before main containers start</td><td>Pre-download model weights so the engine container starts hot; permissions fixups</td></tr>
+<tr><td><strong>Sidecar containers</strong></td><td>Long-running helpers (native support via restartPolicy: Always init)</td><td>Log shippers, proxies, LMCache-style cache agents next to engines</td></tr>
+<tr><td><strong>kubectl debug</strong> / ephemeral containers</td><td>Inject a debug container into a RUNNING pod</td><td>Distroless/minimal images with no shell — the only way in. <code>kubectl debug -it POD --image=busybox --target=vllm</code></td></tr>
+<tr><td><strong>Lifecycle hooks</strong> (preStop) + <code>terminationGracePeriodSeconds</code></td><td>Commands on shutdown; how long K8s waits before SIGKILL</td><td><em>Critical for LLMs:</em> in-flight generations need draining — default 30 s murders long generations mid-token (spotlight below)</td></tr>
+<tr><td><strong>PodDisruptionBudget</strong></td><td>"Never take more than N of these down voluntarily"</td><td>Node drains/upgrades can't kill your whole engine fleet at once</td></tr>
+<tr><td><strong>Rolling-update knobs</strong> (maxSurge / maxUnavailable)</td><td>How many extra/missing pods during rollout</td><td>GPU pods: maxSurge=1 costs a spare GPU; maxUnavailable=1 costs capacity — pick consciously</td></tr>
+<tr><td><strong>Downward API</strong></td><td>Expose pod name/IP/labels/resources as env or files</td><td>Engine logging its pod identity; rank derivation</td></tr>
+<tr><td><strong>Security context</strong> (runAsNonRoot, capabilities, seccomp)</td><td>Per-pod/container privilege bounds</td><td>SOC2 checklists; doronmak's chart sets these — now you know why</td></tr>
+</table>
+
+<h2>The map — platform machinery</h2>
+<table>
+<tr><th>Topic</th><th>What</th><th>Trigger</th></tr>
+<tr><td><strong>CRDs + operators</strong></td><td>Extend the API with your own kinds + a controller reconciling them</td><td>You already run five (Prometheus, cert-manager, Argo, Cilium, ServiceMonitor). production-stack ships an operator too. Spotlight below</td></tr>
+<tr><td><strong>Admission webhooks / policy</strong> (Kyverno, OPA, ValidatingAdmissionPolicy)</td><td>Intercept API writes: mutate or reject</td><td>"Every pod on GPU nodes MUST set limits" — enforced at admission, not in code review</td></tr>
+<tr><td><strong>Finalizers, ownerReferences, GC</strong></td><td>Deletion protocol; parent-child cleanup</td><td>Why a namespace hangs in Terminating; why deleting a Deployment kills its pods</td></tr>
+<tr><td><strong>API machinery: watch/informers</strong></td><td>The event stream every controller (and your router!) consumes</td><td>Writing anything that reacts to cluster state; interview depth</td></tr>
+<tr><td><strong>Kustomize</strong></td><td>Template-free YAML overlays (base + per-env patches); built into kubectl</td><td>The other half of the deploy-tooling world; Argo speaks both. Know Helm-vs-Kustomize trade</td></tr>
+<tr><td><strong>StorageClass / CSI / RWX</strong></td><td>Storage drivers; ReadWriteMany (NFS/EFS-class) volumes</td><td>The clean fix for your lab-06 RWO pain: shared model cache readable by all replicas</td></tr>
+<tr><td><strong>DRA (Dynamic Resource Allocation)</strong></td><td>The NEW device API replacing count-based GPU requests: ResourceClaims with parameters</td><td>The future of "give me an H100 with ≥40 GB free" — landing across 2025–2026 clusters; watch it</td></tr>
+<tr><td><strong>VPA</strong></td><td>Vertical autoscaler — adjusts requests from observed usage</td><td>Right-sizing CPU/mem requests fleet-wide; never with HPA on the same metric</td></tr>
+<tr><td><strong>Cluster Autoscaler / Karpenter</strong></td><td>Node-level autoscaling (mentioned lesson 11)</td><td>The other half of scale-to-zero economics</td></tr>
+<tr><td><strong>Node ops: cordon / drain / upgrades</strong></td><td>Mark unschedulable; evict respecting PDBs</td><td>Every managed-cluster upgrade; your lab drills it</td></tr>
+<tr><td><strong>kube-proxy / CoreDNS / eBPF dataplane</strong></td><td>How Services actually route; how DNS actually resolves</td><td>Debugging "Service exists but connection refused"; Cilium replaced kube-proxy on your own cluster</td></tr>
+<tr><td><strong>Service mesh (Istio/Linkerd) + mTLS</strong></td><td>Per-pod proxies: encryption, retries, traffic policy</td><td>Enterprise mandates; overlaps your netpol+ingress — know when it's overkill</td></tr>
+<tr><td><strong>Logging/tracing architecture</strong> (Loki/EFK, OpenTelemetry)</td><td>The other two observability pillars beside metrics</td><td>Correlate a slow request across UI → router → engine; vLLM has OTel hooks (lesson 20)</td></tr>
+<tr><td><strong>Multi-cluster / fleet</strong></td><td>Many clusters, one control layer (Argo multi-dest, Fleet, Karmada)</td><td>Region isolation, the hard-tenancy answer from lesson 13</td></tr>
+<tr><td><strong>API deprecations & upgrades</strong></td><td>Version skew policy, <code>kubectl convert</code>, deprecation warnings</td><td>The quarterly "will the upgrade break us" exercise</td></tr>
+</table>
+
+<h2>Spotlight 1 — Graceful shutdown for LLM engines</h2>
+<p>Termination sequence: pod marked Terminating → removed from Service endpoints → <strong>preStop hook runs</strong> → SIGTERM → grace period → SIGKILL. Default grace: 30 s. A 70B engine mid-generation on a long output needs minutes. The production pattern:</p>
+<pre><code>terminationGracePeriodSeconds: 300
+lifecycle:
+  preStop:
+    exec:
+      command: ["/bin/sh","-c","sleep 15"]  # let endpoint removal propagate
+                                            # before the engine even sees SIGTERM</code></pre>
+<p>Plus a PDB so drains never take the fleet below N−1. Without these, every node upgrade = user-visible failures. This is a 10-line diff worth a paragraph in your design doc.</p>
+
+<h2>Spotlight 2 — Jobs are half of AI compute</h2>
+<p>Evals, batch scoring, embeddings backfills, distillation data generation — none of it wants a Deployment. Jobs give you completion tracking, retry with <code>backoffLimit</code>, parallelism fan-out, and (with <code>Indexed</code> completion mode) a per-pod index — the poor man's rank. Add Kueue when multiple teams' Jobs compete for the same GPUs. Your lab runs a real batch-inference Job against the stack.</p>
+
+<h2>Spotlight 3 — Operators: the pattern behind everything you installed</h2>
+<p>CRD = new noun in the API (<code>ServiceMonitor</code>, <code>Certificate</code>, <code>Application</code>). Operator = controller making that noun true, in a loop, forever. That's the whole trick — the same reconciliation you watched in lesson 1, pointed at domain logic. production-stack's <code>operator/</code> directory manages engine fleets this way. You'll write a toy CRD in the lab to break the mystique; kubebuilder is the real tool when a team needs one.</p>
+
+<h2>Spotlight 4 — Init containers for weight pre-loading</h2>
+<p>Scaling lag (lesson 10's pain) is mostly weight-loading. Init-container pattern: a downloader image populates the PVC/hostPath cache BEFORE the engine container starts; combined with RWX storage or node-local caches, new replicas skip the download entirely. Streaming loaders (Run:ai model streamer, tensorizer — lesson 20) attack the same seconds.</p>
+
+<h2>Spotlight 5 — Helm vs Kustomize (the eternal interview question)</h2>
+<p>Helm: packaging + templating + lifecycle (installable product, values API — what you built). Kustomize: patch-based env overlays with zero templates (fleet configs, no chart to maintain). Real platforms: Helm for third-party software, Kustomize overlays (sometimes ON TOP of rendered Helm) for env-specific tweaks. Saying exactly that sentence settles the debate in most rooms.</p>
+
+<h2>Lab (labs/lab-19): touch four gaps</h2>
+<div class="lab">
+<div class="step"><h3>Batch inference Job</h3><p>Job (parallelism 2, completions 6) whose pods curl the router with prompts from a ConfigMap, writing outputs to a shared emptyDir→log. Watch <code>kubectl get jobs -w</code> count completions. Solution: <code>solutions/k8s-advanced/batch-job.yaml</code>.</p></div>
+<div class="step"><h3>Graceful drain drill</h3><p>Add preStop + 300 s grace + a PDB (<code>minAvailable: 1</code>) to the engine chart. Then <code>kubectl drain llm-stack-worker --ignore-daemonsets --delete-emptydir-data</code> mid-load: PDB paces the eviction, engine drains politely. <code>kubectl uncordon</code> after.</p></div>
+<div class="step"><h3>kubectl debug</h3><p><code>kubectl debug -it &lt;engine-pod&gt; -n llm --image=busybox --target=vllm</code> — poke <code>/proc</code>, see the engine's world from a sidecar that wasn't there a second ago.</p></div>
+<div class="step"><h3>Toy CRD</h3><p>Apply a <code>ModelEndpoint</code> CRD + one CR (solution provided). <code>kubectl get modelendpoints</code> — your own noun in the API. No controller yet; discuss with the teacher what the reconcile loop WOULD do (that conversation is the operator interview).</p></div>
+<div class="step"><h3>Gap map</h3><p><code>docs/k8s-gap-map.md</code>: for every atlas row — <em>know it / can use it / need study</em> + one line on when your stack would need it. This honesty document drives your revision plan.</p></div>
+</div>
+
+<h2>Check yourself</h2>
+<div class="quiz" data-quiz>
+  <div class="q">
+    <p class="stem">Node upgrade killed generations mid-token despite a PDB. Missing piece?</p>
+    <button class="opt" data-correct>Grace period and preStop drain timing</button>
+    <button class="opt">Second PDB covering the router pods</button>
+    <button class="opt">Anti-affinity keeping replicas on nodes</button>
+    <p class="explain">PDB paces HOW MANY pods evict — not how gently each dies. In-flight work needs terminationGracePeriodSeconds + preStop drain.</p>
+  </div>
+  <div class="q">
+    <p class="stem">Nightly eval over 10k prompts across 4 workers. Right primitive?</p>
+    <button class="opt" data-correct>Indexed Job under a CronJob</button>
+    <button class="opt">Deployment scaled to four replicas</button>
+    <button class="opt">StatefulSet with four ordered pods</button>
+    <p class="explain">Run-to-completion + parallelism + per-pod index for sharding = Job; CronJob schedules it. Deployments never finish; StatefulSets solve identity, not completion.</p>
+  </div>
+  <div class="q">
+    <p class="stem">What turns a CRD into an operator?</p>
+    <button class="opt" data-correct>A controller reconciling the custom resources</button>
+    <button class="opt">An admission webhook validating the schema</button>
+    <button class="opt">Registration in an operator marketplace catalog</button>
+    <p class="explain">CRD alone is inert storage (your lab proves it). The operator IS the reconcile loop watching those objects and making reality match.</p>
+  </div>
+</div>
+
+<h2>Primary source</h2>
+<p>This lesson's map IS the reading list. Priority order for an AI engineer: <a href="https://kubernetes.io/docs/concepts/workloads/controllers/job/">Jobs</a> → <a href="https://kubernetes.io/docs/tasks/run-application/configure-pdb/">PDBs</a> → <a href="https://kubernetes.io/docs/concepts/extend-kubernetes/api-extension/custom-resources/">Custom Resources</a> → <a href="https://lws.sigs.k8s.io/">LeaderWorkerSet</a> → <a href="https://kueue.sigs.k8s.io/">Kueue</a> → <a href="https://kubernetes.io/docs/concepts/scheduling-eviction/dynamic-resource-allocation/">DRA</a>.</p>
+
+<h2>Next</h2>
+<p><a href="0020-vllm-atlas.html">Lesson 20</a> — the final one: the vLLM atlas.</p>
+
+<div class="lesson-footer"><p><a href="index.html">Course home</a> · lab: <code>labs/lab-19/</code></p></div>
+</div>
+<script src="../assets/quiz.js"></script>
+</body>
+</html>

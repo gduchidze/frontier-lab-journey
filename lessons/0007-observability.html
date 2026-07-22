@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lesson 7 — Observability: Prometheus + Grafana</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<div class="page">
+
+<p class="lesson-kicker">SLM Production Stack · Lesson 7 · Phase 7 · ~2 h</p>
+<h1>Observability: Prometheus + Grafana</h1>
+<p class="lesson-lede">Every serious inference platform answers three questions continuously: how fast (TTFT, latency), how loaded (running/pending requests, KV cache usage), how healthy (up, error rate). Today you build the system that answers them.</p>
+
+<h2>Knowledge: the scrape model</h2>
+
+<h3>1. Pull, not push</h3>
+<p>Prometheus <em>scrapes</em>: every N seconds it GETs <code>/metrics</code> from each target and stores the time series. vLLM already exposes this endpoint (you curled it in lesson 3) — zero instrumentation work. The router exposes its own per-engine stats too.</p>
+
+<h3>2. Metric types you'll actually read</h3>
+<table>
+<tr><th>Type</th><th>Shape</th><th>vLLM example</th></tr>
+<tr><td>Gauge</td><td>Value right now, up and down</td><td><code>vllm:num_requests_running</code>, <code>vllm:kv_cache_usage_perc</code></td></tr>
+<tr><td>Counter</td><td>Only ever increases → read as <code>rate()</code></td><td><code>vllm:prompt_tokens_total</code>, <code>vllm:request_success_total</code></td></tr>
+<tr><td>Histogram</td><td>Buckets → read as <code>histogram_quantile()</code></td><td><code>vllm:time_to_first_token_seconds</code>, <code>vllm:e2e_request_latency_seconds</code></td></tr>
+</table>
+<p>Full metric list: <a href="https://docs.vllm.ai/en/latest/usage/metrics.html">vLLM production metrics docs</a> · condensed table in the <a href="../reference/observability-cheatsheet.html">observability reference</a>.</p>
+
+<h3>3. PromQL, the 3 patterns that cover 90%</h3>
+<pre><code># current load per engine (gauge, as-is)
+vllm:num_requests_running
+
+# throughput: tokens/sec over 1m window (counter → rate)
+rate(vllm:generation_tokens_total[1m])
+
+# P90 TTFT over 5m (histogram → quantile)
+histogram_quantile(0.9, rate(vllm:time_to_first_token_seconds_bucket[5m]))</code></pre>
+
+<h3>4. ServiceMonitor: telling Prometheus what to scrape, the K8s way</h3>
+<p>The <strong>kube-prometheus-stack</strong> Helm chart installs Prometheus + Grafana + the Prometheus Operator. The Operator watches for <strong>ServiceMonitor</strong> objects — a manifest saying "scrape Services matching these labels on this port". Declarative scrape config, same philosophy as everything else you've built.</p>
+
+<h2>Lab: lights on</h2>
+
+<div class="lab">
+
+<div class="step">
+<h3>Install kube-prometheus-stack</h3>
+<pre><code>helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+helm repo update
+helm install kps prometheus-community/kube-prometheus-stack \
+  --namespace monitoring --create-namespace \
+  --set grafana.adminPassword=admin \
+  --set prometheus.prometheusSpec.serviceMonitorSelectorNilUsesHelmValues=false
+kubectl get pods -n monitoring -w     # wait until all Running (2-3 min)</code></pre>
+<p class="expect">expect: prometheus, grafana, operator, kube-state-metrics, node-exporter pods Running</p>
+<div class="note"><strong>That last --set flag</strong>
+By default the chart only scrapes ServiceMonitors carrying its own release label. Setting the selector to nil-uses-false = "scrape ANY ServiceMonitor". Saves you the classic "my target never appears" hour.</div>
+</div>
+
+<div class="step">
+<h3>Point Prometheus at vLLM</h3>
+<p>Save as <code>k8s/vllm-servicemonitor.yaml</code>:</p>
+<pre><code>apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: vllm
+  namespace: llm
+  labels: { app: vllm }
+spec:
+  selector:
+    matchLabels: { app: vllm }
+  endpoints:
+  - port: "8000"
+    path: /metrics
+    interval: 15s</code></pre>
+<div class="warning"><strong>Port must be NAMED</strong>
+ServiceMonitor's <code>port:</code> refers to a Service port <em>name</em>, not number. Add <code>name: http</code> to the port in your vllm Service template, use <code>port: http</code> here. This mismatch is the #1 ServiceMonitor gotcha.</div>
+<pre><code>kubectl apply -f k8s/vllm-servicemonitor.yaml</code></pre>
+</div>
+
+<div class="step">
+<h3>Verify the target, run first queries</h3>
+<pre><code>kubectl port-forward -n monitoring svc/kps-kube-prometheus-stack-prometheus 9090:9090</code></pre>
+<p>Open <a href="http://localhost:9090/targets">localhost:9090/targets</a> → your vllm endpoints should show <strong>UP</strong> (give it ~30s). Then in the Graph tab, run each of the 3 PromQL patterns from the knowledge section. Generate some traffic through the router first so the graphs move:</p>
+<pre><code>for i in $(seq 1 10); do curl -s localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"Qwen/Qwen3.5-0.8B","messages":[{"role":"user","content":"Tell me a 50 word story."}],"max_tokens":80}' &gt; /dev/null &amp; done</code></pre>
+</div>
+
+<div class="step">
+<h3>Grafana: build the inference dashboard</h3>
+<pre><code>kubectl port-forward -n monitoring svc/kps-grafana 3000:80</code></pre>
+<p>Login at <a href="http://localhost:3000">localhost:3000</a> (admin / admin). Two paths — do both:</p>
+<p><strong>a) Import the reference dashboard.</strong> production-stack ships one: download <a href="https://github.com/vllm-project/production-stack/tree/main/observability">observability/vllm-dashboard.json</a> from the repo → Grafana → Dashboards → Import → upload. Instant panels: TTFT distribution, running/pending requests, healthy instances.</p>
+<p><strong>b) Build one panel yourself</strong> (this is the skill): New dashboard → Add visualization → datasource Prometheus → query:</p>
+<pre><code>histogram_quantile(0.9, sum(rate(vllm:time_to_first_token_seconds_bucket[5m])) by (le))</code></pre>
+<p>Title it "P90 TTFT", unit seconds, save dashboard as <em>SLM Stack</em>.</p>
+<p class="expect">expect: live TTFT curve that spikes when you fire the traffic loop</p>
+<div class="win"><strong>The win</strong>
+The production-stack README screenshot — available instances, TTFT distribution, pending requests — is now running on YOUR cluster, watching YOUR engines. Screenshot it for the portfolio README.</div>
+</div>
+
+<div class="step">
+<h3>Load-and-watch drill (10 min)</h3>
+<p>Split screen: Grafana left, terminal right. Fire 20 concurrent requests. Narrate what you see: pending queue rises → running plateaus at engine capacity → TTFT P90 climbs → drains. This narration is <em>exactly</em> what an SRE interview asks you to do with a dashboard.</p>
+</div>
+
+</div>
+
+<h2>Check yourself</h2>
+<div class="quiz" data-quiz>
+  <div class="q">
+    <p class="stem">Why must counters be wrapped in rate() to be useful?</p>
+    <button class="opt" data-correct>Raw value only accumulates since start</button>
+    <button class="opt">Prometheus stores counters at lower resolution</button>
+    <button class="opt">Counters reset between each scrape interval</button>
+    <p class="explain">A counter is a lifetime total — its slope (rate) is the meaningful signal. rate() also handles restarts (counter resets) gracefully.</p>
+  </div>
+  <div class="q">
+    <p class="stem">ServiceMonitor applied, target never appears in Prometheus. First check?</p>
+    <button class="opt" data-correct>Port name matches Service port name</button>
+    <button class="opt">Pod exposes metrics on privileged port</button>
+    <button class="opt">Grafana datasource points at Prometheus</button>
+    <p class="explain">Named-port mismatch (or label-selector mismatch) causes silent non-discovery. Grafana is downstream — irrelevant to target discovery.</p>
+  </div>
+  <div class="q">
+    <p class="stem">TTFT P90 rising while num_requests_waiting grows means…</p>
+    <button class="opt" data-correct>Engines saturated, requests queue before prefill</button>
+    <button class="opt">Network latency between router and engines</button>
+    <button class="opt">KV cache fragmentation slowing token generation</button>
+    <p class="explain">Waiting queue growth = admission backlog; time in queue lands in TTFT. Network latency is milliseconds, and PagedAttention already prevents fragmentation.</p>
+  </div>
+</div>
+
+<h2>Primary source</h2>
+<p><a href="https://docs.vllm.ai/en/latest/usage/metrics.html">vLLM Production Metrics</a> + <a href="https://prometheus.io/docs/prometheus/latest/querying/basics/">PromQL basics</a>. Optional gold: production-stack's <a href="https://github.com/vllm-project/production-stack/tree/main/observability">observability/</a> folder — their exact dashboard JSON and install script.</p>
+
+<h2>Next</h2>
+<p><a href="0008-ui-openwebui.html">Lesson 8</a>: a real chat UI on top of the router — the stack becomes a product.</p>
+
+<div class="lesson-footer">
+<p>References: <a href="../reference/observability-cheatsheet.html">observability cheat sheet</a>.</p>
+<p>Dashboard empty? Paste your ServiceMonitor + Service YAML to your teacher.</p>
+</div>
+
+</div>
+<script src="../assets/quiz.js"></script>
+</body>
+</html>

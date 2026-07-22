@@ -1,0 +1,50 @@
+# Lab 17 — PrometheusRule: burn-rate page + cause diagnostics.
+# SLO here: 95% of requests get TTFT < 10s (CPU-realistic). 1−SLO = 0.05.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: slm-slo-alerts
+  namespace: llm
+  labels: { app: vllm }
+spec:
+  groups:
+  - name: slo-burn
+    rules:
+    - alert: HighTTFTBurnRate
+      expr: |
+        (
+          1 - (
+            sum(rate(vllm:time_to_first_token_seconds_bucket{le="10.0"}[1h]))
+            /
+            sum(rate(vllm:time_to_first_token_seconds_count[1h]))
+          )
+        ) > (14.4 * 0.05)
+        and
+        (
+          1 - (
+            sum(rate(vllm:time_to_first_token_seconds_bucket{le="10.0"}[5m]))
+            /
+            sum(rate(vllm:time_to_first_token_seconds_count[5m]))
+          )
+        ) > (14.4 * 0.05)
+      for: 2m
+      labels: { severity: page }
+      annotations:
+        summary: "TTFT SLO burning 14.4x too fast"
+        runbook_url: "runbooks/high-ttft.md"
+  - name: diagnostics
+    rules:
+    - alert: VLLMEngineDown
+      expr: up{namespace="llm"} == 0
+      for: 2m
+      labels: { severity: ticket }
+      annotations:
+        summary: "vLLM engine target down"
+        runbook_url: "runbooks/engine-down.md"
+    - alert: QueueBacklog
+      expr: sum(vllm:num_requests_waiting) > 10
+      for: 5m
+      labels: { severity: ticket }
+      annotations:
+        summary: "Request queue backing up — nearing saturation"
+        runbook_url: "runbooks/high-ttft.md"

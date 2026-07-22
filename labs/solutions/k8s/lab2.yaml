@@ -1,0 +1,63 @@
+# Lab 02 — production-shaped hello app
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: llm
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: hello-config
+  namespace: llm
+data:
+  index.html: |
+    <h1>Served by Kubernetes, configured by ConfigMap</h1>
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hello
+  namespace: llm
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app: hello }
+  template:
+    metadata:
+      labels: { app: hello }
+    spec:
+      containers:
+      - name: web
+        image: nginx:alpine
+        ports:
+        - containerPort: 80
+        resources:
+          requests: { cpu: 100m, memory: 64Mi }
+          limits:   { cpu: 500m, memory: 128Mi }
+        startupProbe:
+          httpGet: { path: /, port: 80 }
+          periodSeconds: 2
+          failureThreshold: 15
+        readinessProbe:
+          httpGet: { path: /, port: 80 }
+          periodSeconds: 5
+        livenessProbe:
+          httpGet: { path: /, port: 80 }
+          periodSeconds: 10
+        volumeMounts:
+        - name: content
+          mountPath: /usr/share/nginx/html
+      volumes:
+      - name: content
+        configMap: { name: hello-config }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: hello
+  namespace: llm
+spec:
+  selector: { app: hello }
+  ports:
+  - port: 80
+    targetPort: 80

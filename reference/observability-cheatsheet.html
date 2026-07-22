@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Reference — Observability Cheat Sheet</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<div class="page">
+
+<p class="lesson-kicker">SLM Production Stack · Reference</p>
+<h1>Observability Cheat Sheet</h1>
+<p class="lesson-lede">PromQL patterns, serving-metric definitions, and the queries behind every dashboard panel in this course.</p>
+
+<h2>The 3 PromQL patterns (cover ~90% of use)</h2>
+<pre><code># 1. GAUGE — read as-is, aggregate across pods
+sum(vllm:num_requests_running)
+vllm:kv_cache_usage_perc                       # per-engine, labeled by pod
+
+# 2. COUNTER — always wrap in rate() over a window
+rate(vllm:generation_tokens_total[1m])         # output tokens/sec
+sum(rate(vllm:request_success_total[5m]))      # completed req/sec
+
+# 3. HISTOGRAM — quantile over rate of buckets
+histogram_quantile(0.9,
+  sum(rate(vllm:time_to_first_token_seconds_bucket[5m])) by (le))</code></pre>
+<p>Rules of thumb: window ≥ 2× scrape interval · <code>by (le)</code> is mandatory in the quantile pattern · <code>sum(... ) by (pod)</code> to split lines per engine.</p>
+
+<h2>Serving metrics — definitions and healthy shapes</h2>
+<table>
+<tr><th>Number</th><th>Definition</th><th>Watch for</th></tr>
+<tr><td>TTFT</td><td>Request sent → first token</td><td>P90 hockey-stick = queueing (saturation)</td></tr>
+<tr><td>TPOT / ITL</td><td>Per-token time after the first</td><td>Creeps up as batch grows — throughput/latency trade</td></tr>
+<tr><td>Throughput</td><td>tok/s or req/s systemwide</td><td>Plateau while offered load rises = capacity found</td></tr>
+<tr><td>Goodput</td><td>Throughput meeting SLO</td><td>The honest number to report</td></tr>
+<tr><td>Queue depth</td><td><code>num_requests_waiting</code></td><td>Sustained &gt; 0 and climbing = saturated</td></tr>
+<tr><td>KV usage</td><td><code>kv_cache_usage_perc</code></td><td>Near 1.0 → preemptions/evictions begin</td></tr>
+</table>
+
+<h2>Dashboard panel recipes (Grafana)</h2>
+<table>
+<tr><th>Panel</th><th>Query</th></tr>
+<tr><td>P50/P90/P99 TTFT</td><td><code>histogram_quantile(0.5|0.9|0.99, sum(rate(vllm:time_to_first_token_seconds_bucket[5m])) by (le))</code></td></tr>
+<tr><td>Tokens/sec</td><td><code>sum(rate(vllm:generation_tokens_total[1m]))</code></td></tr>
+<tr><td>Running vs waiting</td><td><code>sum(vllm:num_requests_running)</code> and <code>sum(vllm:num_requests_waiting)</code>, two series</td></tr>
+<tr><td>Per-engine load</td><td><code>vllm:num_requests_running</code> (legend <code>{{pod}}</code>)</td></tr>
+<tr><td>KV cache %</td><td><code>avg(vllm:kv_cache_usage_perc) * 100</code>, unit percent</td></tr>
+<tr><td>Healthy engines</td><td><code>count(up{job=~".*vllm.*"} == 1)</code></td></tr>
+<tr><td>Error rate</td><td><code>sum(rate(vllm:request_failure_total[5m]))</code> (name varies — grep /metrics)</td></tr>
+</table>
+
+<h2>Access ritual (this cluster)</h2>
+<pre><code># Prometheus UI
+kubectl port-forward -n monitoring svc/kps-kube-prometheus-stack-prometheus 9090:9090
+# → localhost:9090  (/targets to verify scraping)
+
+# Grafana
+kubectl port-forward -n monitoring svc/kps-grafana 3000:80
+# → localhost:3000  admin / admin (set at install)</code></pre>
+
+<h2>Scrape-debugging checklist (target missing/DOWN)</h2>
+<ol>
+<li>ServiceMonitor <code>selector.matchLabels</code> matches the <strong>Service's</strong> labels (not the Pod's)?</li>
+<li><code>endpoints.port</code> is the Service port <strong>name</strong> (not a number)?</li>
+<li>Installed with <code>serviceMonitorSelectorNilUsesHelmValues=false</code> (or ServiceMonitor carries the release label)?</li>
+<li>Endpoint actually serves: <code>kubectl exec ... -- curl -s localhost:8000/metrics | head</code>?</li>
+<li>Pod Ready? Not-Ready pods drop out of Service endpoints → nothing to scrape.</li>
+</ol>
+
+<h2>Glossary</h2>
+<table>
+<tr><td>Scrape</td><td>Prometheus pulling /metrics from a target on an interval</td></tr>
+<tr><td>Target</td><td>One endpoint Prometheus scrapes (per Pod, usually)</td></tr>
+<tr><td>Series</td><td>One metric + one unique label set over time</td></tr>
+<tr><td>ServiceMonitor</td><td>CRD declaring "scrape Services matching these labels"</td></tr>
+<tr><td>Quantile / P90</td><td>Value 90% of samples fall under</td></tr>
+<tr><td>SLO</td><td>Target on a metric ("P90 TTFT &lt; 4s") that gates goodput</td></tr>
+</table>
+
+<div class="lesson-footer">
+<p><a href="../lessons/index.html">Course home</a> · <a href="https://docs.vllm.ai/en/latest/usage/metrics.html">vLLM metrics docs</a> · <a href="https://prometheus.io/docs/prometheus/latest/querying/basics/">PromQL basics</a></p>
+</div>
+
+</div>
+</body>
+</html>

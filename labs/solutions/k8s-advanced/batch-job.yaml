@@ -1,0 +1,53 @@
+# Lab 19 — batch inference as an Indexed Job (2 workers, 6 completions)
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: eval-prompts
+  namespace: llm
+data:
+  prompts.txt: |
+    What is a Pod in one sentence?
+    Explain PagedAttention in one sentence.
+    What does a readiness probe control?
+    Why pin a model revision?
+    What is continuous batching?
+    Name the four LLM serving metrics.
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: batch-eval
+  namespace: llm
+spec:
+  completions: 6
+  parallelism: 2
+  completionMode: Indexed        # JOB_COMPLETION_INDEX = which prompt is mine
+  backoffLimit: 3
+  template:
+    metadata:
+      labels: { job-name: batch-eval }
+    spec:
+      restartPolicy: OnFailure
+      containers:
+      - name: eval
+        image: curlimages/curl
+        command:
+        - /bin/sh
+        - -c
+        - |
+          IDX=$((JOB_COMPLETION_INDEX + 1))
+          PROMPT=$(sed -n "${IDX}p" /prompts/prompts.txt)
+          echo "[$IDX] PROMPT: $PROMPT"
+          curl -s -m 120 http://vllm-router.llm.svc.cluster.local/v1/chat/completions \
+            -H "Content-Type: application/json" \
+            -d "{\"model\":\"Qwen/Qwen3.5-0.8B\",\"messages\":[{\"role\":\"user\",\"content\":\"$PROMPT\"}],\"max_tokens\":60}" \
+            | sed 's/.*"content":"\([^"]*\)".*/[COMPLETION] \1/'
+        resources:
+          requests: { cpu: 50m, memory: 32Mi }
+          limits:   { cpu: 200m, memory: 64Mi }
+        volumeMounts:
+        - name: prompts
+          mountPath: /prompts
+      volumes:
+      - name: prompts
+        configMap: { name: eval-prompts }

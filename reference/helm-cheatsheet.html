@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Reference — Helm Cheat Sheet</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<div class="page">
+
+<p class="lesson-kicker">SLM Production Stack · Reference</p>
+<h1>Helm Cheat Sheet</h1>
+<p class="lesson-lede">Commands, chart layout, and the template syntax survival kit. Canonical: <a href="https://helm.sh/docs/">helm.sh/docs</a>.</p>
+
+<h2>Commands</h2>
+<table>
+<tr><th>Command</th><th>What</th></tr>
+<tr><td><code>helm install NAME ./chart</code></td><td>Render + apply as release NAME</td></tr>
+<tr><td><code>helm install NAME repo/chart -f values.yaml</code></td><td>Install from repo with value overrides</td></tr>
+<tr><td><code>helm upgrade NAME ./chart --set a.b=c</code></td><td>Apply changes (new revision)</td></tr>
+<tr><td><code>helm rollback NAME [REV]</code></td><td>Revert to previous / given revision</td></tr>
+<tr><td><code>helm history NAME</code></td><td>Revision log</td></tr>
+<tr><td><code>helm list -A</code></td><td>All releases, all namespaces</td></tr>
+<tr><td><code>helm uninstall NAME</code></td><td>Delete release resources</td></tr>
+<tr><td><code>helm template ./chart</code></td><td>Render locally, no cluster — debugging #1</td></tr>
+<tr><td><code>helm lint ./chart</code></td><td>Static checks</td></tr>
+<tr><td><code>helm get values NAME</code></td><td>Values a release was installed with</td></tr>
+<tr><td><code>helm repo add NAME URL && helm repo update</code></td><td>Register chart repo</td></tr>
+</table>
+
+<h2>Chart layout</h2>
+<pre><code>charts/slm-stack/
+├── Chart.yaml          # name, version (chart), appVersion (software)
+├── values.yaml         # default knobs — the chart's public API
+├── templates/          # manifests with {{ }} holes
+│   ├── _helpers.tpl    # named template snippets (define/include)
+│   ├── vllm-deployment.yaml
+│   ├── vllm-service.yaml
+│   └── vllm-pvc.yaml
+└── charts/             # subchart dependencies</code></pre>
+
+<h2>Template syntax survival kit</h2>
+<pre><code>{{ .Values.vllm.model.name }}            # value lookup
+{{ .Values.tag | default "latest" }}     # pipe through function
+{{ .Values.model.name | quote }}         # always quote strings you don't control
+{{ .Release.Name }} {{ .Release.Namespace }}   # install-time context
+{{ .Chart.Name }} {{ .Chart.Version }}
+
+# whole-block YAML insertion — indentation is THE classic bug:
+resources:
+  {{- toYaml .Values.vllm.resources | nindent 10 }}
+#  ^ "-" trims preceding whitespace/newline; nindent N re-indents block to N
+
+# conditionals / loops
+{{- if .Values.dashboard.enabled }} ... {{- end }}
+{{- range $key, $val := .Values.env }}
+- name: {{ $key }}
+  value: {{ $val | quote }}
+{{- end }}</code></pre>
+
+<h2>Values precedence (low → high)</h2>
+<ol>
+<li><code>values.yaml</code> in the chart</li>
+<li><code>-f my-values.yaml</code> (last file wins if several)</li>
+<li><code>--set key=value</code></li>
+</ol>
+
+<h2>Debug ritual</h2>
+<pre><code>helm lint ./chart                        # 1. static errors
+helm template ./chart | less             # 2. is generated YAML right?
+helm template ./chart | kubectl apply --dry-run=server -f -   # 3. would API accept it?
+helm upgrade NAME ./chart --debug        # 4. verbose install</code></pre>
+
+<h2>Charts used in this course</h2>
+<table>
+<tr><th>Chart</th><th>Repo</th><th>Lesson</th></tr>
+<tr><td><code>charts/slm-stack</code></td><td>yours</td><td>5</td></tr>
+<tr><td><code>kube-prometheus-stack</code></td><td>prometheus-community</td><td>7</td></tr>
+<tr><td><code>metrics-server</code></td><td>metrics-server</td><td>10</td></tr>
+<tr><td><code>keda</code></td><td>kedacore</td><td>10 (stretch)</td></tr>
+<tr><td><code>vllm-stack</code></td><td>vllm (production-stack)</td><td>study material, lessons 5–6</td></tr>
+</table>
+
+<div class="lesson-footer">
+<p><a href="../lessons/index.html">Course home</a> · study: <a href="https://github.com/vllm-project/production-stack/blob/main/helm/values.yaml">production-stack values.yaml</a>, <a href="https://github.com/doronmak/VLLM-Kubernetes-Deployment/tree/main/charts/vllm-demo">doronmak vllm-demo chart</a></p>
+</div>
+
+</div>
+</body>
+</html>

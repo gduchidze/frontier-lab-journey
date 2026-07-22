@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lesson 18 — Cost, Capacity, and the Senior Capstone</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<div class="page">
+
+<p class="lesson-kicker">SLM Production Stack · ADVANCED · Lesson 18 · ~3 h + writeup</p>
+<h1>Cost, Capacity, and the Senior Capstone</h1>
+<p class="lesson-lede">Every architecture decision in this course was secretly a cost decision. The final lesson makes the money explicit — $/million tokens, build vs buy, capacity planning — and ends with the artifact that closes the loop: a platform design doc you defend in a mock interview.</p>
+
+<h2>Knowledge</h2>
+
+<h3>1. The unit economics of a token</h3>
+<pre><code>$/1M output tokens ≈ (GPU $/hr × num_GPUs) / (throughput tok/s × 3600) × 1e6
+
+H100 @ ~$2.5/hr, 70B fp8 TP=2 doing ~2500 tok/s:
+  (2.5 × 2) / (2500 × 3600) × 1e6  ≈  $0.56 / 1M output tokens — at 100% utilization</code></pre>
+<p>The killer variable is <strong>utilization</strong>. At 20% average load your real cost is 5× the napkin number — and 20–40% is TYPICAL for diurnal chat traffic. Everything you built exists to push that number up: continuous batching (lesson 3), routing (6), autoscaling (10), bin-packing (11), disaggregation (16).</p>
+
+<h3>2. Levers, ranked by how often they win</h3>
+<table>
+<tr><th>Lever</th><th>Typical gain</th><th>You learned it in</th></tr>
+<tr><td>Right-size the model (0.8B where 70B was reflex; distill/fine-tune)</td><td>10–100×</td><td>the whole course's premise</td></tr>
+<tr><td>Utilization: autoscale + bin-pack + scale-to-zero off-peak</td><td>2–5×</td><td>10, 11</td></tr>
+<tr><td>Quantization (fp8 weights + KV)</td><td>~2× capacity/GPU</td><td>15</td></tr>
+<tr><td>Prefix/KV caching for shared-context workloads</td><td>1.5–10× on prefill</td><td>6, 15, 16</td></tr>
+<tr><td>Spot/preemptible for batch + stateless replicas</td><td>~3× on those pools</td><td>11 (priorities make it safe)</td></tr>
+<tr><td>Batch tier: overnight queue for non-interactive work</td><td>fills the utilization valleys</td><td>17 (SLO tiers)</td></tr>
+</table>
+
+<h3>3. Build vs buy, without religion</h3>
+<pre><code>API cost/mo  = tokens/mo × $/token           (scales with usage, zero floor)
+Self-host/mo = GPUs × $/hr × 730 + eng_time  (scales with PEAK capacity, high floor)</code></pre>
+<p>Breakeven usually lands at sustained <em>hundreds of millions</em> of tokens/month — but the decision is rarely pure math: data governance (prompts leave your VPC?), latency control, model customization (LoRA fleets), and rate-limit sovereignty all push build; spiky/low volume and zero infra headcount push buy. The senior answer is a table, not a slogan — and "start on APIs, instrument usage, revisit at the breakeven curve" is usually the honest recommendation.</p>
+
+<h3>4. Capacity planning as a repeatable procedure</h3>
+<pre><code>1. Forecast: peak RPS, tokens in/out distribution, growth, tenant mix
+2. Measure:  bench ONE replica on target hardware (lesson 9 — you know how)
+3. Divide:   replicas = peak_demand / per-replica goodput (at SLO, not at max!)
+4. Headroom: ×1.3–1.5 for N-1 failures, deploys, cache warmup (lesson 10's lesson)
+5. Re-run:   every model change, quantization change, workload drift</code></pre>
+<p>Per-replica <em>goodput at SLO</em> — the knee from your lesson-9 curve, not the peak — is the number that goes in the spreadsheet. You've already measured one; most engineers never have.</p>
+
+<h3>5. The design doc is the senior deliverable</h3>
+<p>Working structure: Context & requirements → SLOs → Architecture (+ the two designs you rejected and why) → Capacity & cost model → Failure modes & blast radii → Security/tenancy → Rollout & operations → Open questions. If lessons 11–17 each left you an artifact, this doc mostly assembles them — that was the plan all along.</p>
+
+<h2>Lab (labs/lab-18): the senior capstone</h2>
+<div class="lab">
+<div class="step"><h3>Cost model</h3><p><code>docs/cost-model.md</code>: three scenarios — (a) your actual CPU stack (Mac amortization! electricity! it's not $0); (b) same product on 2×A10 cloud; (c) 70B-fp8 API-vs-self-host breakeven curve with the crossover point computed. Tables + stated assumptions.</p></div>
+<div class="step"><h3>The design prompt</h3><p><code>docs/platform-design.md</code> — treat as a real take-home: <em>"Design the inference platform for a chat+API product: 3 models (0.8B, 8B, 70B), 5k peak RPS mostly on the small models, P90 TTFT &lt; 1.5s interactive tier, batch tier overnight, 3 enterprise tenants needing isolation, SOC2 on the horizon, budget-conscious CFO."</em> Full structure from §5. Every section must cite a lesson artifact (SLO doc, tuning report, distributed-design doc, netpol diagram, cost model).</p></div>
+<div class="step"><h3>The defense</h3><p>Mock interview with your teacher: 45 min, whiteboard-style. Expect: "walk me through a request", "engine fleet OOMs at 2 AM — go", "CFO cuts GPU budget 40% — what degrades first and how do you choose", "why not just use the OpenAI API for all three models?". Revise the doc after. Round 2 if it went badly — that's not failure, that's the drill working.</p></div>
+<div class="step"><h3>Ship the portfolio</h3><p>Final repo pass: README links the design doc, tuning report, chaos-day postmortem, benchmark tables, Grafana screenshots. Pin it on GitHub. Post to r/LocalLLaMA / vLLM Slack — external eyes are the wisdom step, and the feedback thread itself becomes portfolio evidence.</p></div>
+</div>
+
+<h2>Check yourself</h2>
+<div class="quiz" data-quiz>
+  <div class="q">
+    <p class="stem">Napkin says $0.56/1M tokens; the bill implies $2.80. Most likely gap?</p>
+    <button class="opt" data-correct>Fleet utilization far below one hundred</button>
+    <button class="opt">Cloud egress fees on token responses</button>
+    <button class="opt">Prefill tokens billed at decode rates</button>
+    <p class="explain">5× gap ≈ 20% utilization — the classic diurnal-traffic number. The napkin assumed the GPUs never idle; they mostly do. Egress on text is pennies.</p>
+  </div>
+  <div class="q">
+    <p class="stem">Capacity plan divides demand by which per-replica number?</p>
+    <button class="opt" data-correct>Goodput at the SLO knee</button>
+    <button class="opt">Peak throughput at full saturation</button>
+    <button class="opt">Mean throughput across the day</button>
+    <p class="explain">Beyond the knee you serve tokens that violate the SLO — capacity that "exists" but can't be sold. Planning on saturation throughput bakes in SLO breaches at peak.</p>
+  </div>
+  <div class="q">
+    <p class="stem">Strongest single argument for self-hosting despite API convenience?</p>
+    <button class="opt" data-correct>Prompts and data never leave boundary</button>
+    <button class="opt">Self-hosted models always cost less</button>
+    <button class="opt">APIs cannot serve fine-tuned models</button>
+    <p class="explain">Governance is binary and non-negotiable for some buyers; cost flips with volume, and API vendors do host fine-tunes. When data-residency is the requirement, the math becomes secondary.</p>
+  </div>
+</div>
+
+<h2>Primary source</h2>
+<p><a href="https://sre.google/workbook/capacity-planning/">SRE Workbook — Capacity Planning</a> + current GPU pricing pages (Lambda, RunPod, CoreWeave) for live numbers in your cost model.</p>
+
+<h2>Next</h2>
+<p>Two final atlas lessons map everything the course didn't cover: <a href="0019-k8s-atlas.html">Lesson 19 — the Kubernetes Atlas</a> and <a href="0020-vllm-atlas.html">Lesson 20 — the vLLM Atlas</a>.</p>
+
+<h2>The end — and the loop</h2>
+<p>Advanced final exam, two weeks out: delete everything, rebuild base + advanced stack from your docs alone, then re-defend the design doc cold. After that you're not a student of this stack; you're its author. Time to interview.</p>
+
+<div class="lesson-footer"><p><a href="index.html">Course home</a> · lab: <code>labs/lab-18/</code> · <a href="../MISSION.md">mission — go check it off</a></p></div>
+</div>
+<script src="../assets/quiz.js"></script>
+</body>
+</html>

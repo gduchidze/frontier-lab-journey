@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Reference — kubectl Cheat Sheet</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<div class="page">
+
+<p class="lesson-kicker">SLM Production Stack · Reference</p>
+<h1>kubectl Cheat Sheet</h1>
+<p class="lesson-lede">The commands this course actually uses. Canonical source: <a href="https://kubernetes.io/docs/reference/kubectl/quick-reference/">kubectl quick reference</a>.</p>
+
+<h2>Inspect</h2>
+<table>
+<tr><th>Command</th><th>What</th></tr>
+<tr><td><code>kubectl get nodes</code></td><td>Cluster machines and their status</td></tr>
+<tr><td><code>kubectl get pods -A</code></td><td>All pods, all namespaces (<code>-A</code> = everywhere)</td></tr>
+<tr><td><code>kubectl get pods -o wide</code></td><td>Pods + which node, IP</td></tr>
+<tr><td><code>kubectl get pods -w</code></td><td>Watch live changes (Ctrl+C exits)</td></tr>
+<tr><td><code>kubectl get deployment,svc,pods -l app=X</code></td><td>Everything matching label</td></tr>
+<tr><td><code>kubectl describe pod NAME</code></td><td>Full detail + Events — first stop when broken</td></tr>
+<tr><td><code>kubectl logs NAME</code></td><td>Container stdout (<code>-f</code> follows, <code>-l app=X</code> by label)</td></tr>
+<tr><td><code>kubectl cluster-info</code></td><td>API server address</td></tr>
+</table>
+
+<h2>Create / change</h2>
+<table>
+<tr><th>Command</th><th>What</th></tr>
+<tr><td><code>kubectl apply -f file.yaml</code></td><td>Declare desired state from YAML (the production way)</td></tr>
+<tr><td><code>kubectl create deployment N --image=I --replicas=2</code></td><td>Quick generator (learning/dev only)</td></tr>
+<tr><td><code>kubectl expose deployment N --port=80</code></td><td>Generate Service for a Deployment</td></tr>
+<tr><td><code>kubectl scale deployment N --replicas=3</code></td><td>Change replica count</td></tr>
+<tr><td><code>kubectl rollout status deployment/N</code></td><td>Wait for rollout to finish</td></tr>
+<tr><td><code>kubectl delete -f file.yaml</code></td><td>Delete what the YAML declared</td></tr>
+</table>
+
+<h2>Debug / access</h2>
+<table>
+<tr><th>Command</th><th>What</th></tr>
+<tr><td><code>kubectl port-forward svc/N 8080:80</code></td><td>Tunnel local port → Service</td></tr>
+<tr><td><code>kubectl exec -it POD -- sh</code></td><td>Shell inside a container</td></tr>
+<tr><td><code>kubectl get events --sort-by=.lastTimestamp</code></td><td>Recent cluster events, newest last</td></tr>
+</table>
+
+<h2>Pod status decoder</h2>
+<table>
+<tr><th>Status</th><th>Meaning</th><th>First move</th></tr>
+<tr><td><code>Pending</code></td><td>No node can fit it (resources/GPU)</td><td><code>describe pod</code> → Events</td></tr>
+<tr><td><code>ImagePullBackOff</code></td><td>Image name/tag wrong or registry unreachable</td><td>Check image string</td></tr>
+<tr><td><code>CrashLoopBackOff</code></td><td>Container starts then dies repeatedly</td><td><code>logs</code> (add <code>--previous</code>)</td></tr>
+<tr><td><code>OOMKilled</code></td><td>Exceeded memory limit</td><td>Raise limit or shrink workload</td></tr>
+<tr><td><code>Running</code> but <code>READY 0/1</code></td><td>Readiness probe failing</td><td><code>describe</code> → probe config</td></tr>
+</table>
+
+<h2>kind (local clusters)</h2>
+<table>
+<tr><th>Command</th><th>What</th></tr>
+<tr><td><code>kind create cluster --config k8s/kind-config.yaml</code></td><td>Create from config</td></tr>
+<tr><td><code>kind get clusters</code></td><td>List clusters</td></tr>
+<tr><td><code>kind load docker-image IMG --name llm-stack</code></td><td>Push a local image into the cluster (no registry needed)</td></tr>
+<tr><td><code>kind delete cluster --name llm-stack</code></td><td>Destroy</td></tr>
+</table>
+
+<h2>Glossary (course-wide)</h2>
+<table>
+<tr><th>Term</th><th>Definition</th></tr>
+<tr><td>Cluster</td><td>Control plane + nodes acting as one computer</td></tr>
+<tr><td>Control plane</td><td>API server, scheduler, etcd — decides, stores, assigns</td></tr>
+<tr><td>Node</td><td>Machine (or kind container) that runs Pods</td></tr>
+<tr><td>Pod</td><td>Smallest deployable unit; mortal; 1+ containers</td></tr>
+<tr><td>Deployment</td><td>Keeps N replicas of a Pod template alive (reconciliation)</td></tr>
+<tr><td>Service</td><td>Stable address load-balancing over Pods by label selector</td></tr>
+<tr><td>Namespace</td><td>Named partition of cluster resources</td></tr>
+<tr><td>Label / selector</td><td>Key-value tags; how Services and controllers find Pods</td></tr>
+<tr><td>Manifest</td><td>YAML file declaring desired state</td></tr>
+<tr><td>Reconciliation</td><td>Loop driving actual state toward desired state</td></tr>
+</table>
+
+<div class="lesson-footer">
+<p>Back to <a href="../lessons/0001-first-cluster.html">Lesson 1</a>.</p>
+</div>
+
+</div>
+</body>
+</html>

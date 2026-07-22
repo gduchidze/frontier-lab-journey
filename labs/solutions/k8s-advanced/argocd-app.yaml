@@ -1,0 +1,29 @@
+# Lab 14 — Argo CD Application tracking your chart.
+# EDIT repoURL to your fork before applying.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: slm-stack
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/YOUR-USER/llm-infra-playground.git
+    targetRevision: main
+    path: charts/slm-stack
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: llm
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+  # when the HPA (lab 10) owns replicas, stop Argo fighting it:
+  ignoreDifferences:
+    - group: apps
+      kind: Deployment
+      name: vllm
+      jsonPointers:
+        - /spec/replicas

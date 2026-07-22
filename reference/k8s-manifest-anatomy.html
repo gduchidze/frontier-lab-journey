@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Reference — K8s Manifest Anatomy</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<div class="page">
+
+<p class="lesson-kicker">SLM Production Stack · Reference</p>
+<h1>Manifest Anatomy</h1>
+<p class="lesson-lede">Annotated skeletons of every resource kind this course uses. Canonical source: <a href="https://kubernetes.io/docs/reference/kubernetes-api/">Kubernetes API reference</a>.</p>
+
+<h2>Every manifest, always</h2>
+<pre><code>apiVersion: apps/v1        # API group/version the kind lives in
+kind: Deployment           # what you're declaring
+metadata:
+  name: vllm               # unique within namespace
+  namespace: llm
+  labels: { app: vllm }    # tags for selectors and humans
+spec:                      # desired state — shape depends on kind
+  ...</code></pre>
+
+<h2>Deployment (full production shape)</h2>
+<pre><code>apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm
+  namespace: llm
+spec:
+  replicas: 2
+  selector:                          # MUST match template labels
+    matchLabels: { app: vllm }
+  template:                          # the Pod recipe
+    metadata:
+      labels: { app: vllm }         # what Services select on
+    spec:
+      containers:
+      - name: vllm
+        image: vllm-cpu:local
+        imagePullPolicy: IfNotPresent   # required for kind-loaded images
+        args: ["--model", "Qwen/Qwen3.5-0.8B"]
+        env:
+        - name: VLLM_CPU_KVCACHE_SPACE
+          value: "4"
+        - name: HF_TOKEN                 # secret injection pattern
+          valueFrom:
+            secretKeyRef: { name: hf-token, key: HF_TOKEN }
+        ports:
+        - containerPort: 8000
+          name: http                     # NAME ports — ServiceMonitors need it
+        resources:
+          requests: { cpu: "4", memory: 6Gi }   # scheduler reservation
+          limits:   { cpu: "6", memory: 8Gi }   # kill ceiling (mem → OOMKilled)
+        startupProbe:                    # boot grace: 60 × 10s = 10 min
+          httpGet: { path: /health, port: 8000 }
+          periodSeconds: 10
+          failureThreshold: 60
+        readinessProbe:                  # traffic gate
+          httpGet: { path: /health, port: 8000 }
+          periodSeconds: 10
+        livenessProbe:                   # hang detector → restart
+          httpGet: { path: /health, port: 8000 }
+          periodSeconds: 20
+          failureThreshold: 3
+        volumeMounts:
+        - { name: hf-cache, mountPath: /root/.cache/huggingface }
+        - { name: dshm,     mountPath: /dev/shm }
+      volumes:
+      - name: hf-cache
+        persistentVolumeClaim: { claimName: hf-cache }
+      - name: dshm                       # PyTorch shared memory
+        emptyDir: { medium: Memory, sizeLimit: 2Gi }</code></pre>
+
+<h2>Service</h2>
+<pre><code>apiVersion: v1
+kind: Service
+metadata:
+  name: vllm
+  namespace: llm
+spec:
+  # type: ClusterIP (default) | NodePort | LoadBalancer
+  selector: { app: vllm }     # routes to Ready pods with this label
+  ports:
+  - name: http                # named → ServiceMonitor can reference
+    port: 8000                # the Service's own port
+    targetPort: 8000          # container port (number or port name)
+    # nodePort: 30080         # NodePort type only, range 30000-32767</code></pre>
+<p>In-cluster DNS: <code>&lt;name&gt;.&lt;namespace&gt;.svc.cluster.local</code> → e.g. <code>vllm-router.llm.svc.cluster.local</code>.</p>
+
+<h2>PersistentVolumeClaim</h2>
+<pre><code>apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: hf-cache
+  namespace: llm
+spec:
+  accessModes: [ReadWriteOnce]   # RWO = one node at a time (matters at replicas>1!)
+  resources:
+    requests:
+      storage: 10Gi
+  # storageClassName: standard   # kind's default provisioner if omitted</code></pre>
+
+<h2>ConfigMap and Secret</h2>
+<pre><code>apiVersion: v1
+kind: ConfigMap
+metadata: { name: app-config, namespace: llm }
+data:
+  LOG_LEVEL: "info"
+  settings.yaml: |
+    key: value
+---
+apiVersion: v1
+kind: Secret
+metadata: { name: hf-token, namespace: llm }
+type: Opaque
+stringData:                  # plaintext here; stored base64. NEVER commit real tokens
+  HF_TOKEN: "hf_xxx"</code></pre>
+<p>Create secrets imperatively instead of committing them: <code>kubectl create secret generic hf-token --from-literal=HF_TOKEN="$HF_TOKEN" -n llm</code>.</p>
+
+<h2>HorizontalPodAutoscaler</h2>
+<pre><code>apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata: { name: vllm, namespace: llm }
+spec:
+  scaleTargetRef: { apiVersion: apps/v1, kind: Deployment, name: vllm }
+  minReplicas: 1
+  maxReplicas: 2
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target: { type: Utilization, averageUtilization: 70 }
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300   # don't kill engines on brief lulls</code></pre>
+
+<h2>ServiceMonitor (Prometheus Operator CRD)</h2>
+<pre><code>apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata: { name: vllm, namespace: llm }
+spec:
+  selector:
+    matchLabels: { app: vllm }   # matches SERVICE labels, not pod labels
+  endpoints:
+  - port: http                   # SERVICE PORT NAME — #1 gotcha
+    path: /metrics
+    interval: 15s</code></pre>
+
+<h2>RBAC trio (used by the router)</h2>
+<pre><code>apiVersion: v1
+kind: ServiceAccount
+metadata: { name: vllm-router, namespace: llm }
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata: { name: pod-reader, namespace: llm }
+rules:
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata: { name: vllm-router-pod-reader, namespace: llm }
+subjects:
+- { kind: ServiceAccount, name: vllm-router, namespace: llm }
+roleRef:
+  { kind: Role, name: pod-reader, apiGroup: rbac.authorization.k8s.io }</code></pre>
+
+<div class="lesson-footer">
+<p><a href="../lessons/index.html">Course home</a> · <a href="kubectl-cheatsheet.html">kubectl cheat sheet</a></p>
+</div>
+
+</div>
+</body>
+</html>

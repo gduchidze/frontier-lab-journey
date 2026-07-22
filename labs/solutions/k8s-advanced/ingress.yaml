@@ -1,0 +1,54 @@
+# Lab 12 — hostname routing with LLM-tuned annotations + TLS via cert-manager
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: llm-edge
+  namespace: llm
+  annotations:
+    cert-manager.io/cluster-issuer: local-ca
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "600"   # long generations
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "600"
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"      # SSE streaming
+    nginx.ingress.kubernetes.io/proxy-body-size: "10m"      # long-context payloads
+spec:
+  ingressClassName: nginx
+  tls:
+  - hosts: [api.llm.local]
+    secretName: api-llm-local-tls
+  rules:
+  - host: api.llm.local
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: vllm-router
+            port:
+              number: 80
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: chat-edge
+  namespace: ui
+  annotations:
+    cert-manager.io/cluster-issuer: local-ca
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "600"
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+spec:
+  ingressClassName: nginx
+  tls:
+  - hosts: [chat.llm.local]
+    secretName: chat-llm-local-tls
+  rules:
+  - host: chat.llm.local
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: open-webui
+            port:
+              number: 8080

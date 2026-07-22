@@ -1,0 +1,21 @@
+namespace: llm
+
+vllm:
+  replicaCount: 1
+  image:
+    repository: vllm-cpu
+    tag: local
+    pullPolicy: IfNotPresent
+  model:
+    name: Qwen/Qwen3.5-0.8B     # fallback: Qwen/Qwen3-0.6B
+    maxModelLen: 4096
+    dtype: bfloat16
+  kvCacheSpaceGiB: 4            # drop to 2 when replicaCount > 1
+  resources:
+    requests: { cpu: "4", memory: 6Gi }
+    limits:   { cpu: "6", memory: 8Gi }
+  pvc:
+    enabled: true               # lab 06: set false when replicaCount > 1 (RWO)
+    size: 10Gi
+  service:
+    port: 8000

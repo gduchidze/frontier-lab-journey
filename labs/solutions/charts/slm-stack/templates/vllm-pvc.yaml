@@ -1,0 +1,14 @@
+{{- if .Values.vllm.pvc.enabled }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: hf-cache
+  namespace: {{ .Values.namespace }}
+  annotations:
+    helm.sh/resource-policy: keep   # don't delete cached weights on uninstall
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: {{ .Values.vllm.pvc.size }}
+{{- end }}

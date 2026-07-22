@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lesson 4 — vLLM Meets Kubernetes</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<div class="page">
+
+<p class="lesson-kicker">SLM Production Stack · Lesson 4 · Phase 4 · ~90 min</p>
+<h1>vLLM Meets Kubernetes</h1>
+<p class="lesson-lede">The convergence lesson. Your engine image from lesson 3, deployed with the production patterns from lesson 2: namespace, PVC for model weights, probes tuned for slow model loads, and a Service the whole stack will talk to.</p>
+
+<div class="note"><strong>Prerequisites</strong>
+Cluster running · image <code>vllm-cpu:local</code> built (lesson 3) · namespace <code>llm</code> exists (lesson 2).</div>
+
+<h2>Knowledge: three new pieces</h2>
+
+<h3>1. Getting a local image into kind</h3>
+<p>Your cluster nodes are containers — they can't see your Mac's Docker images. <code>kind load docker-image</code> copies an image into every node. In real clusters this step is "push to a registry" (ECR, GCR, Artifact Registry); kind lets you skip the registry while learning:</p>
+<pre><code>kind load docker-image vllm-cpu:local --name llm-stack</code></pre>
+<p>Then the manifest must say <code>imagePullPolicy: IfNotPresent</code> — otherwise K8s tries to pull <code>vllm-cpu:local</code> from Docker Hub and fails with <code>ImagePullBackOff</code>.</p>
+
+<h3>2. PersistentVolumeClaims: weights survive Pods</h3>
+<p>Without persistence, every Pod restart re-downloads ~2 GB of weights. A <strong>PVC</strong> requests storage that outlives Pods (<a href="https://kubernetes.io/docs/concepts/storage/persistent-volumes/">docs</a>). Mount it at <code>/root/.cache/huggingface</code> — the HF cache path — and restarts become fast. Both reference repos do exactly this (doronmak: <code>vllm-models</code> PVC; production-stack: <code>pvcStorage</code> per model). kind ships a default <code>standard</code> StorageClass, so a bare PVC "just works".</p>
+
+<h3>3. Probe timing for LLM engines</h3>
+<p>vLLM exposes <code>/health</code> (200 = engine up). The trap: model load on CPU can take minutes. So: <strong>startup probe</strong> with a huge window (<code>failureThreshold: 60 × periodSeconds: 10</code> = 10 min grace), then tight readiness/liveness. Compare with the <code>vllm-deploy-k8s</code> skill templates and doronmak's chart — all three use this shape.</p>
+
+<h2>Lab: deploy the engine</h2>
+
+<div class="lab">
+
+<div class="step">
+<h3>Load the image into the cluster</h3>
+<pre><code>kind load docker-image vllm-cpu:local --name llm-stack
+# verify it landed on a node:
+docker exec llm-stack-worker crictl images | grep vllm-cpu</code></pre>
+<p class="expect">expect: vllm-cpu local listed</p>
+</div>
+
+<div class="step">
+<h3>Write the manifests</h3>
+<p>Save as <code>k8s/vllm.yaml</code>:</p>
+<pre><code>apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: hf-cache
+  namespace: llm
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 10Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm
+  namespace: llm
+  labels: { app: vllm }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: vllm }
+  template:
+    metadata:
+      labels: { app: vllm }
+    spec:
+      containers:
+      - name: vllm
+        image: vllm-cpu:local
+        imagePullPolicy: IfNotPresent
+        args:
+          - "--model"
+          - "Qwen/Qwen3.5-0.8B"
+          - "--max-model-len"
+          - "4096"
+          - "--dtype"
+          - "bfloat16"
+        env:
+        - name: VLLM_CPU_KVCACHE_SPACE
+          value: "4"
+        ports:
+        - containerPort: 8000
+          name: http
+        resources:
+          requests: { cpu: "4", memory: 6Gi }
+          limits:   { cpu: "6", memory: 8Gi }
+        startupProbe:
+          httpGet: { path: /health, port: 8000 }
+          periodSeconds: 10
+          failureThreshold: 60
+        readinessProbe:
+          httpGet: { path: /health, port: 8000 }
+          periodSeconds: 10
+        livenessProbe:
+          httpGet: { path: /health, port: 8000 }
+          periodSeconds: 20
+          failureThreshold: 3
+        volumeMounts:
+        - name: hf-cache
+          mountPath: /root/.cache/huggingface
+        - name: dshm
+          mountPath: /dev/shm
+      volumes:
+      - name: hf-cache
+        persistentVolumeClaim: { claimName: hf-cache }
+      - name: dshm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 2Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm
+  namespace: llm
+spec:
+  selector: { app: vllm }
+  ports:
+  - port: 8000
+    targetPort: 8000</code></pre>
+<div class="note"><strong>Why /dev/shm?</strong>
+PyTorch uses shared memory for inter-process tensors; the default container /dev/shm is 64 MB. Both reference repos mount a Memory-backed emptyDir. Undersized shm = cryptic crashes.</div>
+</div>
+
+<div class="step">
+<h3>Deploy and watch the startup probe earn its keep</h3>
+<pre><code>kubectl apply -f k8s/vllm.yaml
+kubectl get pods -n llm -w</code></pre>
+<p>The Pod will sit READY 0/1 for several minutes (downloading + loading). That's the startup probe holding liveness back. Watch the engine work:</p>
+<pre><code>kubectl logs -n llm -l app=vllm -f</code></pre>
+<p class="expect">expect: eventually "Application startup complete" → pod flips to READY 1/1</p>
+</div>
+
+<div class="step">
+<h3>Chat through the cluster</h3>
+<pre><code>kubectl port-forward -n llm svc/vllm 8000:8000</code></pre>
+<p>Second terminal:</p>
+<pre><code>curl -s localhost:8000/v1/chat/completions -H "Content-Type: application/json" \
+  -d '{"model":"Qwen/Qwen3.5-0.8B","messages":[{"role":"user","content":"You are running inside Kubernetes. How does that feel?"}],"max_tokens":80}' \
+  | python3 -m json.tool</code></pre>
+<p class="expect">expect: Qwen answers — served by a Pod, through a Service</p>
+</div>
+
+<div class="step">
+<h3>Prove the PVC works</h3>
+<pre><code>kubectl delete pod -n llm -l app=vllm
+kubectl get pods -n llm -w</code></pre>
+<p class="expect">expect: new pod becomes READY far faster — weights read from PVC, no re-download</p>
+<div class="win"><strong>The win</strong>
+A production-shaped inference service: declarative, self-healing, persistent, probed. This YAML file is the heart of your portfolio repo — everything else in the course wraps around it.</div>
+</div>
+
+</div>
+
+<h2>Check yourself</h2>
+<div class="quiz" data-quiz>
+  <div class="q">
+    <p class="stem">Pod shows ImagePullBackOff for vllm-cpu:local. Most likely cause?</p>
+    <button class="opt" data-correct>Image never loaded into kind nodes</button>
+    <button class="opt">Registry requires login before image pulls</button>
+    <button class="opt">PVC missing so container cannot start</button>
+    <p class="explain">Local-only images must be <code>kind load</code>-ed. K8s falls back to pulling from a registry, where the image doesn't exist. PVC issues surface differently (Pending / CreateContainerError).</p>
+  </div>
+  <div class="q">
+    <p class="stem">Why mount the PVC at /root/.cache/huggingface specifically?</p>
+    <button class="opt" data-correct>HF libraries cache downloaded weights there</button>
+    <button class="opt">vLLM requires writable root home directory</button>
+    <button class="opt">K8s mandates one standard cache path</button>
+    <p class="explain">It's the Hugging Face cache convention. Persist it and any restart or new replica reuses downloaded weights.</p>
+  </div>
+</div>
+
+<h2>Primary source</h2>
+<p><a href="https://docs.vllm.ai/en/latest/deployment/k8s.html">vLLM docs — Using Kubernetes</a>, plus tutorial <a href="https://github.com/vllm-project/production-stack/blob/main/tutorials/03-load-model-from-pv.md">03-load-model-from-pv</a> from production-stack (the same PVC pattern at production scale).</p>
+
+<h2>Next</h2>
+<p><a href="0005-helm-package.html">Lesson 5</a>: this YAML is already 100 lines and phase 6 wants two model variants of it. Time for Helm — templating and packaging.</p>
+
+<div class="lesson-footer">
+<p>References: <a href="../reference/k8s-manifest-anatomy.html">manifest anatomy</a> · <a href="../reference/vllm-cheatsheet.html">vLLM cheat sheet</a>.</p>
+<p>Pod stuck? <code>kubectl describe</code> + <code>kubectl logs</code>, then ask your teacher with the output.</p>
+</div>
+
+</div>
+<script src="../assets/quiz.js"></script>
+</body>
+</html>

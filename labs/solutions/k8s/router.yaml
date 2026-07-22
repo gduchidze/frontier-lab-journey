@@ -1,0 +1,87 @@
+# Lab 06 — production-stack request router + RBAC
+# NOTE: verify image tag and flags against the router README before applying:
+# https://github.com/vllm-project/production-stack/tree/main/src/vllm_router
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: vllm-router
+  namespace: llm
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: pod-reader
+  namespace: llm
+rules:
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: vllm-router-pod-reader
+  namespace: llm
+subjects:
+- kind: ServiceAccount
+  name: vllm-router
+  namespace: llm
+roleRef:
+  kind: Role
+  name: pod-reader
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm-router
+  namespace: llm
+  labels: { app: vllm-router }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: vllm-router }
+  template:
+    metadata:
+      labels: { app: vllm-router }
+    spec:
+      serviceAccountName: vllm-router
+      containers:
+      - name: router
+        image: lmcache/lmstack-router:latest
+        args:
+          - "--host"
+          - "0.0.0.0"
+          - "--port"
+          - "8000"
+          - "--service-discovery"
+          - "k8s"
+          - "--k8s-namespace"
+          - "llm"
+          - "--k8s-label-selector"
+          - "app=vllm"
+          - "--routing-logic"
+          - "roundrobin"          # lab step: switch to "session" + --session-key x-user-id
+          - "--engine-scrape-interval"
+          - "15"
+          - "--request-stats-window"
+          - "60"
+        ports:
+        - containerPort: 8000
+          name: http
+        resources:
+          requests: { cpu: 250m, memory: 256Mi }
+          limits:   { cpu: "1",  memory: 512Mi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-router
+  namespace: llm
+  labels: { app: vllm-router }
+spec:
+  selector: { app: vllm-router }
+  ports:
+  - name: http
+    port: 80
+    targetPort: 8000

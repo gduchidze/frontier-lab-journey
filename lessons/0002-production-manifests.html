@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lesson 2 — Production-Shaped Manifests</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<div class="page">
+
+<p class="lesson-kicker">SLM Production Stack · Lesson 2 · Phase 2 · ~90 min</p>
+<h1>Production-Shaped Manifests</h1>
+<p class="lesson-lede">Lesson 1 used generator commands. Real teams commit YAML to git. Today you write manifests by hand — with namespaces, resource limits, and health probes — the exact three knobs that make or break a vLLM deployment.</p>
+
+<div class="note"><strong>Prerequisite</strong>
+Cluster <code>llm-stack</code> from <a href="0001-first-cluster.html">Lesson 1</a> running (<code>kubectl get nodes</code> → 2 Ready). If not: <code>kind create cluster --config k8s/kind-config.yaml</code>.</div>
+
+<h2>Knowledge: five ideas</h2>
+
+<h3>1. Everything is a manifest</h3>
+<p>A manifest is YAML declaring desired state: <code>apiVersion</code> + <code>kind</code> + <code>metadata</code> + <code>spec</code>. <code>kubectl apply -f</code> sends it to the API server; controllers make it true. Git-committed manifests = your infrastructure has code review, history, rollback. This is why "GitOps" is a job requirement. Full annotated skeletons: <a href="../reference/k8s-manifest-anatomy.html">manifest anatomy reference</a>.</p>
+
+<h3>2. Namespaces partition the cluster</h3>
+<p>A <a href="https://kubernetes.io/docs/concepts/overview/working-with-objects/namespaces/">Namespace</a> is a named slice of the cluster. Our stack lives in <code>llm</code>; monitoring will live in <code>monitoring</code>. DNS inside the cluster: <code>&lt;service&gt;.&lt;namespace&gt;.svc.cluster.local</code> — memorize this, the router and UI lessons depend on it.</p>
+
+<h3>3. Requests and limits</h3>
+<p><strong>Request</strong> = what the scheduler reserves for you ("I need 4 CPUs to be placed"). <strong>Limit</strong> = the ceiling you're killed for crossing (memory → <code>OOMKilled</code>). (<a href="https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/">docs</a>) On a 16 GB Mac this is not academic: vLLM CPU will want ~6 Gi. Set requests too high → Pod stuck <code>Pending</code> forever. This is the #1 GPU-cluster skill too — GPUs are requested the same way (<code>nvidia.com/gpu: 1</code>).</p>
+
+<h3>4. The three probes</h3>
+<table>
+<tr><th>Probe</th><th>Question</th><th>On failure</th><th>vLLM meaning</th></tr>
+<tr><td>startup</td><td>Finished booting?</td><td>Keep waiting (up to threshold)</td><td>Model still downloading/loading — can take minutes</td></tr>
+<tr><td>readiness</td><td>Can you take traffic <em>now</em>?</td><td>Removed from Service endpoints</td><td>Engine busy/overloaded — stop routing here</td></tr>
+<tr><td>liveness</td><td>Are you alive at all?</td><td>Container restarted</td><td>Engine hung — kill and reload</td></tr>
+</table>
+<p>Without a startup probe, a slow-loading model gets liveness-killed in a loop: the classic <code>CrashLoopBackOff</code>-on-deploy. (<a href="https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/">docs</a>)</p>
+
+<h3>5. ConfigMaps and Secrets</h3>
+<p>Config lives outside the image: <strong>ConfigMap</strong> for plain settings, <strong>Secret</strong> for credentials (your Hugging Face token in phase 4). Injected as env vars or files. Never bake tokens into images or YAML committed to git.</p>
+
+<h2>Lab: rebuild hello, production-shaped</h2>
+<p>Same nginx as lesson 1 — but now namespaced, resource-bounded, probed, and configured via ConfigMap. Then we break it on purpose.</p>
+
+<div class="lab">
+
+<div class="step">
+<h3>Create the app manifests</h3>
+<p>Save as <code>k8s/lab2.yaml</code> (multiple docs separated by <code>---</code>):</p>
+<pre><code>apiVersion: v1
+kind: Namespace
+metadata:
+  name: llm
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: hello-config
+  namespace: llm
+data:
+  index.html: |
+    &lt;h1&gt;Served by Kubernetes, configured by ConfigMap&lt;/h1&gt;
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hello
+  namespace: llm
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app: hello }
+  template:
+    metadata:
+      labels: { app: hello }
+    spec:
+      containers:
+      - name: web
+        image: nginx:alpine
+        ports:
+        - containerPort: 80
+        resources:
+          requests: { cpu: 100m, memory: 64Mi }
+          limits:   { cpu: 500m, memory: 128Mi }
+        startupProbe:
+          httpGet: { path: /, port: 80 }
+          periodSeconds: 2
+          failureThreshold: 15
+        readinessProbe:
+          httpGet: { path: /, port: 80 }
+          periodSeconds: 5
+        livenessProbe:
+          httpGet: { path: /, port: 80 }
+          periodSeconds: 10
+        volumeMounts:
+        - name: content
+          mountPath: /usr/share/nginx/html
+      volumes:
+      - name: content
+        configMap: { name: hello-config }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: hello
+  namespace: llm
+spec:
+  selector: { app: hello }
+  ports:
+  - port: 80
+    targetPort: 80</code></pre>
+</div>
+
+<div class="step">
+<h3>Apply and verify</h3>
+<pre><code>kubectl apply -f k8s/lab2.yaml
+kubectl get pods -n llm -w      # wait for 2/2 READY 1/1, Ctrl+C
+kubectl port-forward -n llm svc/hello 8080:80</code></pre>
+<p>Second terminal:</p>
+<pre><code>curl -s localhost:8080</code></pre>
+<p class="expect">expect: the ConfigMap HTML, not the default nginx page</p>
+</div>
+
+<div class="step">
+<h3>Break the readiness probe — watch traffic drain</h3>
+<pre><code>kubectl exec -n llm deploy/hello -- rm /usr/share/nginx/html/index.html 2>/dev/null; \
+kubectl get pods -n llm -w</code></pre>
+<p>Wait — that deleted from ONE pod's mounted volume? No: ConfigMap mounts are read-only. Try it — the <code>rm</code> fails. Good. Break it differently — point the probe at a path that doesn't exist:</p>
+<pre><code>kubectl patch deployment hello -n llm --type=json -p='[
+ {"op":"replace","path":"/spec/template/spec/containers/0/readinessProbe/httpGet/path","value":"/nope"}]'
+kubectl get pods -n llm -w</code></pre>
+<p class="expect">expect: new pods appear but stay READY 0/1 — rollout stalls, OLD pods keep serving</p>
+<p>This is the safety net in action: Kubernetes refuses to replace working Pods with broken ones. Check <em>why</em> it's not ready:</p>
+<pre><code>kubectl describe pod -n llm -l app=hello | grep -A3 "Readiness"
+kubectl rollout undo deployment/hello -n llm
+kubectl get pods -n llm</code></pre>
+<p class="expect">expect: after undo, back to 2 pods READY 1/1</p>
+</div>
+
+<div class="step">
+<h3>Break memory — meet OOMKilled</h3>
+<p>Run a Pod that allocates more than its limit:</p>
+<pre><code>kubectl run oom-demo -n llm --image=polinux/stress --restart=Never \
+  --limits=memory=64Mi \
+  -- stress --vm 1 --vm-bytes 128M --vm-hang 0
+sleep 10 && kubectl get pod oom-demo -n llm
+kubectl describe pod oom-demo -n llm | grep -A2 "Last State"</code></pre>
+<p class="expect">expect: STATUS OOMKilled — the exact failure you'll diagnose when vLLM exceeds its memory limit</p>
+<pre><code>kubectl delete pod oom-demo -n llm</code></pre>
+<div class="win"><strong>The win</strong>
+You have now seen, hands-on, the two failure modes that dominate real vLLM operations: <em>readiness failure → traffic drained</em> and <em>OOMKilled → limits too tight</em>. In phase 4 you'll set these knobs for the actual engine.</div>
+</div>
+
+<div class="step">
+<h3>Clean up the app, keep the namespace</h3>
+<pre><code>kubectl delete deployment hello -n llm
+kubectl delete svc hello -n llm
+kubectl delete configmap hello-config -n llm</code></pre>
+</div>
+
+</div>
+
+<h2>Check yourself</h2>
+<div class="quiz" data-quiz>
+  <div class="q">
+    <p class="stem">vLLM takes 4 minutes to load a model. Which probe prevents restart-loops during load?</p>
+    <button class="opt" data-correct>Startup probe with high failure threshold</button>
+    <button class="opt">Liveness probe with high failure threshold</button>
+    <button class="opt">Readiness probe with long initial delay</button>
+    <p class="explain">The startup probe disables liveness checking until it passes. Stretching liveness works but weakens hang-detection forever; startup probes only cover boot.</p>
+  </div>
+  <div class="q">
+    <p class="stem">A Pod requests 8 CPUs on a node with 6 free. Result?</p>
+    <button class="opt" data-correct>Pending forever, scheduler finds no fit</button>
+    <button class="opt">Running slowly, throttled to six CPUs</button>
+    <button class="opt">Evicting others, scheduler reclaims the CPUs</button>
+    <p class="explain">Requests are a scheduling contract. No node can satisfy it → <code>Pending</code>. <code>kubectl describe pod</code> → Events shows "Insufficient cpu".</p>
+  </div>
+  <div class="q">
+    <p class="stem">Readiness probe fails on 1 of 2 replicas. What happens to it?</p>
+    <button class="opt" data-correct>Removed from Service endpoints, keeps running</button>
+    <button class="opt">Restarted by kubelet, then rejoins Service</button>
+    <button class="opt">Deleted by Deployment, replacement gets created</button>
+    <p class="explain">Readiness only controls traffic. Restarts are liveness's job; replacement is the Deployment's job when Pods die.</p>
+  </div>
+</div>
+
+<h2>Primary source</h2>
+<p><a href="https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/">Configure Liveness, Readiness and Startup Probes</a> (K8s docs, 20 min). The probe table above compresses it; the doc has the edge cases interviewers love.</p>
+
+<h2>Next</h2>
+<p><a href="0003-vllm-engine-docker.html">Lesson 3</a>: we leave Kubernetes for one session and meet the engine itself — vLLM on CPU, in plain Docker, talking to Qwen.</p>
+
+<div class="lesson-footer">
+<p>References: <a href="../reference/k8s-manifest-anatomy.html">manifest anatomy</a> · <a href="../reference/kubectl-cheatsheet.html">kubectl cheat sheet</a>.</p>
+<p>Stuck? Ask your teacher (the agent) — paste the error, we debug together.</p>
+</div>
+
+</div>
+<script src="../assets/quiz.js"></script>
+</body>
+</html>

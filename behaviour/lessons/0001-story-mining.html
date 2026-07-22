@@ -1,0 +1,124 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lesson 1 · Story Mining</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<div class="lesson">
+  <header class="lesson-header">
+    <p class="kicker">Lesson 0001 · Phase A — Raw Material</p>
+    <h1>Story Mining</h1>
+    <p class="dek">Before any technique: dig up the true events. You cannot polish stories you haven't found.</p>
+  </header>
+
+  <div class="mission-tie">
+    <strong>Mission tie.</strong> Every behavioral question at all three labs is answered from the same bank of 8–10 real stories. Anthropic's culture round additionally demands live reasoning — but even there, reasoning needs real events to reason <em>about</em>. This lesson builds the raw material everything else refines.
+  </div>
+
+  <h2>1 · Why mining comes first</h2>
+  <p>The reported failure pattern at senior level is not bad delivery — it is <strong>thin material</strong>: candidates reach for their two favorite war stories, repeat them across rounds, and have nothing when the interviewer asks for a failure or a values conflict. The fix is an inventory pass over your whole recent career <em>before</em> any question practice. (<a href="https://maven.com/uncharted-path-breakthroughs/senior-engineer-behavioral-interviews">Senior-engineer behavioral guide</a>)</p>
+  <p>One more research finding to internalize now: at Anthropic's culture round, <strong>rehearsed STAR stories are an explicit failure mode</strong> — interviewers are trained to detect performance and probe past it. Bullets, not scripts, from day one. (<a href="https://preper.app/guides/anthropic-behavioral-interview-prep">Preper Anthropic guide</a>)</p>
+
+  <h2>2 · The mining protocol (do this now — 30 minutes)</h2>
+  <p>Open a blank note. Scan the last 3–4 years, job by job, project by project. For each trigger below, write every event that surfaces — one line each, no filtering, aim for 15+ candidates:</p>
+  <ol>
+    <li>An incident or outage where you were in the room. What did you decide?</li>
+    <li>A time you disagreed with your manager or a senior engineer. Out loud.</li>
+    <li>Something you shipped that failed — visibly, with your name attached.</li>
+    <li>A project with no clear owner or spec that you picked up anyway.</li>
+    <li>A time you changed a team's process, tooling, or architecture — and it stuck.</li>
+    <li>A deadline you refused, or a corner you refused to cut. What did it cost you?</li>
+    <li>A time you were flat-out wrong and someone junior to you was right.</li>
+    <li>Cross-team work where the other side had opposite incentives.</li>
+    <li>The hardest feedback you ever received. What changed after?</li>
+    <li>A moment your personal ethics and the business's interest pointed different ways.</li>
+  </ol>
+  <p>Triggers 3, 7, and 10 feel worst to write. Those are the highest-value entries — failure (C3) and values-under-pressure (C6) are the competencies frontier labs weight hardest and candidates prep least.</p>
+
+  <h2>3 · Select and outline</h2>
+  <p>From your 15+, pick the <strong>8–10 with real stakes and a measurable result</strong>. For each, write the 6-bullet outline from the <a href="../reference/0001-story-bank-matrix.html">Story Bank Matrix</a> template — context, stakes, 2–3 actions, metric result, one honest learned-sentence. Then fill the matrix grid: every story gets checked against the six competencies; every competency column needs ≥2 stories.</p>
+  <div class="callout"><span class="label">Senior bar check</span>
+    For each Result bullet ask: did anything about <em>how the organization works</em> change? "Fixed the bug" is a mid-level story. "We now canary every model rollout because of this" is a senior one. If no story clears this bar yet, that's lesson 0002's job — mine anyway.
+  </div>
+
+  <h2>4 · Project step</h2>
+  <p>Deliverable before next session: the filled matrix (hand-written or in a note) + 6-bullet outlines for your top 8. Bring the two emptiest competency columns to your teacher — that gap drives lesson 0002. Then try one drill: say <strong>"drill me — Anthropic"</strong> and answer whatever comes, out loud, from bullets only.</p>
+
+  <h2>Check yourself</h2>
+  <div class="quiz" id="quiz"></div>
+
+  <h2>Primary source</h2>
+  <p>Read the <a href="https://blog.theinterviewguys.com/the-star-method/">STAR method guide</a> for baseline mechanics (Action ≈ 50% of airtime) — then read the <a href="https://igotanoffer.com/en/advice/anthropic-culture-interview">Anthropic culture interview guide</a> to see exactly where those mechanics must be abandoned.</p>
+
+  <footer class="lesson-footer">
+    <p><strong>Stuck?</strong> Ask your teacher. "I can't think of a values-conflict story" is the most common opening — there is a protocol for excavating those too.</p>
+    <nav class="lesson-nav">
+      <span>◀ (first lesson)</span>
+      <span>Next: 0002 · Upgrading Stories to the Senior Bar ▶</span>
+    </nav>
+  </footer>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+renderQuiz(document.getElementById('quiz'), {
+  title: 'Check yourself',
+  questions: [
+    {
+      q: 'Why are stories kept as bullet outlines instead of written scripts?',
+      options: [
+        'Bullets sound like thinking while scripts sound rehearsed',
+        'Bullets are much faster to write than scripts',
+        'Bullets are easier to memorize word for word',
+      ],
+      answer: 0,
+      explain: 'Recalling bullets forces live composition, which reads as authentic. Anthropic explicitly flags rehearsed delivery as a failure mode; memorizing word-for-word is the exact trap.',
+    },
+    {
+      q: 'Each story in the bank should map to how many competencies, minimum?',
+      options: [
+        'At least three competencies for reuse flexibility',
+        'At least one competency for focused clarity',
+        'At least all six competencies for coverage',
+      ],
+      answer: 0,
+      explain: 'A 4–6 round loop burns questions fast. Stories covering ≥3 competencies let you answer without repeating; demanding all six per story would force vague stories.',
+    },
+    {
+      q: 'What distinguishes a senior-level Result from a mid-level one?',
+      options: [
+        'The organization permanently changed how it works',
+        'The bug was fixed faster than anyone expected',
+        'The manager was very impressed by the work',
+      ],
+      answer: 0,
+      explain: 'Senior bar = organizational impact: a process, architecture, or norm that outlived the incident. Personal delivery alone is mid-level signal.',
+    },
+    {
+      q: 'Which lab treats polished STAR delivery as a negative signal in its culture round?',
+      options: [
+        'Anthropic, which rewards live honest reasoning',
+        'DeepMind, which rewards collaborative research framing',
+        'OpenAI, which rewards strong ownership stories',
+      ],
+      answer: 0,
+      explain: 'OpenAI and DeepMind grade classic STAR fine. Anthropic’s 45-minute culture round tests values-reasoning in real time and probes past performance.',
+    },
+    {
+      q: 'Which two competency columns do engineers most often leave empty?',
+      options: [
+        'Failure stories and values-under-pressure stories both',
+        'Ownership stories and ambiguity-handling stories both',
+        'Influence stories and conflict-resolution stories both',
+      ],
+      answer: 0,
+      explain: 'C3 and C6 feel bad to write, so they go unmined — yet they carry the most weight at frontier labs. That asymmetry is your edge if you do the work.',
+    },
+  ],
+});
+</script>
+</body>
+</html>

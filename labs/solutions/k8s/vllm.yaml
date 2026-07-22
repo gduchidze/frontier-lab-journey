@@ -1,0 +1,82 @@
+# Lab 04 — vLLM engine on K8s (raw manifests; lab 05 converts to Helm)
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: hf-cache
+  namespace: llm
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 10Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm
+  namespace: llm
+  labels: { app: vllm }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: vllm }
+  template:
+    metadata:
+      labels: { app: vllm }
+    spec:
+      containers:
+      - name: vllm
+        image: vllm-cpu:local
+        imagePullPolicy: IfNotPresent
+        args:
+          - "--model"
+          - "Qwen/Qwen3.5-0.8B"          # fallback: Qwen/Qwen3-0.6B
+          - "--max-model-len"
+          - "4096"
+          - "--dtype"
+          - "bfloat16"
+        env:
+        - name: VLLM_CPU_KVCACHE_SPACE
+          value: "4"
+        ports:
+        - containerPort: 8000
+          name: http
+        resources:
+          requests: { cpu: "4", memory: 6Gi }
+          limits:   { cpu: "6", memory: 8Gi }
+        startupProbe:
+          httpGet: { path: /health, port: 8000 }
+          periodSeconds: 10
+          failureThreshold: 60            # 10 min budget for download+load
+        readinessProbe:
+          httpGet: { path: /health, port: 8000 }
+          periodSeconds: 10
+        livenessProbe:
+          httpGet: { path: /health, port: 8000 }
+          periodSeconds: 20
+          failureThreshold: 3
+        volumeMounts:
+        - name: hf-cache
+          mountPath: /root/.cache/huggingface
+        - name: dshm
+          mountPath: /dev/shm
+      volumes:
+      - name: hf-cache
+        persistentVolumeClaim: { claimName: hf-cache }
+      - name: dshm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 2Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm
+  namespace: llm
+  labels: { app: vllm }        # ServiceMonitor (lab 07) selects on this
+spec:
+  selector: { app: vllm }
+  ports:
+  - name: http                 # named — ServiceMonitor references by name
+    port: 8000
+    targetPort: 8000

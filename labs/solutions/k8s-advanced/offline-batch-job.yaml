@@ -1,0 +1,61 @@
+# Lab 20 — offline vLLM (LLM class) inside a Job: the canonical ML batch pattern.
+# Uses the local CPU image; entrypoint overridden to run python instead of the server.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: offline-prompts
+  namespace: llm
+data:
+  prompts.jsonl: |
+    {"prompt": "One sentence: what is KV cache?"}
+    {"prompt": "One sentence: what is a Service?"}
+    {"prompt": "One sentence: why quantize weights?"}
+    {"prompt": "One sentence: what does an HPA do?"}
+    {"prompt": "One sentence: what is GitOps?"}
+  run.py: |
+    import json
+    from vllm import LLM, SamplingParams
+    prompts = [json.loads(l)["prompt"] for l in open("/data/prompts.jsonl") if l.strip()]
+    llm = LLM(model="Qwen/Qwen3.5-0.8B", max_model_len=2048, dtype="bfloat16")
+    params = SamplingParams(temperature=0, seed=7, max_tokens=48)
+    for out in llm.generate(prompts, params):
+        print(json.dumps({"prompt": out.prompt,
+                          "completion": out.outputs[0].text.strip()}))
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: offline-batch
+  namespace: llm
+spec:
+  backoffLimit: 1
+  template:
+    metadata:
+      labels: { job-name: offline-batch }
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: offline
+        image: vllm-cpu:local
+        imagePullPolicy: IfNotPresent
+        command: ["python3", "/data/run.py"]
+        env:
+        - name: VLLM_CPU_KVCACHE_SPACE
+          value: "2"
+        resources:
+          requests: { cpu: "3", memory: 5Gi }
+          limits:   { cpu: "5", memory: 7Gi }
+        volumeMounts:
+        - name: data
+          mountPath: /data
+        - name: hf-cache
+          mountPath: /root/.cache/huggingface
+        - name: dshm
+          mountPath: /dev/shm
+      volumes:
+      - name: data
+        configMap: { name: offline-prompts }
+      - name: hf-cache
+        persistentVolumeClaim: { claimName: hf-cache }
+      - name: dshm
+        emptyDir: { medium: Memory, sizeLimit: 2Gi }

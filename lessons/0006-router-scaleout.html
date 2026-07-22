@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lesson 6 — Scale Out: Replicas and the Request Router</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<div class="page">
+
+<p class="lesson-kicker">SLM Production Stack · Lesson 6 · Phase 6 · ~2 h</p>
+<h1>Scale Out: Replicas and the Request Router</h1>
+<p class="lesson-lede">One engine can only serve so much. Today you run two, and learn why LLM serving needs a smarter load balancer than a plain Service — the request router at the heart of vLLM production-stack.</p>
+
+<div class="warning"><strong>Memory check first</strong>
+Two vLLM replicas ≈ 12–16 Gi requested on a 16 Gi Mac. Before this lab: Docker Desktop → Settings → Resources → give Docker ≥ 12 GB. Also drop per-replica resources (step 1). If your machine swaps hard, run this lesson with <code>facebook/opt-125m</code> as the model — the routing lessons are identical.</div>
+
+<h2>Knowledge: why a plain Service isn't enough</h2>
+
+<h3>1. LLM requests are not web requests</h3>
+<p>A web request costs milliseconds; an LLM request costs seconds-to-minutes of stateful compute with a growing KV cache. Random round-robin (what a Service does) ignores: engine load (queue depth), KV cache reuse (same user's conversation prefix already cached on engine A), and model placement (engine B serves a different model). Result: avoidable latency and evictions.</p>
+
+<h3>2. The router is an application-layer load balancer</h3>
+<p>production-stack's <a href="https://github.com/vllm-project/production-stack/tree/main/src/vllm_router">vllm-router</a> sits in front of engines and adds what a Service can't:</p>
+<table>
+<tr><th>Capability</th><th>Why it matters</th></tr>
+<tr><td>K8s service discovery</td><td>Watches the API for engine Pods by label — replicas join/leave automatically</td></tr>
+<tr><td>Routing algorithms</td><td>round-robin, session-ID affinity, prefix-aware (route same prefix → same engine → KV cache hit)</td></tr>
+<tr><td>Per-engine metrics</td><td>QPS, TTFT, pending requests per engine — feeds phase 7 dashboards</td></tr>
+<tr><td>Model routing</td><td>One endpoint, many models: request's <code>model</code> field picks the backend</td></tr>
+</table>
+
+<h3>3. Session affinity = KV cache economics</h3>
+<p>A chat conversation resends the whole history each turn. If turn N lands on the engine that served turn N−1, the prefix is already in KV cache (with prefix caching enabled) → TTFT drops dramatically. Sticky routing isn't a nicety; it's a compute-cost lever. This is the "KV cache reuse" phrase in the production-stack README — and in ML infra job postings.</p>
+
+<h2>Lab: two engines, one router</h2>
+
+<div class="lab">
+
+<div class="step">
+<h3>Slim per-replica resources, scale to 2</h3>
+<p>Edit <code>charts/slm-stack/values.yaml</code>: <code>replicaCount: 2</code>, resources → <code>requests: { cpu: "2", memory: 5Gi }, limits: { cpu: "4", memory: 6Gi }</code>, <code>kvCacheSpaceGiB: 2</code>. One more change — two Pods can't share a ReadWriteOnce PVC on different nodes. Simplest local fix: in the deployment template, replace the PVC volume with a per-pod emptyDir (weights re-download once per pod; accept it locally) — or pin both replicas to one node with <code>nodeSelector</code>. Choose, then:</p>
+<pre><code>helm upgrade slm charts/slm-stack
+kubectl get pods -n llm -o wide -w    # wait for both READY 1/1 (patience: CPU load × 2)</code></pre>
+<p class="expect">expect: vllm-xxxx and vllm-yyyy both Running READY 1/1</p>
+</div>
+
+<div class="step">
+<h3>Watch a plain Service round-robin</h3>
+<pre><code>kubectl port-forward -n llm svc/vllm 8000:8000 &amp;
+for i in 1 2 3 4 5 6; do
+  curl -s localhost:8000/v1/chat/completions -H "Content-Type: application/json" \
+    -d '{"model":"Qwen/Qwen3.5-0.8B","messages":[{"role":"user","content":"hi"}],"max_tokens":5}' &gt; /dev/null
+done
+kubectl logs -n llm -l app=vllm --tail=5 --prefix | grep "POST /v1"</code></pre>
+<p class="expect">expect: requests visible in BOTH pods' logs (note: port-forward pins to one pod — in-cluster traffic spreads; check both logs to compare)</p>
+</div>
+
+<div class="step">
+<h3>Deploy the router</h3>
+<p>Save as <code>k8s/router.yaml</code>:</p>
+<pre><code>apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: vllm-router
+  namespace: llm
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: pod-reader
+  namespace: llm
+rules:
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: vllm-router-pod-reader
+  namespace: llm
+subjects:
+- kind: ServiceAccount
+  name: vllm-router
+  namespace: llm
+roleRef:
+  kind: Role
+  name: pod-reader
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm-router
+  namespace: llm
+  labels: { app: vllm-router }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: vllm-router }
+  template:
+    metadata:
+      labels: { app: vllm-router }
+    spec:
+      serviceAccountName: vllm-router
+      containers:
+      - name: router
+        image: lmcache/lmstack-router:latest
+        args:
+          - "--host"
+          - "0.0.0.0"
+          - "--port"
+          - "8000"
+          - "--service-discovery"
+          - "k8s"
+          - "--k8s-namespace"
+          - "llm"
+          - "--k8s-label-selector"
+          - "app=vllm"
+          - "--routing-logic"
+          - "roundrobin"
+          - "--engine-scrape-interval"
+          - "15"
+          - "--request-stats-window"
+          - "60"
+        ports:
+        - containerPort: 8000
+        resources:
+          requests: { cpu: 250m, memory: 256Mi }
+          limits:   { cpu: "1",  memory: 512Mi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-router
+  namespace: llm
+spec:
+  selector: { app: vllm-router }
+  ports:
+  - port: 80
+    targetPort: 8000</code></pre>
+<div class="note"><strong>Two things to notice</strong>
+(1) The RBAC block: the router watches Pods via the K8s API, so it needs explicit permission — your first taste of cluster security. (2) Image tag: verify current image/args against the <a href="https://github.com/vllm-project/production-stack/tree/main/src/vllm_router">router README</a> before applying — flags evolve. Ask your teacher to check if unsure.</div>
+<pre><code>kubectl apply -f k8s/router.yaml
+kubectl logs -n llm -l app=vllm-router -f    # expect: discovers 2 engine pods</code></pre>
+</div>
+
+<div class="step">
+<h3>Route through it</h3>
+<pre><code>kill %1 2>/dev/null   # stop old port-forward
+kubectl port-forward -n llm svc/vllm-router 8080:80</code></pre>
+<p>Second terminal — same API, now behind the router:</p>
+<pre><code>curl -s localhost:8080/v1/models | python3 -m json.tool
+for i in 1 2 3 4; do
+  curl -s localhost:8080/v1/chat/completions -H "Content-Type: application/json" \
+    -d '{"model":"Qwen/Qwen3.5-0.8B","messages":[{"role":"user","content":"one word: ping"}],"max_tokens":5}' | python3 -c "import json,sys; print(json.load(sys.stdin)['choices'][0]['message']['content'])"
+done</code></pre>
+<p class="expect">expect: 4 replies; router logs show requests alternating between engines</p>
+</div>
+
+<div class="step">
+<h3>Switch to session-sticky routing</h3>
+<p>In <code>k8s/router.yaml</code> change <code>--routing-logic</code> to <code>session</code> and add <code>--session-key</code> / <code>x-user-id</code> args, then:</p>
+<pre><code>kubectl apply -f k8s/router.yaml
+kubectl rollout status deployment/vllm-router -n llm
+# same header → same engine every time:
+for i in 1 2 3 4; do
+  curl -s localhost:8080/v1/chat/completions -H "Content-Type: application/json" \
+    -H "x-user-id: giorgi" \
+    -d '{"model":"Qwen/Qwen3.5-0.8B","messages":[{"role":"user","content":"ping"}],"max_tokens":5}' &gt; /dev/null
+done
+kubectl logs -n llm -l app=vllm --tail=10 --prefix | grep "POST /v1"</code></pre>
+<p class="expect">expect: all 4 requests in ONE pod's log — affinity working</p>
+<div class="win"><strong>The win</strong>
+You now run the core production-stack architecture: N engines + discovering, affinity-aware router. From here on, everything (UI, monitoring, load tests) talks to <code>vllm-router.llm.svc.cluster.local</code>.</div>
+</div>
+
+</div>
+
+<h2>Check yourself</h2>
+<div class="quiz" data-quiz>
+  <div class="q">
+    <p class="stem">Why does session affinity reduce time-to-first-token in chat?</p>
+    <button class="opt" data-correct>Conversation prefix already cached on engine</button>
+    <button class="opt">Engine keeps network connection warm longer</button>
+    <button class="opt">Router skips discovery lookup for session</button>
+    <p class="explain">Chat resends history each turn; landing on the same engine means the shared prefix's KV cache can be reused instead of recomputed — that recompute IS most of TTFT.</p>
+  </div>
+  <div class="q">
+    <p class="stem">Why did the router Deployment need a ServiceAccount + Role?</p>
+    <button class="opt" data-correct>It lists and watches Pods via API</button>
+    <button class="opt">It must restart engines that go unhealthy</button>
+    <button class="opt">All Deployments require explicit RBAC roles</button>
+    <p class="explain">Service discovery = querying the K8s API for Pods matching a label. Default service accounts can't. The router never restarts engines — that's the Deployment controller's job.</p>
+  </div>
+</div>
+
+<h2>Primary source</h2>
+<p><a href="https://github.com/vllm-project/production-stack/tree/main/src/vllm_router">vllm-router README</a> (production-stack) — routing logics, flags, metrics. Skim <a href="https://docs.vllm.ai/en/latest/features/automatic_prefix_caching.html">Automatic Prefix Caching</a> to connect affinity → cache hits.</p>
+
+<h2>Next</h2>
+<p><a href="0007-observability.html">Lesson 7</a>: you can't run what you can't see. Prometheus scrapes every engine + the router; Grafana turns it into the dashboard from the production-stack README.</p>
+
+<div class="lesson-footer">
+<p>References: <a href="../reference/vllm-cheatsheet.html">vLLM cheat sheet</a> · <a href="../reference/helm-cheatsheet.html">Helm cheat sheet</a>.</p>
+<p>Router flags changed upstream? Paste its --help or crash log to your teacher.</p>
+</div>
+
+</div>
+<script src="../assets/quiz.js"></script>
+</body>
+</html>

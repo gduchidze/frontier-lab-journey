@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lesson 16 — Distributed and Disaggregated Inference</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<div class="page">
+
+<p class="lesson-kicker">SLM Production Stack · ADVANCED · Lesson 16 · ~2 h (theory + design lab)</p>
+<h1>Distributed and Disaggregated Inference</h1>
+<p class="lesson-lede">When the model outgrows one GPU — or the workload outgrows one architecture — serving becomes a distributed-systems problem. This is the lesson interviewers reach for when the req says "senior". Mostly theory + capacity math; your deliverable is a design doc.</p>
+
+<h2>Knowledge</h2>
+
+<h3>1. The memory math that forces all of this</h3>
+<pre><code>weights ≈ params × bytes/param        70B @ bf16 ≈ 140 GB   → no single GPU
+KV/token ≈ 2 × layers × kv_heads × head_dim × bytes
+   Llama-70B bf16 ≈ ~320 KB/token → 8k-ctx request ≈ ~2.6 GB of KV — EACH</code></pre>
+<p>Weights don't fit → split the model. KV dominates at scale → cache becomes a first-class distributed resource. Every architecture below is one of those two forces.</p>
+
+<h3>2. The parallelism zoo</h3>
+<table>
+<tr><th>Type</th><th>Split</th><th>Comm pattern</th><th>Use when</th></tr>
+<tr><td><strong>TP</strong> tensor</td><td>Within each layer (attn heads, matmul shards)</td><td>All-reduce EVERY layer → needs NVLink; intra-node only</td><td>Model &gt; 1 GPU; the default (<code>--tensor-parallel-size</code> = GPUs/node)</td></tr>
+<tr><td><strong>PP</strong> pipeline</td><td>Layer ranges → stages</td><td>Activations at stage borders — cheap, cross-node OK</td><td>Model &gt; 1 node: TP inside node × PP across nodes</td></tr>
+<tr><td><strong>DP</strong> data</td><td>Nothing — full replicas</td><td>None (a router)</td><td>Throughput. Your lesson-6 stack IS DP</td></tr>
+<tr><td><strong>EP</strong> expert</td><td>MoE experts across GPUs</td><td>All-to-all token routing</td><td>Mixtral/DeepSeek-class MoE</td></tr>
+</table>
+<p>Composition rule of thumb: TP up to 8 (one node), then PP across nodes, then DP replicas for throughput. Multi-node coordination runs on Ray. PP's tax: pipeline <em>bubbles</em> — stages idling while waiting; microbatching shrinks but never removes them. (<a href="https://docs.vllm.ai/en/latest/serving/parallelism_scaling.html">docs</a>)</p>
+
+<h3>3. Disaggregated prefill: split the two workloads onto different metal</h3>
+<p>Lesson 15's tension (prefill interferes with decode) scales into an architecture: <strong>prefill instances</strong> (compute-optimized) process prompts, then ship KV to <strong>decode instances</strong> (bandwidth-optimized) via a KV-transfer connector (NIXL, Mooncake, LMCache). Wins: independent scaling of the two phases, tight TPOT SLOs without prefill jitter, right hardware per phase. Cost: KV shipping latency + a scheduler that must place both halves. This is production-stack's "disaggregated prefill" roadmap line and the architecture behind DeepSeek/Mooncake-style serving. (<a href="https://docs.vllm.ai/en/latest/features/disagg_prefill/">docs</a>)</p>
+
+<h3>4. The KV hierarchy: cache as infrastructure</h3>
+<p><a href="https://github.com/LMCache/LMCache">LMCache</a> (production-stack's sibling) tiers KV: GPU HBM → CPU RAM → local disk → remote store. Long system prompts, RAG contexts, and multi-turn histories get computed once and re-attached anywhere. Combine with the router's session/prefix awareness (lesson 6) and the cluster starts behaving like a CDN for computed attention. Tutorial 05 in production-stack wires exactly this.</p>
+
+<h3>5. Failure domains grow with the topology</h3>
+<p>DP replica dies → router drops it, capacity −1/N (you demoed this in lesson 8). TP shard dies → that whole replica dies (all-reduce needs every rank). PP stage dies → pipeline dead. Disagg prefill dies → TTFT degrades but decode drains. Senior design = stating blast radius per failure BEFORE it happens.</p>
+
+<h2>Lab (labs/lab-16): capacity math + design doc</h2>
+<p>Paper lab — the deliverables are what distinguish "read about it" from "can design it".</p>
+<div class="lab">
+<div class="step"><h3>Worksheet: three sizing problems</h3><p>In <code>docs/distributed-design.md</code>, show your arithmetic: (a) Llama-3.1-70B bf16 on H100-80GB — minimum TP for weights + KV headroom at 8k ctx × 32 concurrent; (b) same with fp8 weights + fp8 KV — what shrinks, what's now the binding constraint; (c) 405B across nodes — TP×PP layout and where the bubbles hurt.</p></div>
+<div class="step"><h3>Read the real thing</h3><p>production-stack <a href="https://github.com/vllm-project/production-stack/blob/main/tutorials/05-offload-kv-cache.md">tutorial 05 (KV offloading)</a> + the router's KV-aware routing notes. Map each config block to a concept from this lesson in your doc.</p></div>
+<div class="step"><h3>Design: the interview question</h3><p>Same doc, final section: "Chat product, 30k concurrent users, 8k avg context, tight TPOT SLO, H100 budget exists. Monolithic DP fleet vs disaggregated P/D — pick, justify, state blast radii and the metrics that would tell you you chose wrong." One page, opinionated.</p></div>
+<div class="step"><h3>Defend it</h3><p>Ask your teacher to attack the doc. Revise once. (Optional cloud session: rent 2×A10 for an hour, run real TP=2 — ask teacher to plan it.)</p></div>
+</div>
+
+<h2>Check yourself</h2>
+<div class="quiz" data-quiz>
+  <div class="q">
+    <p class="stem">Why does TP stay inside one node while PP crosses nodes?</p>
+    <button class="opt" data-correct>TP all-reduces every layer, needing NVLink</button>
+    <button class="opt">PP shards weights finer than TP</button>
+    <button class="opt">Ray schedules TP only on single hosts</button>
+    <p class="explain">TP synchronizes at every layer — interconnect bandwidth is the ceiling, so NVLink-class links or bust. PP only passes activations at stage boundaries; Ethernet survives that.</p>
+  </div>
+  <div class="q">
+    <p class="stem">Disaggregated prefill's core economic win?</p>
+    <button class="opt" data-correct>Scale prompt and token capacity independently</button>
+    <button class="opt">Halve total memory by sharing KV</button>
+    <button class="opt">Remove the router from the hot path</button>
+    <p class="explain">Prefill demand (prompt tokens/s) and decode demand (concurrent streams) move independently; separate pools let you buy the right hardware for each and stop cross-interference.</p>
+  </div>
+  <div class="q">
+    <p class="stem">One GPU dies in a TP=8 replica. Immediate effect?</p>
+    <button class="opt" data-correct>Whole replica down until rescheduled</button>
+    <button class="opt">Seven GPUs continue with degraded throughput</button>
+    <button class="opt">Requests reroute mid-generation to peers</button>
+    <p class="explain">All-reduce needs all ranks — TP is a single failure domain. In-flight generations on it are lost (the router retries new ones elsewhere). Design capacity with N-1 replicas in mind.</p>
+  </div>
+</div>
+
+<h2>Primary source</h2>
+<p><a href="https://docs.vllm.ai/en/latest/serving/parallelism_scaling.html">vLLM — Parallelism and Scaling</a> + <a href="https://docs.vllm.ai/en/latest/features/disagg_prefill/">disaggregated prefill</a>. Ambitious: the Mooncake paper (separating prefill/decode at industrial scale).</p>
+
+<h2>Next</h2>
+<p><a href="0017-sre-inference.html">Lesson 17</a>: running it — SLOs, burn-rate alerts, runbooks, and a chaos day against your own stack.</p>
+
+<div class="lesson-footer"><p><a href="index.html">Course home</a> · lab: <code>labs/lab-16/</code></p></div>
+</div>
+<script src="../assets/quiz.js"></script>
+</body>
+</html>

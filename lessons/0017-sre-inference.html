@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lesson 17 — SRE for Inference: SLOs, Alerts, Chaos</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<div class="page">
+
+<p class="lesson-kicker">SLM Production Stack · ADVANCED · Lesson 17 · ~2.5 h</p>
+<h1>SRE for Inference: SLOs, Alerts, Chaos</h1>
+<p class="lesson-lede">Building the stack was engineering; running it at 3 AM is a different discipline. Today you define what "working" means numerically, alert on it without paging yourself to death, write the runbook future-you will thank you for, and then break everything on purpose.</p>
+
+<h2>Knowledge</h2>
+
+<h3>1. SLI → SLO → error budget</h3>
+<p><strong>SLI</strong>: a measured ratio of good events ("chat requests with TTFT &lt; 4s"). <strong>SLO</strong>: the target over a window ("99% over 30 days"). <strong>Error budget</strong>: 100% − SLO — the amount of badness you're <em>allowed</em>, which is what makes deploys, chaos tests, and risk-taking rational instead of forbidden. For this stack:</p>
+<table>
+<tr><th>SLI</th><th>SLO (local-realistic)</th><th>Source</th></tr>
+<tr><td>Availability (non-5xx via router)</td><td>99.5% / 30d</td><td>router metrics</td></tr>
+<tr><td>TTFT &lt; 10s (CPU-realistic)</td><td>95% of requests</td><td><code>vllm:time_to_first_token_seconds_bucket</code></td></tr>
+<tr><td>Queue sanity</td><td>waiting &lt; 10 for 99% of minutes</td><td><code>vllm:num_requests_waiting</code></td></tr>
+</table>
+<p>The senior move: SLOs are <em>user-experience</em> statements, so TTFT/availability — never "CPU below 80%" (that's a cause, not an experience).</p>
+
+<h3>2. Alert on symptoms, page on burn rate</h3>
+<p>Threshold alerts ("TTFT &gt; 4s for 5m") either page constantly or too late. <strong>Multi-window burn-rate</strong> alerts fire when the error budget is being consumed abnormally fast:</p>
+<pre><code># page: burning 30d budget 14.4× too fast, confirmed on two windows
+(error_rate_1h  > 14.4 × (1 − SLO))
+and
+(error_rate_5m  > 14.4 × (1 − SLO))</code></pre>
+<p>Fast-burn (1h/5m, 14.4×) pages a human; slow-burn (6h/30m, 6×) files a ticket. Two windows kill flapping. This is the Google SRE Workbook recipe, and it's asked in interviews by name.</p>
+<p>Alert taxonomy for THIS stack — cause-alerts kept as <em>diagnostics</em>, not pages: engines down (<code>up == 0</code>), queue climbing, KV usage pinned &gt; 0.95, HPA at maxReplicas for &gt; 15m.</p>
+
+<h3>3. Runbooks: written before the incident, linked from the alert</h3>
+<p>An alert without a runbook is homework assigned at 3 AM. Skeleton that works:</p>
+<pre><code>ALERT: HighTTFTBurnRate
+1. CONFIRM   dashboards X, Y — real or metric artifact?
+2. SCOPE     one engine or all? one tenant? started when? deploy nearby? (Argo history!)
+3. MITIGATE  scale out | shed load (rate-limit at edge) | rollback last change
+4. VERIFY    burn rate falling on the 5m window
+5. FOLLOW-UP file postmortem; link evidence</code></pre>
+<p>Mitigate-then-diagnose. Restoring service outranks understanding it — understanding happens in the postmortem, which is <strong>blameless</strong>: systems and processes fail, not people.</p>
+
+<h3>4. Chaos engineering: hypothesis, not vandalism</h3>
+<p>Format: "Given [steady load], when [engine pod dies], we expect [router drops it &lt; 5s, zero 5xx, TTFT bump &lt; 30s]." Run, observe, compare, fix the gap. You've done baby chaos (lesson 8); today it's systematic, under load, with the dashboard recording and expectations written BEFORE.</p>
+
+<h2>Lab (labs/lab-17): ops day</h2>
+<div class="lab">
+<div class="step"><h3>Encode the SLOs</h3><p><code>docs/slo.md</code>: 3 SLIs above, targets, measurement queries. 15 minutes, no gold-plating.</p></div>
+<div class="step"><h3>PrometheusRule</h3><p><code>k8s/alerts.yaml</code>: fast-burn TTFT alert (two windows), plus diagnostics: <code>VLLMEngineDown</code>, <code>QueueBacklog</code> (waiting &gt; 10 for 5m). Apply; see them Inactive in Prometheus → Alerts.</p></div>
+<div class="step"><h3>Fire one for real</h3><p>k6 load beyond the lesson-9 knee → watch <code>QueueBacklog</code> go Pending → Firing. Screenshot. (Alertmanager routing to Slack/email = stretch.)</p></div>
+<div class="step"><h3>Runbooks</h3><p><code>runbooks/high-ttft.md</code> and <code>runbooks/engine-down.md</code> in the skeleton format, with real commands for YOUR stack (the scale command, the Argo rollback, the edge rate-limit annotation).</p></div>
+<div class="step"><h3>Chaos day (the fun one)</h3><p>Under steady k6 load, hypotheses written first: kill an engine → kill the router → <code>docker pause llm-stack-worker</code> (a "hung node" — nastier than a dead one) → delete Prometheus pod (who watches the watcher?). For each: expected vs observed, in <code>docs/chaos-day.md</code>.</p></div>
+<div class="step"><h3>Postmortem</h3><p>Pick the worst surprise. Full blameless postmortem in <code>docs/postmortems/0001-…md</code>: timeline, impact, root cause (5 whys), what saved us, action items. This document format is a hiring signal all by itself.</p></div>
+</div>
+
+<h2>Check yourself</h2>
+<div class="quiz" data-quiz>
+  <div class="q">
+    <p class="stem">Why burn-rate alerts instead of "P90 TTFT &gt; 4s for 5m"?</p>
+    <button class="opt" data-correct>They page proportional to budget consumption</button>
+    <button class="opt">They compute faster on histograms</button>
+    <button class="opt">They need no SLO definition upfront</button>
+    <p class="explain">Burn rate ties paging to how fast user-promised reliability is being spent — brief blips don't page, slow bleeds eventually do. Threshold alerts can't do either. (They require MORE upfront SLO work, not less.)</p>
+  </div>
+  <div class="q">
+    <p class="stem">Mid-incident, cause unknown, users hurting. Correct next move?</p>
+    <button class="opt" data-correct>Mitigate first, diagnose after service returns</button>
+    <button class="opt">Diagnose fully so the fix is correct</button>
+    <button class="opt">Freeze everything to preserve the evidence</button>
+    <p class="explain">Scale out / shed / roll back — restore the experience, then investigate. Metrics and logs preserve evidence for you; users don't wait for root cause.</p>
+  </div>
+  <div class="q">
+    <p class="stem">A paused (hung) node is nastier than a killed one because…</p>
+    <button class="opt" data-correct>Detection lags: node looks alive longer</button>
+    <button class="opt">Pods on it consume double resources</button>
+    <button class="opt">Kubelet restarts erase the pod logs</button>
+    <p class="explain">Dead nodes fail fast and clean. Hung nodes ride on stale heartbeats (~40s+ before NotReady, minutes before eviction) while requests routed there time out. Gray failures are the expensive ones.</p>
+  </div>
+</div>
+
+<h2>Primary source</h2>
+<p><a href="https://sre.google/workbook/alerting-on-slos/">Google SRE Workbook — Alerting on SLOs</a> (the burn-rate chapter, free online). Skim <a href="https://sre.google/sre-book/postmortem-culture/">Postmortem Culture</a>.</p>
+
+<h2>Next</h2>
+<p><a href="0018-cost-capstone.html">Lesson 18</a>: the money lesson — GPU economics, capacity planning, build-vs-buy — and the senior capstone design doc.</p>
+
+<div class="lesson-footer"><p><a href="index.html">Course home</a> · lab: <code>labs/lab-17/</code></p></div>
+</div>
+<script src="../assets/quiz.js"></script>
+</body>
+</html>

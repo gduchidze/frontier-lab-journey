@@ -1,0 +1,60 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm
+  namespace: {{ .Values.namespace }}
+  labels: { app: vllm }
+spec:
+  replicas: {{ .Values.vllm.replicaCount }}
+  selector:
+    matchLabels: { app: vllm }
+  template:
+    metadata:
+      labels: { app: vllm }
+    spec:
+      containers:
+      - name: vllm
+        image: "{{ .Values.vllm.image.repository }}:{{ .Values.vllm.image.tag }}"
+        imagePullPolicy: {{ .Values.vllm.image.pullPolicy }}
+        args:
+          - "--model"
+          - {{ .Values.vllm.model.name | quote }}
+          - "--max-model-len"
+          - {{ .Values.vllm.model.maxModelLen | quote }}
+          - "--dtype"
+          - {{ .Values.vllm.model.dtype | quote }}
+        env:
+        - name: VLLM_CPU_KVCACHE_SPACE
+          value: {{ .Values.vllm.kvCacheSpaceGiB | quote }}
+        ports:
+        - containerPort: 8000
+          name: http
+        resources:
+          {{- toYaml .Values.vllm.resources | nindent 10 }}
+        startupProbe:
+          httpGet: { path: /health, port: 8000 }
+          periodSeconds: 10
+          failureThreshold: 60
+        readinessProbe:
+          httpGet: { path: /health, port: 8000 }
+          periodSeconds: 10
+        livenessProbe:
+          httpGet: { path: /health, port: 8000 }
+          periodSeconds: 20
+          failureThreshold: 3
+        volumeMounts:
+        - name: hf-cache
+          mountPath: /root/.cache/huggingface
+        - name: dshm
+          mountPath: /dev/shm
+      volumes:
+      - name: hf-cache
+        {{- if .Values.vllm.pvc.enabled }}
+        persistentVolumeClaim: { claimName: hf-cache }
+        {{- else }}
+        emptyDir: {}
+        {{- end }}
+      - name: dshm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 2Gi

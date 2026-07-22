@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lesson 9 — Load Testing: Get the Numbers</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<div class="page">
+
+<p class="lesson-kicker">SLM Production Stack · Lesson 9 · Phase 9 · ~90 min</p>
+<h1>Load Testing: Get the Numbers</h1>
+<p class="lesson-lede">"It works" is a demo. "It sustains 0.9 req/s at P90 TTFT under 4s before saturating at 6 concurrent requests" is engineering. Today you measure your stack with the industry's own tools and read the results properly.</p>
+
+<h2>Knowledge: the four numbers of LLM serving</h2>
+<table>
+<tr><th>Metric</th><th>Definition</th><th>Who cares</th></tr>
+<tr><td><strong>TTFT</strong></td><td>Time To First Token — request sent → first token back</td><td>Users (feels like "responsiveness")</td></tr>
+<tr><td><strong>TPOT / ITL</strong></td><td>Time Per Output Token (inter-token latency) after the first</td><td>Users (feels like "typing speed")</td></tr>
+<tr><td><strong>Throughput</strong></td><td>Tokens/sec (or requests/sec) across the whole system</td><td>Whoever pays for hardware</td></tr>
+<tr><td><strong>Goodput</strong></td><td>Throughput <em>that meets latency SLOs</em></td><td>Everyone, eventually</td></tr>
+</table>
+<p>The fundamental trade: batching harder raises throughput but worsens per-request latency. A load test's job is to find <em>your</em> knee of that curve — the saturation point.</p>
+<p>Always report <strong>percentiles, not means</strong>: P50 tells the typical story, P99 tells the on-call story. One 60-second outlier hides completely in a mean.</p>
+
+<h2>Lab: two tools, one saturation curve</h2>
+
+<div class="lab">
+
+<div class="step">
+<h3>Tool 1 — vllm bench serve (the official benchmark)</h3>
+<p>It ships inside your image, so run it as a container on the same network path. Terminal 1: <code>kubectl port-forward -n llm svc/vllm-router 8080:80</code>. Terminal 2:</p>
+<pre><code>docker run --rm --network host --entrypoint vllm vllm-cpu:local \
+  bench serve \
+  --backend openai-chat \
+  --base-url http://host.docker.internal:8080 \
+  --endpoint /v1/chat/completions \
+  --model Qwen/Qwen3.5-0.8B \
+  --dataset-name random \
+  --random-input-len 128 --random-output-len 64 \
+  --num-prompts 30 \
+  --request-rate 0.5 \
+  --save-result --result-dir /tmp</code></pre>
+<p class="expect">expect (after a few min): a summary table — Request throughput, Output token throughput, Mean/Median/P99 TTFT, TPOT, ITL</p>
+<div class="note"><strong>Reading it</strong>
+<code>--request-rate 0.5</code> = Poisson arrivals at 0.5 req/s (open-loop, like real traffic). <code>inf</code> would fire everything at once (closed-loop stress). The <code>vllm-bench-serve</code> skill in this workspace documents every flag.</div>
+</div>
+
+<div class="step">
+<h3>Find the saturation point</h3>
+<p>Repeat the benchmark at <code>--request-rate</code> 0.25 → 0.5 → 1 → 2. Record into a table (put it in <code>NOTES.md</code> or the capstone README):</p>
+<pre><code>rate   req/s achieved   P50 TTFT   P90 TTFT   output tok/s
+0.25   ____             ____       ____       ____
+0.5    ____             ____       ____       ____
+1      ____             ____       ____       ____
+2      ____             ____       ____       ____</code></pre>
+<p class="expect">expect: achieved req/s stops following offered rate at some point, and P90 TTFT hockey-sticks — that knee IS your capacity</p>
+<p>Keep Grafana open: <code>num_requests_waiting</code> going nonzero-and-climbing is saturation seen from the inside — the same knee, two views.</p>
+</div>
+
+<div class="step">
+<h3>Tool 2 — k6 (the SRE's load tool)</h3>
+<p>What the doronmak repo uses (<code>load_tests/load_test.js</code>). Different lens: user-scenario scripting, SLO thresholds, pass/fail gates for CI.</p>
+<pre><code>brew install k6</code></pre>
+<p>Save as <code>load_tests/chat.js</code>:</p>
+<pre><code>import http from 'k6/http';
+import { check } from 'k6';
+
+export const options = {
+  stages: [
+    { duration: '1m', target: 4 },   // ramp to 4 virtual users
+    { duration: '2m', target: 4 },   // hold
+    { duration: '30s', target: 0 },  // drain
+  ],
+  thresholds: {
+    http_req_failed: ['rate&lt;0.01'],        // &lt;1% errors
+    http_req_duration: ['p(90)&lt;30000'],    // P90 end-to-end &lt; 30s (CPU-realistic)
+  },
+};
+
+export default function () {
+  const res = http.post(
+    'http://localhost:8080/v1/chat/completions',
+    JSON.stringify({
+      model: 'Qwen/Qwen3.5-0.8B',
+      messages: [{ role: 'user', content: 'Reply with one short sentence.' }],
+      max_tokens: 32,
+    }),
+    { headers: { 'Content-Type': 'application/json' }, timeout: '120s' },
+  );
+  check(res, { 'status 200': (r) =&gt; r.status === 200 });
+}</code></pre>
+<pre><code>k6 run load_tests/chat.js</code></pre>
+<p class="expect">expect: live VU/RPS readout; final report shows checks passed, thresholds ✓ or ✗ — a ✗ exits nonzero, which is how CI gates on performance</p>
+</div>
+
+<div class="step">
+<h3>Watch the whole system under load</h3>
+<p>Run the k6 test again with Grafana beside it. Confirm the story end to end: k6 VUs up → router QPS up → engine running requests plateau → waiting queue grows → TTFT P90 climbs → k6 P90 threshold nears its limit. One load, five instruments, one coherent narrative.</p>
+<div class="win"><strong>The win</strong>
+You have real numbers: capacity (req/s at the knee), latency (P50/P90 TTFT and TPOT), and an automated SLO gate. Put the table and a Grafana-under-load screenshot in the capstone README — measurable results are what make a portfolio project credible.</div>
+</div>
+
+</div>
+
+<h2>Check yourself</h2>
+<div class="quiz" data-quiz>
+  <div class="q">
+    <p class="stem">Why report P90 TTFT instead of mean TTFT?</p>
+    <button class="opt" data-correct>Tail latency reveals what means hide</button>
+    <button class="opt">Percentiles are cheaper to compute online</button>
+    <button class="opt">Mean requires storing every raw sample</button>
+    <p class="explain">Users experience the tail; a handful of slow requests vanish into a mean. SLOs are defined on percentiles for exactly this reason.</p>
+  </div>
+  <div class="q">
+    <p class="stem">Offered rate 2/s, achieved 0.9/s, waiting queue growing. System is…</p>
+    <button class="opt" data-correct>Saturated: past capacity, backlog accumulating</button>
+    <button class="opt">Warming up: caches not yet populated</button>
+    <button class="opt">Rate limited: router rejecting excess requests</button>
+    <p class="explain">Achieved &lt; offered with a growing queue is the definition of saturation. Warm-up ends; this doesn't. Nothing here rejects requests — they just wait.</p>
+  </div>
+  <div class="q">
+    <p class="stem">Raising max batch size usually trades…</p>
+    <button class="opt" data-correct>Better throughput for worse per-request latency</button>
+    <button class="opt">Better latency for worse memory safety</button>
+    <button class="opt">Better accuracy for worse token throughput</button>
+    <p class="explain">Bigger batches keep hardware busier (throughput ↑) but each request shares compute with more neighbors (TPOT ↑). Accuracy is untouched.</p>
+  </div>
+</div>
+
+<h2>Primary source</h2>
+<p><a href="https://docs.vllm.ai/en/latest/benchmarking/">vLLM benchmarking docs</a> (bench serve flags, metric definitions) and <a href="https://grafana.com/docs/k6/latest/">k6 docs</a> (thresholds, stages). Compare your k6 script with <a href="https://github.com/doronmak/VLLM-Kubernetes-Deployment/blob/main/load_tests/load_test.js">doronmak's load_test.js</a>.</p>
+
+<h2>Next</h2>
+<p><a href="0010-autoscaling-capstone.html">Lesson 10</a>: close the loop — autoscaling on the very metrics you just learned to read, then the capstone writeup.</p>
+
+<div class="lesson-footer">
+<p>References: <a href="../reference/observability-cheatsheet.html">observability cheat sheet</a> · workspace skills <code>vllm-bench-serve</code>, <code>vllm-bench-random-synthetic</code>.</p>
+<p>Numbers look weird? Share the bench output table with your teacher — interpreting it together is the lesson.</p>
+</div>
+
+</div>
+<script src="../assets/quiz.js"></script>
+</body>
+</html>

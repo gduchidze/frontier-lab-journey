@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Story Bank Matrix</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<div class="lesson">
+  <header class="lesson-header">
+    <p class="kicker">Reference · Story Bank</p>
+    <h1>Story Bank Matrix</h1>
+    <p class="dek">8–10 true stories × 6 competencies. Bullets only — a scripted story is a dead story. Print this, fill by hand, keep it beside you in every mock.</p>
+  </header>
+
+  <h2>The rules</h2>
+  <ul>
+    <li><strong>Bullets, never scripts.</strong> 4–6 bullet points per story: context (1), stakes (1), your actions (2–3), measured result + what you learned (1). Recalling bullets sounds like thinking; recalling scripts sounds like reciting — an explicit failure mode at Anthropic.</li>
+    <li><strong>Each story covers ≥3 competencies.</strong> A 4–6 round loop burns questions fast; stories must be reusable from different angles without repeating.</li>
+    <li><strong>Senior bar:</strong> the Result row must show organizational impact — what changed about how the team/company works — not just "the bug got fixed".</li>
+    <li><strong>Quantify.</strong> Latency numbers, revenue, headcount influenced, incidents prevented. Specific metrics are the strongest authenticity signal.</li>
+  </ul>
+
+  <h2>Competency columns</h2>
+  <table>
+    <tr><th>#</th><th>Competency</th><th>What the labs probe</th></tr>
+    <tr><td>C1</td><td>Ownership</td><td>Took responsibility beyond your lane; OpenAI's favorite axis</td></tr>
+    <tr><td>C2</td><td>Conflict / disagreement</td><td>Disagreed with authority or peer; how you fought and how you lost/won gracefully</td></tr>
+    <tr><td>C3</td><td>Failure</td><td>A real one, with your name on it — self-reflection, no hero edit</td></tr>
+    <tr><td>C4</td><td>Ambiguity</td><td>Acted with unclear requirements/no precedent; frontier-lab daily life</td></tr>
+    <tr><td>C5</td><td>Influence / leadership</td><td>Changed other people's behavior without authority; cross-functional work</td></tr>
+    <tr><td>C6</td><td>Values under pressure</td><td>Anthropic's signature: your ethics actually costing you something</td></tr>
+  </table>
+
+  <h2>The matrix (fill in)</h2>
+  <table>
+    <tr><th>Story (2–4 word handle)</th><th>C1</th><th>C2</th><th>C3</th><th>C4</th><th>C5</th><th>C6</th><th>Metric in the result?</th></tr>
+    <tr><td><em>Example: "The rollback call"</em></td><td>✓</td><td>✓</td><td></td><td>✓</td><td></td><td>✓</td><td><em>prevented ~2h outage for 40k users</em></td></tr>
+    <tr><td>1.</td><td></td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+    <tr><td>2.</td><td></td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+    <tr><td>3.</td><td></td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+    <tr><td>4.</td><td></td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+    <tr><td>5.</td><td></td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+    <tr><td>6.</td><td></td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+    <tr><td>7.</td><td></td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+    <tr><td>8.</td><td></td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+    <tr><td>9.</td><td></td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+    <tr><td>10.</td><td></td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+  </table>
+
+  <div class="callout"><span class="label">Coverage check</span>
+    Every column needs ≥2 checked stories. C3 (failure) and C6 (values) are the ones engineers leave empty — and the ones frontier labs weight hardest. If they're empty after mining, that's the next lesson's work.
+  </div>
+
+  <h2>Per-story bullet template</h2>
+  <pre><code>STORY: &lt;handle&gt;
+• Context: &lt;one line — company/scale/your role&gt;
+• Stakes: &lt;what breaks / who's affected if this goes wrong&gt;
+• Action 1: &lt;what YOU did — verbs, decisions, trade-offs&gt;
+• Action 2: &lt;…&gt;
+• Result: &lt;metric&gt; + changed: &lt;what the org does differently now&gt;
+• Learned: &lt;one honest sentence — this is the part Anthropic listens to&gt;</code></pre>
+
+  <footer class="lesson-footer">
+    <p>Built in <a href="../lessons/0001-story-mining.html">Lesson 0001</a>. Question banks: <a href="0002-question-bank.html">Reference 0002</a>.</p>
+  </footer>
+</div>
+</body>
+</html>

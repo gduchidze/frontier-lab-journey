@@ -1,0 +1,188 @@
+/* Shared course stylesheet — SLM Production Stack course */
+:root {
+  --bg: #fffef9;
+  --ink: #1a1a18;
+  --muted: #6b6b64;
+  --accent: #b3492a;      /* burnt sienna — links, highlights */
+  --accent-soft: #f4e3dc;
+  --k8s: #2e5aac;         /* kubernetes blue */
+  --ok: #2f6b3a;
+  --warn: #8a6d1f;
+  --code-bg: #f4f2ea;
+  --border: #e2ded2;
+  --serif: "Iowan Old Style", "Palatino", "Georgia", serif;
+  --mono: "SF Mono", "JetBrains Mono", Menlo, monospace;
+}
+
+* { box-sizing: border-box; }
+html { font-size: 17px; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font-family: var(--serif);
+  line-height: 1.55;
+}
+
+.page {
+  max-width: 46rem;
+  margin: 0 auto;
+  padding: 3rem 1.5rem 6rem;
+}
+
+/* ---------- header ---------- */
+.lesson-kicker {
+  font-family: var(--mono);
+  font-size: 0.72rem;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--accent);
+  margin: 0 0 0.4rem;
+}
+h1 {
+  font-size: 2.1rem;
+  line-height: 1.15;
+  margin: 0 0 0.5rem;
+  font-weight: 600;
+}
+.lesson-lede {
+  font-size: 1.12rem;
+  color: var(--muted);
+  font-style: italic;
+  margin: 0 0 2.5rem;
+}
+
+h2 {
+  font-size: 1.35rem;
+  margin: 2.8rem 0 0.8rem;
+  padding-top: 1.2rem;
+  border-top: 1px solid var(--border);
+  font-weight: 600;
+}
+h3 { font-size: 1.05rem; margin: 1.8rem 0 0.5rem; font-weight: 700; }
+
+a { color: var(--accent); text-decoration-thickness: 1px; text-underline-offset: 2px; }
+a:hover { text-decoration-thickness: 2px; }
+
+/* ---------- code ---------- */
+code {
+  font-family: var(--mono);
+  font-size: 0.82em;
+  background: var(--code-bg);
+  padding: 0.1em 0.35em;
+  border-radius: 3px;
+}
+pre {
+  background: var(--code-bg);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--k8s);
+  border-radius: 4px;
+  padding: 0.9rem 1rem;
+  overflow-x: auto;
+  line-height: 1.45;
+}
+pre code { background: none; padding: 0; font-size: 0.8rem; }
+
+/* ---------- callouts ---------- */
+.note, .win, .warning {
+  border-radius: 4px;
+  padding: 0.8rem 1rem;
+  margin: 1.2rem 0;
+  font-size: 0.95rem;
+}
+.note    { background: #eef2f9; border-left: 3px solid var(--k8s); }
+.win     { background: #edf5ee; border-left: 3px solid var(--ok); }
+.warning { background: #faf3df; border-left: 3px solid var(--warn); }
+.note strong:first-child, .win strong:first-child, .warning strong:first-child { display: block; margin-bottom: 0.2rem; }
+
+/* ---------- architecture diagram blocks ---------- */
+.arch {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin: 1.4rem 0;
+  font-family: var(--mono);
+  font-size: 0.75rem;
+}
+.arch .box {
+  flex: 1 1 8rem;
+  border: 1.5px solid var(--ink);
+  border-radius: 4px;
+  padding: 0.6rem 0.7rem;
+  background: #fff;
+  text-align: center;
+}
+.arch .box small { display: block; color: var(--muted); margin-top: 0.25rem; font-size: 0.68rem; }
+.arch .box.hot { border-color: var(--accent); background: var(--accent-soft); }
+.arch .flow { align-self: center; color: var(--muted); }
+
+/* ---------- tables ---------- */
+table { border-collapse: collapse; width: 100%; margin: 1.2rem 0; font-size: 0.92rem; }
+th { text-align: left; font-family: var(--mono); font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); }
+th, td { padding: 0.45rem 0.6rem; border-bottom: 1px solid var(--border); vertical-align: top; }
+
+/* ---------- lab steps ---------- */
+.lab { counter-reset: step; }
+.lab .step {
+  position: relative;
+  padding-left: 2.6rem;
+  margin: 1.6rem 0;
+}
+.lab .step::before {
+  counter-increment: step;
+  content: counter(step);
+  position: absolute;
+  left: 0; top: 0.1rem;
+  width: 1.7rem; height: 1.7rem;
+  border-radius: 50%;
+  background: var(--k8s);
+  color: #fff;
+  font-family: var(--mono);
+  font-size: 0.85rem;
+  display: flex; align-items: center; justify-content: center;
+}
+.lab .step h3 { margin-top: 0; }
+.expect {
+  font-family: var(--mono);
+  font-size: 0.75rem;
+  color: var(--ok);
+  margin-top: -0.4rem;
+}
+
+/* ---------- quiz (used with ../assets/quiz.js) ---------- */
+.quiz { border: 1px solid var(--border); border-radius: 6px; padding: 1.2rem 1.4rem; margin: 1.5rem 0; background: #fff; }
+.quiz h3 { margin-top: 0; }
+.quiz .q { margin: 1.1rem 0; }
+.quiz .q p.stem { font-weight: 600; margin: 0 0 0.5rem; }
+.quiz .opt {
+  display: block;
+  width: 100%;
+  text-align: left;
+  font-family: var(--mono);
+  font-size: 0.82rem;
+  background: var(--code-bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.5rem 0.7rem;
+  margin: 0.35rem 0;
+  cursor: pointer;
+}
+.quiz .opt:hover { border-color: var(--k8s); }
+.quiz .opt.correct { background: #edf5ee; border-color: var(--ok); }
+.quiz .opt.wrong   { background: #f9e8e2; border-color: var(--accent); }
+.quiz .explain { font-size: 0.85rem; color: var(--muted); margin: 0.4rem 0 0; display: none; }
+.quiz .q.answered .explain { display: block; }
+
+/* ---------- footer nav ---------- */
+.lesson-footer {
+  margin-top: 3.5rem;
+  padding-top: 1.2rem;
+  border-top: 1px solid var(--border);
+  font-size: 0.9rem;
+  color: var(--muted);
+}
+
+@media print {
+  body { background: #fff; }
+  .quiz .opt { cursor: default; }
+}

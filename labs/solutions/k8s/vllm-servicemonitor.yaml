@@ -1,0 +1,15 @@
+# Lab 07 — scrape declaration (requires kube-prometheus-stack installed with
+# --set prometheus.prometheusSpec.serviceMonitorSelectorNilUsesHelmValues=false)
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: vllm
+  namespace: llm
+  labels: { app: vllm }
+spec:
+  selector:
+    matchLabels: { app: vllm }   # matches the SERVICE's labels
+  endpoints:
+  - port: http                    # SERVICE PORT NAME, not a number
+    path: /metrics
+    interval: 15s

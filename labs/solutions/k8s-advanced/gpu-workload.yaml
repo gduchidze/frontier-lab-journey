@@ -1,0 +1,50 @@
+# Lab 11 — priority classes + "GPU" workload for scheduling drills
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: prod-inference
+value: 100000
+description: "Production inference — preempts batch"
+---
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: batch-experiment
+value: 1000
+preemptionPolicy: Never        # batch never preempts anyone
+description: "Batch / experiments — first to be evicted"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gpu-workload
+  labels: { app: gpu-workload }
+spec:
+  replicas: 3                  # node advertises 2 → third stays Pending (intended)
+  selector:
+    matchLabels: { app: gpu-workload }
+  template:
+    metadata:
+      labels: { app: gpu-workload }
+    spec:
+      priorityClassName: batch-experiment
+      tolerations:
+      - key: gpu
+        operator: Equal
+        value: "true"
+        effect: NoSchedule
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - { key: gpu, operator: In, values: ["true"] }
+      containers:
+      - name: work
+        image: busybox
+        command: ["sleep", "infinity"]
+        resources:
+          requests:
+            example.com/gpu: 1
+          limits:
+            example.com/gpu: 1

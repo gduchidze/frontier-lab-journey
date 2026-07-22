@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lesson 1 — The Map, and Your First Cluster</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<div class="page">
+
+<p class="lesson-kicker">SLM Production Stack · Lesson 1 · Phase 1 · ~90 min</p>
+<h1>The Map, and Your First Cluster</h1>
+<p class="lesson-lede">Before serving a language model, you need somewhere to serve it. Today you learn what Kubernetes actually is, see the whole stack you'll build, and run your first workload in a real cluster on your own machine.</p>
+
+<h2>Where you're going</h2>
+<p>This is the system you'll have built by the end of the course — the same architecture as <a href="https://github.com/vllm-project/production-stack">vLLM production-stack</a>, the official reference used by real inference platforms:</p>
+
+<div class="arch">
+  <div class="box">Open WebUI<small>chat frontend · phase 8</small></div>
+  <div class="flow">→</div>
+  <div class="box">Request Router<small>session routing · phase 6</small></div>
+  <div class="flow">→</div>
+  <div class="box hot">vLLM engines<small>Qwen3.5-0.8B · phases 3–5</small></div>
+</div>
+<div class="arch">
+  <div class="box">Prometheus<small>scrapes metrics · phase 7</small></div>
+  <div class="flow">→</div>
+  <div class="box">Grafana<small>TTFT, latency dashboards · phase 7</small></div>
+  <div class="flow"></div>
+  <div class="box">k6 / vllm bench<small>load tests · phase 9</small></div>
+</div>
+
+<p>Everything in those boxes runs <em>inside Kubernetes</em>. That's why K8s comes first: it's the operating system of the whole stack.</p>
+
+<h2>Knowledge: Kubernetes in four ideas</h2>
+
+<h3>1. A cluster is machines pretending to be one computer</h3>
+<p>A <strong>cluster</strong> = a <strong>control plane</strong> (the brain: API server, scheduler) + <strong>nodes</strong> (the muscle: machines that run your containers). You tell the API server <em>what you want</em>; the scheduler decides <em>which node</em> runs it. At a company, nodes are GPU servers. On your Mac, nodes are Docker containers created by <a href="https://kind.sigs.k8s.io/">kind</a> — "Kubernetes in Docker". Same API, same skills.</p>
+
+<h3>2. The Pod is the atom</h3>
+<p>A <strong>Pod</strong> is the smallest deployable unit: one or more containers sharing a network identity. You almost never create Pods directly — they're mortal. When a Pod dies, it's gone. (<a href="https://kubernetes.io/docs/concepts/workloads/pods/">docs</a>)</p>
+
+<h3>3. Deployments keep the desired state true</h3>
+<p>A <strong>Deployment</strong> says "I want 3 replicas of this Pod, always." Kubernetes runs a reconciliation loop: kill a Pod, and a new one appears. This is <em>declarative</em> infrastructure — you declare the goal, K8s does the work. This one idea is why K8s won. (<a href="https://kubernetes.io/docs/concepts/workloads/controllers/deployment/">docs</a>)</p>
+
+<h3>4. Services give mortal Pods an immortal address</h3>
+<p>Pods get random IPs and die. A <strong>Service</strong> is a stable name + IP that load-balances across whatever Pods currently match its label selector. When your router sends traffic to "the vLLM engines" in phase 6, it will talk to a Service, never to Pods. (<a href="https://kubernetes.io/docs/concepts/services-networking/service/">docs</a>)</p>
+
+<div class="note"><strong>Career note</strong>
+Interviews for ML infra roles routinely ask: "What happens when you run <code>kubectl apply</code>?" and "Deployment vs Pod vs Service?" After today's lab you'll have touched all three.</div>
+
+<h2>Lab: cluster up, app served</h2>
+<p>Goal: a two-node cluster on your Mac, an nginx web server running as a Deployment, reachable through a Service. ~45–60 min including installs.</p>
+
+<div class="lab">
+
+<div class="step">
+<h3>Start Docker, install tools</h3>
+<p>Open Docker Desktop (kind lives inside Docker), then:</p>
+<pre><code>brew install kind helm
+kind version &amp;&amp; helm version</code></pre>
+<p class="expect">expect: kind v0.2x.x, helm v3.x</p>
+</div>
+
+<div class="step">
+<h3>Create the cluster</h3>
+<p>Save as <code>k8s/kind-config.yaml</code> in this workspace (same pattern as the <a href="https://github.com/doronmak/VLLM-Kubernetes-Deployment/blob/main/k8s/kind-config.yaml">doronmak repo</a> — a control-plane node plus a worker, with port 30080 mapped to your Mac for later):</p>
+<pre><code>kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: llm-stack
+nodes:
+  - role: control-plane
+    extraPortMappings:
+      - containerPort: 30080
+        hostPort: 30080
+  - role: worker</code></pre>
+<pre><code>kind create cluster --config k8s/kind-config.yaml
+kubectl get nodes</code></pre>
+<p class="expect">expect: 2 nodes, STATUS Ready (control-plane may take ~30s)</p>
+</div>
+
+<div class="step">
+<h3>Look at what you built</h3>
+<pre><code>docker ps                          # your "machines" are containers
+kubectl get pods -A                # K8s runs itself as pods too
+kubectl cluster-info</code></pre>
+<p>Notice <code>kube-apiserver</code>, <code>etcd</code>, <code>kube-scheduler</code> in namespace <code>kube-system</code> — the control plane from idea #1, running as Pods.</p>
+</div>
+
+<div class="step">
+<h3>Run a Deployment</h3>
+<pre><code>kubectl create deployment hello --image=nginx:alpine --replicas=2
+kubectl get pods -o wide</code></pre>
+<p class="expect">expect: 2 pods hello-xxxx Running, spread across nodes</p>
+<p>Now prove the reconciliation loop (idea #3). Delete one Pod and watch K8s resurrect it:</p>
+<pre><code>kubectl delete pod $(kubectl get pods -l app=hello -o name | head -1)
+kubectl get pods -w        # Ctrl+C to stop watching</code></pre>
+<p class="expect">expect: a NEW pod (different suffix) appears within seconds</p>
+</div>
+
+<div class="step">
+<h3>Expose it with a Service</h3>
+<pre><code>kubectl expose deployment hello --port=80
+kubectl get svc hello
+kubectl port-forward svc/hello 8080:80</code></pre>
+<p>In a second terminal:</p>
+<pre><code>curl -s localhost:8080 | head -4</code></pre>
+<p class="expect">expect: &lt;!DOCTYPE html&gt; ... Welcome to nginx!</p>
+<div class="win"><strong>The win</strong>
+You just did, in miniature, exactly what phase 4 does with vLLM: Deployment runs the workload, Service gives it a stable address, port-forward lets you talk to it. Swap <code>nginx</code> for <code>vllm</code> and <code>curl /</code> for <code>curl /v1/chat/completions</code> — same shape.</div>
+</div>
+
+<div class="step">
+<h3>Clean up (keep the cluster!)</h3>
+<pre><code>kubectl delete deployment hello
+kubectl delete svc hello</code></pre>
+<p>The cluster stays — lesson 2 builds on it. (If you ever need to nuke it: <code>kind delete cluster --name llm-stack</code>.)</p>
+</div>
+
+</div>
+
+<h2>Check yourself</h2>
+<p>Answer from memory — retrieval is the point. Click an option.</p>
+
+<div class="quiz" data-quiz>
+  <div class="q">
+    <p class="stem">A Pod in your Deployment crashes at 3 AM. What happens?</p>
+    <button class="opt" data-correct>Controller creates replacement Pod automatically</button>
+    <button class="opt">Operator receives page, restarts it manually</button>
+    <button class="opt">Service restarts the crashed Pod directly</button>
+    <p class="explain">The Deployment's reconciliation loop notices actual state (1 replica) ≠ desired state (2 replicas) and creates a new Pod. Services never manage Pods — they only route to them.</p>
+  </div>
+  <div class="q">
+    <p class="stem">Why does the router talk to a Service instead of Pod IPs?</p>
+    <button class="opt" data-correct>Pods die often, Service address stays stable</button>
+    <button class="opt">Services run faster, Pod networking adds latency</button>
+    <button class="opt">Pod IPs stay hidden, Services expose everything</button>
+    <p class="explain">Pods are mortal and get new IPs each time. The Service is the stable name that load-balances across whichever Pods currently match its selector.</p>
+  </div>
+  <div class="q">
+    <p class="stem">In kind, what is a "node" physically?</p>
+    <button class="opt" data-correct>A Docker container simulating one machine</button>
+    <button class="opt">A virtual machine running inside hypervisor</button>
+    <button class="opt">A separate process on host macOS</button>
+    <p class="explain">kind = Kubernetes IN Docker. Each node is a container. That's why <code>docker ps</code> showed your "machines". Real clusters use VMs or bare metal — same API either way.</p>
+  </div>
+</div>
+
+<h2>Primary source</h2>
+<p>Read this tonight (15 min): <a href="https://kubernetes.io/docs/concepts/overview/">Kubernetes docs — Overview &amp; Concepts</a>. It's the canonical source and unusually well-written. Skim <a href="https://kind.sigs.k8s.io/docs/user/quick-start/">kind quickstart</a> for what you just did.</p>
+
+<h2>Next</h2>
+<p>Lesson 2: production-shaped manifests — writing the YAML yourself (you used generator commands today), plus namespaces, resource requests/limits, and health probes. Those are the exact knobs the vLLM deployment in phase 4 depends on.</p>
+
+<div class="lesson-footer">
+<p>Course home: <a href="index.html">all lessons</a> · Reference card for today: <a href="../reference/kubectl-cheatsheet.html">kubectl cheat sheet</a>.</p>
+<p>Stuck or curious? Ask your teacher (the agent) anything — error output, "why", "what if". That's what it's for.</p>
+</div>
+
+</div>
+<script src="../assets/quiz.js"></script>
+</body>
+</html>

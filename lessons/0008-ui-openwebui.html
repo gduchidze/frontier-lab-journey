@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lesson 8 — The UI: Open WebUI on the Stack</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<div class="page">
+
+<p class="lesson-kicker">SLM Production Stack · Lesson 8 · Phase 8 · ~75 min</p>
+<h1>The UI: Open WebUI on the Stack</h1>
+<p class="lesson-lede">Everything so far spoke curl. Today the stack gets a face: Open WebUI — a full-featured chat frontend — deployed into the cluster, wired to the router, and exposed to your browser through the NodePort you mapped back in Lesson 1.</p>
+
+<h2>Knowledge: three ideas</h2>
+
+<h3>1. The OpenAI API dividend pays out</h3>
+<p><a href="https://github.com/open-webui/open-webui">Open WebUI</a> speaks the OpenAI API. Point <code>OPENAI_API_BASE_URL</code> at any compatible server — vLLM, your router — and it lists models, streams chat, manages conversations. Zero custom code. This is why lesson 3 called the API "the dividend": every tool in the ecosystem plugs in for free. (vLLM's own docs feature this pairing: <a href="https://docs.vllm.ai/en/latest/deployment/frameworks/open-webui.html">Open WebUI deployment guide</a>.)</p>
+
+<h3>2. In-cluster DNS does the wiring</h3>
+<p>The UI reaches the router by Service DNS: <code>http://vllm-router.llm.svc.cluster.local/v1</code>. No IPs, no config discovery — the pattern from lesson 2, now earning its keep across namespaces.</p>
+
+<h3>3. NodePort: the third way to be reached</h3>
+<p>You know <code>port-forward</code> (dev tunnel) and ClusterIP (in-cluster only). <strong>NodePort</strong> opens a port (30000–32767) on every node. Your Lesson-1 kind config mapped node port 30080 → Mac port 30080 — planted exactly for today. Production would use an Ingress/LoadBalancer; NodePort is the honest local equivalent. (<a href="https://kubernetes.io/docs/concepts/services-networking/service/#type-nodeport">docs</a>)</p>
+
+<h2>Lab: ship the face</h2>
+
+<div class="lab">
+
+<div class="step">
+<h3>Deploy Open WebUI</h3>
+<p>Save as <code>k8s/webui.yaml</code>:</p>
+<pre><code>apiVersion: v1
+kind: Namespace
+metadata:
+  name: ui
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: webui-data
+  namespace: ui
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 2Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: open-webui
+  namespace: ui
+  labels: { app: open-webui }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: open-webui }
+  template:
+    metadata:
+      labels: { app: open-webui }
+    spec:
+      containers:
+      - name: open-webui
+        image: ghcr.io/open-webui/open-webui:main
+        env:
+        - name: OPENAI_API_BASE_URL
+          value: "http://vllm-router.llm.svc.cluster.local/v1"
+        - name: OPENAI_API_KEY
+          value: "not-needed-locally"
+        - name: WEBUI_AUTH
+          value: "False"
+        - name: ENABLE_OLLAMA_API
+          value: "False"
+        ports:
+        - containerPort: 8080
+        resources:
+          requests: { cpu: 250m, memory: 512Mi }
+          limits:   { cpu: "1",  memory: 1Gi }
+        readinessProbe:
+          httpGet: { path: /health, port: 8080 }
+          periodSeconds: 10
+        volumeMounts:
+        - name: data
+          mountPath: /app/backend/data
+      volumes:
+      - name: data
+        persistentVolumeClaim: { claimName: webui-data }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: open-webui
+  namespace: ui
+spec:
+  type: NodePort
+  selector: { app: open-webui }
+  ports:
+  - port: 8080
+    targetPort: 8080
+    nodePort: 30080</code></pre>
+<div class="warning"><strong>WEBUI_AUTH=False is local-only</strong>
+Fine on your laptop, disqualifying anywhere reachable by others. If you ever demo this off-machine, enable auth and put it behind TLS. Note it in your portfolio README — reviewers notice security awareness.</div>
+<pre><code>kubectl apply -f k8s/webui.yaml
+kubectl get pods -n ui -w</code></pre>
+<p class="expect">expect: open-webui pod READY 1/1 in ~1 min (first image pull is ~1 GB, be patient)</p>
+</div>
+
+<div class="step">
+<h3>Open it — no port-forward needed</h3>
+<p>Browser → <a href="http://localhost:30080">http://localhost:30080</a>. Trace why this works, hop by hop: browser → Mac:30080 → kind extraPortMapping → control-plane node:30080 → NodePort Service → UI Pod. Say it out loud; being able to trace a request path through K8s networking is an interview staple.</p>
+<p class="expect">expect: Open WebUI loads; model picker shows Qwen/Qwen3.5-0.8B (fetched from the router's /v1/models)</p>
+</div>
+
+<div class="step">
+<h3>Chat, then look behind the curtain</h3>
+<p>Have a short conversation in the UI. Then, split screen with Grafana (lesson 7 dashboard):</p>
+<pre><code>kubectl logs -n llm -l app=vllm-router -f --tail=5</code></pre>
+<p class="expect">expect: each UI message = a POST /v1/chat/completions in router logs; TTFT panel ticks in Grafana</p>
+<div class="win"><strong>The win</strong>
+User-facing product on top of your own inference infrastructure: browser → NodePort → UI → router → engines, with weights on PVCs and metrics flowing to Grafana. That sentence — which you can now defend line by line — is the project summary for your CV.</div>
+</div>
+
+<div class="step">
+<h3>Resilience demo (5 min, do it — it's fun)</h3>
+<p>Mid-conversation, kill an engine:</p>
+<pre><code>kubectl delete pod -n llm $(kubectl get pods -n llm -l app=vllm -o name | head -1 | cut -d/ -f2)</code></pre>
+<p>Keep chatting. The router discovers the dead engine, routes to the survivor; the Deployment resurrects the victim. The user never knows. Every layer you built is now visibly doing its job.</p>
+</div>
+
+</div>
+
+<h2>Check yourself</h2>
+<div class="quiz" data-quiz>
+  <div class="q">
+    <p class="stem">How does Open WebUI find models to show in its picker?</p>
+    <button class="opt" data-correct>GET /v1/models on configured base URL</button>
+    <button class="opt">K8s API listing pods labeled app=vllm</button>
+    <button class="opt">Static list configured in its ConfigMap</button>
+    <p class="explain">Pure OpenAI-API client behavior — it asks the endpoint what models exist. Only the router touches the K8s API.</p>
+  </div>
+  <div class="q">
+    <p class="stem">Why does localhost:30080 reach the UI without port-forward?</p>
+    <button class="opt" data-correct>kind maps node port onto host</button>
+    <button class="opt">NodePort services always bind host localhost</button>
+    <button class="opt">Open WebUI runs in host network</button>
+    <p class="explain">Two mechanisms chained: NodePort opens 30080 on the node; the Lesson-1 <code>extraPortMappings</code> forwards Mac:30080 → node:30080. Without the kind mapping, NodePort alone would only be reachable from the node containers.</p>
+  </div>
+</div>
+
+<h2>Primary source</h2>
+<p><a href="https://docs.vllm.ai/en/latest/deployment/frameworks/open-webui.html">vLLM docs — Open WebUI</a> and <a href="https://docs.openwebui.com/">Open WebUI docs</a> (env vars reference).</p>
+
+<h2>Next</h2>
+<p><a href="0009-load-testing.html">Lesson 9</a>: numbers. k6 and <code>vllm bench serve</code> put your stack under load; you read the results like an infra engineer.</p>
+
+<div class="lesson-footer">
+<p>UI can't see models? Check router Service DNS from inside: <code>kubectl exec -n ui deploy/open-webui -- curl -s http://vllm-router.llm.svc.cluster.local/v1/models</code> — then ask your teacher.</p>
+</div>
+
+</div>
+<script src="../assets/quiz.js"></script>
+</body>
+</html>

@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lesson 1 · Latency, Throughput, and the Tail</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<div class="lesson">
+  <header class="lesson-header">
+    <p class="kicker">Lesson 0001 · Phase 1 — Distributed Systems Core</p>
+    <h1>Latency, Throughput, and the Tail</h1>
+    <p class="dek">The three words every design answer is graded in — and why the average is a lie.</p>
+  </header>
+
+  <div class="mission-tie">
+    <strong>Mission tie.</strong> Anthropic's system design rounds open with prompts like <em>"design a token-generation service that handles 100,000 requests per second."</em> That sentence already contains a throughput target — and your first move as a candidate is to ask for the latency SLO. This lesson gives you those words. (<a href="https://www.tryexponent.com/blog/anthropic-system-design-interview">Exponent's 2026 Anthropic guide</a>)
+  </div>
+
+  <h2>1 · Two axes, not one</h2>
+  <p><strong>Latency</strong> is how long <em>one</em> request takes, measured from the caller's point of view (milliseconds). <strong>Throughput</strong> is how <em>many</em> requests the system completes per second (RPS/QPS — or tokens/second for LLMs). They are independent axes, and systems trade one for the other constantly. (<a href="https://github.com/donnemartin/system-design-primer#latency-vs-throughput">Primer: latency vs throughput</a>)</p>
+  <p>The canonical trade: <strong>batching</strong>. Grouping requests and processing them together raises throughput (less per-request overhead, better hardware utilization) but can raise latency (early requests wait for the batch to fill). Hold onto this — the entire discipline of LLM serving is a sophisticated answer to "how do we batch without wrecking latency," and it is the core of <em>the</em> Anthropic prompt. (<a href="https://blog.vllm.ai/2025/09/05/anatomy-of-vllm.html">Inside vLLM</a>)</p>
+
+  <h2>2 · Percentiles: the average is a lie</h2>
+  <p>Report latency as a <strong>distribution</strong>, never an average. <strong>p50</strong> (median) is the typical experience; <strong>p99</strong> is the value that 99% of requests beat — and 1% suffer. The slow end is the <strong>tail</strong>.</p>
+  <p>Why obsess over 1%? Two reasons from <a href="https://www.oreilly.com/library/view/designing-data-intensive-applications/9781098119058/">DDIA ch. 1</a>:</p>
+  <ul>
+    <li><strong>The tail hits your best customers.</strong> The slowest requests are often the heaviest accounts — the ones with the most data. Amazon famously observed ~1% sales loss per 100 ms of added latency, so they specify SLOs at p999.</li>
+    <li><strong>Fan-out amplifies the tail.</strong> If one page load makes <em>N</em> backend calls, the chance of hitting at least one p99-slow call is <code>1 − 0.99<sup>N</sup></code>. At N = 100 that is ≈ 63%. Your "rare" tail becomes the median user experience. This is called <em>tail latency amplification</em>.</li>
+  </ul>
+
+  <div class="callout"><span class="label">Vocabulary</span>
+    An <strong>SLO</strong> (Service Level Objective) is a target expressed in these terms: "p99 latency &lt; 500 ms at 10k RPS." Designs are judged against SLOs, not vibes. Full definitions live in the <a href="../reference/0001-glossary.html">Glossary</a>.
+  </div>
+
+  <h2>3 · Numbers that anchor every estimate</h2>
+  <p>You cannot sanity-check a design without a few physical constants. The full table is in the <a href="../reference/0002-estimation-kit.html">Estimation Kit</a> — start memorizing these five:</p>
+  <table>
+    <tr><th>Operation</th><th class="num">Time</th></tr>
+    <tr><td>Main memory reference</td><td class="num">100 ns</td></tr>
+    <tr><td>Random SSD read (4 KB)</td><td class="num">150 µs</td></tr>
+    <tr><td>Round trip inside a datacenter</td><td class="num">500 µs</td></tr>
+    <tr><td>HDD seek</td><td class="num">10 ms</td></tr>
+    <tr><td>Round trip across an ocean</td><td class="num">150 ms</td></tr>
+  </table>
+  <p>Notice the cliff between memory (nanoseconds) and anything involving a network or disk (micro-to-milliseconds). Roughly <strong>2,000 round trips/second</strong> fit inside a datacenter; only 6–7 cross an ocean. Most of system design is arranging work so the slow tiers are touched as rarely as possible.</p>
+
+  <h2>4 · First GPU math (a taste of Phase 4)</h2>
+  <p>The same physics governs LLM serving. Generating one token requires reading essentially <em>all model weights</em> from GPU memory. A 70B-parameter model in bf16 is ~140 GB; an H100 moves ~3.35 TB/s from HBM. So a single request's floor is:</p>
+  <pre><code>140 GB ÷ 3.35 TB/s ≈ 42 ms per token  →  ~24 tokens/sec, one user,
+                                          while the GPU's compute units sit mostly idle.</code></pre>
+  <p>Decode is <strong>memory-bandwidth-bound</strong> — which is exactly why serving systems batch many users onto one weight-read. Latency vs throughput, again. We will build this into a full design in lessons 22–26.</p>
+
+  <h2>5 · Project step</h2>
+  <p>Our spine project is an <strong>LLM inference gateway</strong>. Its birth certificate is an SLO sheet. In a scratch note (or in your head, then check), write SLOs for it covering: <strong>TTFT</strong> p50 and p99, <strong>TPOT</strong> p50, sustained <strong>throughput</strong> in requests/sec and tokens/sec, and availability. (TTFT/TPOT are defined in the <a href="../reference/0001-glossary.html">Glossary</a>.) A defensible example: TTFT p99 &lt; 1 s, TPOT p50 &lt; 50 ms, 1,000 RPS sustained, 99.9% availability. There is no single right answer — the skill is <em>stating</em> targets before designing. Bring your sheet to the next session and your teacher will critique it.</p>
+
+  <h2>Check yourself</h2>
+  <div class="quiz" id="quiz"></div>
+
+  <h2>Primary source</h2>
+  <p>Read <strong>DDIA, chapter 1 — the "Percentiles in Practice" discussion</strong> (<a href="https://www.oreilly.com/library/view/designing-data-intensive-applications/9781098119058/">2nd ed., O'Reilly</a>). Free alternative covering the same ground: the Primer's <a href="https://github.com/donnemartin/system-design-primer#latency-vs-throughput">latency vs throughput</a> and <a href="https://github.com/donnemartin/system-design-primer#latency-numbers-every-programmer-should-know">latency numbers</a> sections.</p>
+
+  <footer class="lesson-footer">
+    <p><strong>Stuck or curious?</strong> Ask your teacher (the agent) anything — "why is decode memory-bound but prefill isn't?" is an excellent follow-up question.</p>
+    <nav class="lesson-nav">
+      <span>◀ (first lesson)</span>
+      <span>Next: 0002 · Back-of-Envelope Drills ▶</span>
+    </nav>
+  </footer>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+renderQuiz(document.getElementById('quiz'), {
+  title: 'Check yourself',
+  questions: [
+    {
+      q: "Your API's mean latency is 80 ms but p99 is 2 s. What does the p99 figure mean?",
+      options: [
+        'One percent of requests take longer than two seconds',
+        'Most of the requests take longer than two seconds',
+        'The slowest request took exactly two seconds total',
+      ],
+      answer: 0,
+      explain: 'p99 is the threshold 99% of requests beat; the remaining 1% are slower. It says nothing about the single worst request.',
+    },
+    {
+      q: 'Which change raises throughput but can worsen latency?',
+      options: [
+        'Batching many requests together before processing them',
+        'Caching common responses close to the user',
+        'Removing slow blocking calls from request path',
+      ],
+      answer: 0,
+      explain: 'Batching amortizes overhead across requests (throughput up) but early arrivals wait for the batch (latency up). Caching and removing blocking calls help both axes.',
+    },
+    {
+      q: 'Why do averages hide problems that percentiles reveal?',
+      options: [
+        'Averages smooth away the slow tail of requests',
+        'Averages count only the successful fast requests made',
+        'Averages are computed over too few samples',
+      ],
+      answer: 0,
+      explain: 'A handful of multi-second outliers barely moves a mean built from thousands of fast requests — yet those outliers are real users having a terrible time.',
+    },
+    {
+      q: 'A page load fans out to 100 backend calls, each with independent p99 = 1 s. Roughly what fraction of page loads hit at least one slow call?',
+      options: [
+        'Around sixty-three percent of page loads affected',
+        'Around one percent of page loads affected',
+        'Around ten percent of page loads affected',
+      ],
+      answer: 0,
+      explain: '1 − 0.99^100 ≈ 0.63. This is tail latency amplification: fan-out turns a rare tail into the common case.',
+    },
+    {
+      q: 'Roughly how much slower is a same-datacenter network round trip than a main-memory reference?',
+      options: [
+        'Around five thousand times slower than memory',
+        'Around fifty times slower than a memory',
+        'Around five times slower than a memory',
+      ],
+      answer: 0,
+      explain: '500 µs vs 100 ns = 5,000×. This cliff is why caching in memory beats another network hop almost every time.',
+    },
+    {
+      q: 'In chat-style LLM serving, which metric captures "the response starts quickly"?',
+      options: [
+        'Time to first token, called TTFT',
+        'Time per output token, called TPOT',
+        'Total tokens generated per second overall',
+      ],
+      answer: 0,
+      explain: 'TTFT is the wait before the first token appears (dominated by prefill + queueing). TPOT is the typing speed afterward. Both get SLOs in real systems.',
+    },
+  ],
+});
+</script>
+</body>
+</html>

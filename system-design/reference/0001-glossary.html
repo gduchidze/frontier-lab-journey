@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>System Design Glossary</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<div class="lesson">
+  <header class="lesson-header">
+    <p class="kicker">Reference · Glossary</p>
+    <h1>System Design Glossary</h1>
+    <p class="dek">The course vocabulary. Every lesson uses these terms exactly as defined here. Grows as lessons are added.</p>
+  </header>
+
+  <h2>Performance</h2>
+  <table>
+    <tr><th>Term</th><th>Definition</th></tr>
+    <tr><td><strong>Latency</strong></td><td>Time for <em>one</em> request to complete, measured from the client's perspective. Units: ms. Lower is better.</td></tr>
+    <tr><td><strong>Throughput</strong></td><td>How <em>many</em> requests a system completes per unit time. Units: requests/second (RPS or QPS), or tokens/second for LLMs. Higher is better.</td></tr>
+    <tr><td><strong>Percentile (pN)</strong></td><td>The value below which N% of measurements fall. p50 = median; p99 = the latency that 99% of requests beat — and 1% suffer.</td></tr>
+    <tr><td><strong>Tail latency</strong></td><td>The slow end of the distribution (p99, p999). Dominates user experience at scale because someone always lands in the tail.</td></tr>
+    <tr><td><strong>SLO</strong></td><td>Service Level Objective — a target like "p99 latency &lt; 500&nbsp;ms". What you design against.</td></tr>
+    <tr><td><strong>Saturation</strong></td><td>The state where a resource (CPU, GPU, queue) is near capacity; latency explodes as load approaches saturation.</td></tr>
+  </table>
+
+  <h2>LLM serving (preview — deep dive in Phase 3)</h2>
+  <table>
+    <tr><th>Term</th><th>Definition</th></tr>
+    <tr><td><strong>TTFT</strong></td><td>Time To First Token — latency until the first output token arrives. What users feel as "responsiveness".</td></tr>
+    <tr><td><strong>TPOT</strong></td><td>Time Per Output Token — average gap between tokens after the first. What users feel as "typing speed".</td></tr>
+  </table>
+
+  <footer class="lesson-footer">
+    <p>Part of the <a href="../MISSION.md">System Design for Anthropic</a> course. Terms added per-lesson; if a lesson uses a word not listed here, tell your teacher — that is a bug.</p>
+  </footer>
+</div>
+</body>
+</html>

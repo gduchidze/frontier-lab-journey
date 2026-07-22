@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lesson 20 — The vLLM Atlas: Everything Else an AI Engineer Needs</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<div class="page">
+
+<p class="lesson-kicker">SLM Production Stack · FINAL · Lesson 20 · ~2.5 h (atlas + lab)</p>
+<h1>The vLLM Atlas</h1>
+<p class="lesson-lede">The last lesson. Everything in vLLM the course used but didn't unpack, and everything production will ask of you next: structured outputs, tool calling, multimodal, LoRA fleets, offline batch, fast model loading, the ecosystem around the engine. Map → spotlights → lab.</p>
+
+<h2>The map — the API you only half-used</h2>
+<table>
+<tr><th>Topic</th><th>What it is</th><th>When you need it</th></tr>
+<tr><td><strong>Sampling params</strong></td><td>temperature, top_p/top_k, min_p, repetition/frequency/presence penalties, stop, seed, logprobs, max_tokens</td><td>Every product tunes these; <code>seed</code> + temp 0 for reproducible evals; logprobs for confidence scoring</td></tr>
+<tr><td><strong>Structured outputs</strong></td><td>Constrained decoding: response follows a JSON Schema / regex / grammar — enforced at the logits level (xgrammar/guidance backends)</td><td>Any downstream parser. Kills "the model returned almost-JSON" forever. Spotlight below</td></tr>
+<tr><td><strong>Tool calling</strong></td><td>OpenAI-compatible <code>tools</code>/<code>tool_choice</code>; parsers per model family (<code>--tool-call-parser</code>)</td><td>Agents. Needs the right chat template + parser flag — the #1 "tool calling doesn't work" cause</td></tr>
+<tr><td><strong>Chat templates</strong></td><td>Jinja template turning messages[] into the model's prompt format</td><td>Wrong/missing template = silently degraded model. Custom templates for special formats; <code>--chat-template</code> override</td></tr>
+<tr><td><strong>Multimodal inputs</strong></td><td>Images (and audio/video for some models) via <code>image_url</code> content parts</td><td>Your Qwen3.5-0.8B IS multimodal — the lab finally uses it. Watch <code>--limit-mm-per-prompt</code>, image token budgets</td></tr>
+<tr><td><strong>Reasoning models</strong></td><td>Thinking/reasoning content separated from final answer (<code>reasoning_content</code>)</td><td>Serving o1/R1-style models; budget control over thinking tokens</td></tr>
+<tr><td><strong>Beam search / n&gt;1</strong></td><td>Multiple candidates per request</td><td>Reranking pipelines; costs batch capacity — know why product turned it off</td></tr>
+</table>
+
+<h2>The map — serving modes beyond chat</h2>
+<table>
+<tr><th>Topic</th><th>What</th><th>Trigger</th></tr>
+<tr><td><strong>Offline inference (<code>LLM</code> class)</strong></td><td>Python API: <code>LLM(model=…).generate(prompts, params)</code> — no server, max-throughput batch</td><td>Evals, distillation data, backfills — pairs with lesson 19's Jobs. Spotlight below</td></tr>
+<tr><td><strong>OpenAI Batch-format jobs</strong></td><td><code>vllm run-batch</code> over a JSONL of requests</td><td>Drop-in for OpenAI batch pipelines, offline scoring</td></tr>
+<tr><td><strong>Pooling models</strong></td><td>Embeddings, classification, reward, scoring/rerank endpoints (<code>/v1/embeddings</code>, score API)</td><td>RAG retrievers + rerankers served by the SAME engine tech — one platform, both workloads</td></tr>
+<tr><td><strong>Multi-LoRA serving</strong></td><td>Dozens of fine-tuned adapters over one base model, selected per-request by model name; dynamic load/unload</td><td>Per-customer fine-tunes without per-customer GPU fleets. Spotlight below</td></tr>
+<tr><td><strong>Speculative decoding</strong></td><td>(lesson 15) draft/EAGLE/MTP/n-gram</td><td>Already yours</td></tr>
+<tr><td><strong>Sleep mode</strong></td><td>Offload/park weights, wake on demand (<code>/sleep</code>, <code>/wake_up</code>)</td><td>RLHF loops (train↔serve on same GPUs), dev clusters, scale-to-almost-zero</td></tr>
+<tr><td><strong>Priority scheduling</strong></td><td><code>--scheduling-policy priority</code>; per-request priority</td><td>Interactive tier beats batch tier INSIDE one engine — complements your router tiers</td></tr>
+</table>
+
+<h2>The map — engine internals & operations</h2>
+<table>
+<tr><th>Topic</th><th>What</th><th>Trigger</th></tr>
+<tr><td><strong>V1 engine / AsyncLLM</strong></td><td>The rewritten core: simpler scheduler, chunked-prefill default, zero-overhead prefix caching</td><td>Flag semantics differ V0↔V1; docs/issues often reference which engine — know the split exists</td></tr>
+<tr><td><strong>Fast model loading</strong></td><td>Tensorizer, Run:ai Model Streamer, fastsafetensors — stream weights GPU-direct</td><td>Your lesson-10 scaling lag: load time IS your autoscaling response time. Spotlight below</td></tr>
+<tr><td><strong>Quantized checkpoints ecosystem</strong></td><td>Loading pre-quantized AWQ/GPTQ/FP8/GGUF/bitsandbytes checkpoints vs online quantization</td><td>Lesson 15 taught choosing; here: WHERE quantized weights come from (llm-compressor, community checkpoints — vet them)</td></tr>
+<tr><td><strong>Context extension</strong></td><td>RoPE scaling / YaRN to stretch context beyond training length</td><td>"Can we do 128k?" — yes/no/quality-cliff answer lives here</td></tr>
+<tr><td><strong>Per-request metrics & OTel tracing</strong></td><td>Request-scoped timings; OpenTelemetry spans from the engine</td><td>The third observability pillar for your lesson-7 stack; correlate one slow request end-to-end</td></tr>
+<tr><td><strong>Custom logits processors / plugins</strong></td><td>Hook the sampling step; plugin system for custom models</td><td>Watermarking, banned-token lists, house sampling research</td></tr>
+<tr><td><strong>Determinism & batch invariance</strong></td><td>Same request, different batch neighbors → tiny numeric drift; flags to control</td><td>Eval reproducibility arguments; the "why did temp-0 outputs differ" ticket</td></tr>
+<tr><td><strong>Security posture</strong></td><td>Model files as code (pickle risk — prefer safetensors), <code>HF_HUB_OFFLINE</code>, API server hardening, trust boundaries</td><td>Supply chain for models = the new dependency security; SOC2 will ask</td></tr>
+<tr><td><strong>Troubleshooting kit</strong></td><td><code>VLLM_LOGGING_LEVEL=DEBUG</code>, <code>--enforce-eager</code>, CUDA OOM triage (gpu-mem-util, max-len, max-seqs), profiling hooks</td><td>Your first week on real GPUs, guaranteed</td></tr>
+</table>
+
+<h2>The map — the ecosystem around the engine</h2>
+<table>
+<tr><th>Layer</th><th>Players</th><th>One-line orientation</th></tr>
+<tr><td>K8s-native serving</td><td>production-stack, <strong>llm-d</strong>, AIBrix, KServe, KubeAI, llmaz, NVIDIA Dynamo</td><td>All orchestrate vLLM fleets; production-stack you know; llm-d = K8s-native disagg+KV-aware descendant; Dynamo = NVIDIA's P/D stack</td></tr>
+<tr><td>Gateways</td><td>LiteLLM, Envoy AI Gateway, Higress</td><td>Multi-provider auth/quotas/fallback in front of your router</td></tr>
+<tr><td>App frameworks</td><td>LangChain, LlamaIndex, OpenAI SDKs</td><td>All speak to your stack via the OpenAI API — nothing to change</td></tr>
+<tr><td>Alternative engines</td><td>SGLang, TensorRT-LLM, llama.cpp/Ollama</td><td>Know the trade: TRT-LLM = peak NVIDIA perf/complexity; SGLang = RadixAttention prefix reuse; llama.cpp = edge/CPU</td></tr>
+</table>
+
+<h2>Spotlight 1 — Structured outputs (use this everywhere)</h2>
+<pre><code>curl -s localhost:8080/v1/chat/completions -H "Content-Type: application/json" -d '{
+  "model": "Qwen/Qwen3.5-0.8B",
+  "messages": [{"role":"user","content":"Extract: The Mac M4 has 10 cores and 16GB RAM."}],
+  "response_format": {
+    "type": "json_schema",
+    "json_schema": { "name": "hw", "schema": {
+      "type": "object",
+      "properties": { "chip": {"type":"string"}, "cores": {"type":"integer"}, "ram_gb": {"type":"integer"} },
+      "required": ["chip","cores","ram_gb"] } } }
+}'</code></pre>
+<p>The grammar masks invalid tokens at sampling time — output <em>cannot</em> violate the schema. Near-zero overhead after grammar compile. Retry-on-parse-error dies today. (<a href="https://docs.vllm.ai/en/latest/features/structured_outputs/">docs</a>)</p>
+
+<h2>Spotlight 2 — Multi-LoRA: fine-tunes without fleets</h2>
+<pre><code>vllm serve BASE --enable-lora \
+  --lora-modules customer-a=/adapters/a customer-b=/adapters/b
+# request routes by model name:
+{"model": "customer-a", ...}   # base weights + A's adapter, batched WITH B's traffic</code></pre>
+<p>Adapters are ~10–200 MB vs GB-scale bases; one engine batches requests across adapters simultaneously; dynamic load API adds tenants at runtime. The economics: 50 fine-tuned customers ≈ one base fleet + 50 small files, not 50 fleets. This single feature justifies platforms. (<a href="https://docs.vllm.ai/en/latest/features/lora/">docs</a>)</p>
+
+<h2>Spotlight 3 — Offline batch: the other half of the engine</h2>
+<pre><code>from vllm import LLM, SamplingParams
+llm = LLM(model="Qwen/Qwen3.5-0.8B", max_model_len=4096)
+out = llm.generate(prompts, SamplingParams(temperature=0, max_tokens=64, seed=7))</code></pre>
+<p>No server, no HTTP, scheduler free to maximize pure throughput — evals and data generation run 2–5× cheaper this way than hammering your own API. Wrap it in lesson 19's Job and you have the canonical ML batch pattern.</p>
+
+<h2>Spotlight 4 — Model load time is your autoscaling constant</h2>
+<p>Replica usefulness = download + load + warmup. Attack all three: weights on RWX/PVC or init-container pre-pull (lesson 19), streaming loaders (tensorizer / Run:ai streamer: stream-to-GPU, skip CPU staging), and <code>--load-format</code> choices. Platforms measure "cold-replica-to-first-token" as a first-class SLO — put it in your design doc.</p>
+
+<h2>Lab (labs/lab-20): the API tour you never took</h2>
+<div class="lab">
+<div class="step"><h3>Structured output</h3><p>Run the Spotlight-1 curl through YOUR router. Then break it: ask for a haiku with the same schema — watch the grammar force JSON anyway. Save both to <code>docs/vllm-api-tour.md</code>.</p></div>
+<div class="step"><h3>Multimodal, finally</h3><p>Qwen3.5-0.8B is image-text-to-text and you've served it text-only for 19 lessons. Send an image (base64 data URL in an <code>image_url</code> content part): "What's in this picture?" If your build predates the multimodal path for this arch, document the error + the flag/version needed — that's real platform work too.</p></div>
+<div class="step"><h3>Sampling safari</h3><p>Same prompt: temp 0 + seed (twice — identical?), temp 1.8 (chaos), <code>logprobs: 5</code> (inspect confidence), repetition penalty on a loop-prone prompt. One table in the tour doc.</p></div>
+<div class="step"><h3>Offline batch in a Job</h3><p>Mount a 20-prompt JSONL via ConfigMap; Job runs <code>vllm-cpu:local</code> with the Spotlight-3 python (entrypoint override) writing completions to the pod log. Offline engine + K8s Job = lesson 19 × lesson 20.</p></div>
+<div class="step"><h3>Alias + gap map</h3><p>Add <code>--served-model-name qwen-prod</code> via chart values; UI picker updates — model identity decoupled from HF path (rollout prerequisite from lesson 14). Then <code>docs/vllm-gap-map.md</code>, same three-state honesty as lab 19.</p></div>
+</div>
+
+<h2>Check yourself</h2>
+<div class="quiz" data-quiz>
+  <div class="q">
+    <p class="stem">How do structured outputs guarantee valid JSON?</p>
+    <button class="opt" data-correct>Invalid tokens masked during sampling</button>
+    <button class="opt">Outputs validated then regenerated on failure</button>
+    <button class="opt">Model fine-tuned on schema examples</button>
+    <p class="explain">Constrained decoding: the grammar zeroes out logits of tokens that would violate the schema — invalid output is unrepresentable, not retried away.</p>
+  </div>
+  <div class="q">
+    <p class="stem">40 per-customer fine-tunes of one 8B base. Cheapest serving shape?</p>
+    <button class="opt" data-correct>One base fleet, forty LoRA adapters</button>
+    <button class="opt">Forty quantized replicas, one each</button>
+    <button class="opt">One merged model averaging adapters</button>
+    <p class="explain">Multi-LoRA batches all customers on shared base weights; adapters are megabytes. Forty fleets = forty× hardware; merging destroys per-customer behavior.</p>
+  </div>
+  <div class="q">
+    <p class="stem">Nightly eval of 100k prompts: server API or offline LLM class?</p>
+    <button class="opt" data-correct>Offline class, maximum batch throughput</button>
+    <button class="opt">Server API, reusing production checks</button>
+    <button class="opt">Either, throughput is nearly identical</button>
+    <p class="explain">Offline mode drops HTTP/streaming/fairness constraints and lets the scheduler pack purely for throughput — meaningfully cheaper at this scale. Prod-parity smoke tests can stay on the API.</p>
+  </div>
+</div>
+
+<h2>Primary source</h2>
+<p>Reading order for the gaps you marked: <a href="https://docs.vllm.ai/en/latest/features/structured_outputs/">structured outputs</a> → <a href="https://docs.vllm.ai/en/latest/features/lora/">LoRA</a> → <a href="https://docs.vllm.ai/en/latest/serving/offline_inference.html">offline inference</a> → <a href="https://docs.vllm.ai/en/latest/features/multimodal_inputs/">multimodal</a> → <a href="https://docs.vllm.ai/en/latest/features/tool_calling/">tool calling</a>.</p>
+
+<h2>The end</h2>
+<p>Twenty lessons: from "what is a Pod" to defending a platform design with a gap map of everything beyond it. The two atlas gap-maps are your permanent curriculum — re-grade yourself quarterly. Mission status: go edit <a href="../MISSION.md">MISSION.md</a> yourself this time. Teacher's still here for the mock interviews.</p>
+
+<div class="lesson-footer"><p><a href="index.html">Course home</a> · lab: <code>labs/lab-20/</code></p></div>
+</div>
+<script src="../assets/quiz.js"></script>
+</body>
+</html>

@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SLM Production Stack — Course Home</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<div class="page">
+
+<p class="lesson-kicker">SLM Production Stack · Course Home</p>
+<h1>Build an SLM Inference Production Stack</h1>
+<p class="lesson-lede">Ten lessons, one system: Qwen3.5-0.8B served by vLLM on Kubernetes, with routing, monitoring, a UI, load tests, and autoscaling — entirely on your Mac. Mission: become an ML infra engineer.</p>
+
+<div class="arch">
+  <div class="box">Open WebUI<small>lesson 8</small></div>
+  <div class="flow">→</div>
+  <div class="box">Router<small>lesson 6</small></div>
+  <div class="flow">→</div>
+  <div class="box hot">vLLM × N<small>lessons 3–5</small></div>
+  <div class="flow">←</div>
+  <div class="box">HPA<small>lesson 10</small></div>
+</div>
+<div class="arch">
+  <div class="box">Prometheus + Grafana<small>lesson 7</small></div>
+  <div class="box">k6 / vllm bench<small>lesson 9</small></div>
+  <div class="box">kind cluster + Helm<small>lessons 1, 2, 5</small></div>
+</div>
+
+<h2>Lessons</h2>
+<table>
+<tr><th>#</th><th>Lesson</th><th>You walk away with</th></tr>
+<tr><td>1</td><td><a href="0001-first-cluster.html">The Map, and Your First Cluster</a></td><td>2-node kind cluster; Deployment + Service running; reconciliation seen live</td></tr>
+<tr><td>2</td><td><a href="0002-production-manifests.html">Production-Shaped Manifests</a></td><td>Hand-written YAML: namespaces, probes, requests/limits; OOMKilled witnessed safely</td></tr>
+<tr><td>3</td><td><a href="0003-vllm-engine-docker.html">The Engine: vLLM in Docker</a></td><td>Own ARM CPU vLLM image; Qwen chatting via OpenAI API; continuous batching observed</td></tr>
+<tr><td>4</td><td><a href="0004-vllm-on-k8s.html">vLLM Meets Kubernetes</a></td><td>Engine deployed with PVC weight cache and LLM-tuned probes</td></tr>
+<tr><td>5</td><td><a href="0005-helm-package.html">Helm: Package the Stack</a></td><td>Own chart; upgrade/rollback fluency; values.yaml as API</td></tr>
+<tr><td>6</td><td><a href="0006-router-scaleout.html">Scale Out: Replicas and the Router</a></td><td>2 engines behind production-stack router; session affinity proven in logs</td></tr>
+<tr><td>7</td><td><a href="0007-observability.html">Observability: Prometheus + Grafana</a></td><td>Live TTFT/queue dashboards; PromQL's 3 core patterns</td></tr>
+<tr><td>8</td><td><a href="0008-ui-openwebui.html">The UI: Open WebUI</a></td><td>Browser chat on your own infra; full request path traceable; kill-a-pod resilience demo</td></tr>
+<tr><td>9</td><td><a href="0009-load-testing.html">Load Testing: Get the Numbers</a></td><td>Saturation curve; P90 TTFT/TPOT table; k6 SLO gate</td></tr>
+<tr><td>10</td><td><a href="0010-autoscaling-capstone.html">Autoscaling and the Capstone</a></td><td>HPA feedback loop; portfolio README; mock-interview readiness</td></tr>
+</table>
+
+<h2>Advanced track — Real Productization (after lesson 10)</h2>
+<p>Senior-level theory + labs. Rebuilds the cluster with Cilium + edge ports in lesson 11; GPU-only mechanics taught via simulation, capacity math, and design docs — honestly labeled.</p>
+<table>
+<tr><th>#</th><th>Lesson</th><th>You walk away with</th></tr>
+<tr><td>11</td><td><a href="0011-advanced-scheduling.html">Advanced Scheduling and the GPU Fleet</a></td><td>Taints/affinity/topology/preemption drilled on a simulated GPU pool; MIG vs time-slicing; bin-packing economics</td></tr>
+<tr><td>12</td><td><a href="0012-production-edge.html">The Production Edge</a></td><td>Ingress + cert-manager TLS on real hostnames; the LLM streaming/timeout fixes; Gateway API literacy</td></tr>
+<tr><td>13</td><td><a href="0013-security-multitenancy.html">Security and Multi-Tenancy</a></td><td>Default-deny NetworkPolicy graph (Cilium), quotas, RBAC audit, engine API keys — attacker demo blocked</td></tr>
+<tr><td>14</td><td><a href="0014-gitops-delivery.html">GitOps and Progressive Delivery</a></td><td>Argo CD owning the stack; deploy + rollback via git; model canary design</td></tr>
+<tr><td>15</td><td><a href="0015-vllm-performance.html">vLLM Performance Engineering</a></td><td>Quantization/chunked-prefill/spec-decode theory; a disciplined tuning study + report</td></tr>
+<tr><td>16</td><td><a href="0016-distributed-inference.html">Distributed and Disaggregated Inference</a></td><td>TP/PP/DP/EP, P/D disaggregation, KV hierarchy; capacity math + defended design doc</td></tr>
+<tr><td>17</td><td><a href="0017-sre-inference.html">SRE for Inference</a></td><td>SLOs, burn-rate alerts firing for real, runbooks, chaos day, blameless postmortem</td></tr>
+<tr><td>18</td><td><a href="0018-cost-capstone.html">Cost, Capacity, and the Senior Capstone</a></td><td>$/1M-token economics, build-vs-buy breakeven, platform design doc + mock-interview defense</td></tr>
+</table>
+
+<h2>Final track — the Atlases (after lesson 18)</h2>
+<p>Everything the course didn't cover, mapped: topic → what → when YOU need it → where to read. Each ends with a gap-map self-grade that becomes your permanent revision syllabus.</p>
+<table>
+<tr><th>#</th><th>Lesson</th><th>You walk away with</th></tr>
+<tr><td>19</td><td><a href="0019-k8s-atlas.html">The Kubernetes Atlas</a></td><td>Full K8s map for AI engineers: Jobs/Kueue/LWS, StatefulSets, PDB + graceful drain, operators/CRDs, DRA, Kustomize, mesh, storage. Lab: batch Job, live drain, kubectl debug, toy CRD, gap map</td></tr>
+<tr><td>20</td><td><a href="0020-vllm-atlas.html">The vLLM Atlas</a></td><td>Full vLLM map: structured outputs, tool calling, multimodal, multi-LoRA, offline batch, fast loading, sleep mode, ecosystem (llm-d, Dynamo, SGLang). Lab: API tour + offline Job + gap map</td></tr>
+</table>
+
+<h2>References (living documents)</h2>
+<table>
+<tr><td><a href="../reference/kubectl-cheatsheet.html">kubectl cheat sheet</a></td><td>Commands, pod-status decoder, course glossary</td></tr>
+<tr><td><a href="../reference/k8s-manifest-anatomy.html">Manifest anatomy</a></td><td>Annotated skeletons: Deployment, Service, PVC, probes, ConfigMap/Secret</td></tr>
+<tr><td><a href="../reference/vllm-cheatsheet.html">vLLM cheat sheet</a></td><td>serve flags, CPU env vars, OpenAI API calls, metrics</td></tr>
+<tr><td><a href="../reference/helm-cheatsheet.html">Helm cheat sheet</a></td><td>Commands, chart layout, template syntax survival kit</td></tr>
+<tr><td><a href="../reference/observability-cheatsheet.html">Observability cheat sheet</a></td><td>PromQL patterns, vLLM metrics table, serving-metrics definitions</td></tr>
+</table>
+
+<h2>How to use this course</h2>
+<ol>
+<li>One lesson per 1–2 h session, in order — each builds on the last's cluster state.</li>
+<li>Do the labs for real. Reading YAML is not writing YAML.</li>
+<li>Answer quizzes from memory <em>before</em> clicking. Retrieval builds retention; recognition doesn't.</li>
+<li>When something breaks — good. <code>describe</code>, <code>logs</code>, then ask your teacher (the agent) with the output. Debugging is the curriculum.</li>
+<li>After each session, tell the agent what you did — it writes a learning record and calibrates the next lesson.</li>
+</ol>
+
+<div class="note"><strong>Spaced retrieval</strong>
+Start sessions 3+ with a 5-minute self-test: rebuild last lesson's key command/manifest from memory. The agent can quiz you — just ask "warm me up".</div>
+
+<div class="lesson-footer">
+<p><a href="../MISSION.md">MISSION.md</a> · <a href="../RESOURCES.md">RESOURCES.md</a> · learning records in <code>learning-records/</code></p>
+</div>
+
+</div>
+</body>
+</html>

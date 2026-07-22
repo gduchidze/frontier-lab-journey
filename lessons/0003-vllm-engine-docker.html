@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lesson 3 — The Engine: vLLM in Docker</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<div class="page">
+
+<p class="lesson-kicker">SLM Production Stack · Lesson 3 · Phase 3 · ~2 h (incl. background build)</p>
+<h1>The Engine: vLLM in Docker</h1>
+<p class="lesson-lede">One session without Kubernetes. You meet vLLM itself — why it's the industry default, how continuous batching and PagedAttention work, and you chat with Qwen through the OpenAI-compatible API on your own machine.</p>
+
+<h2>Knowledge: why vLLM won</h2>
+
+<h3>1. The problem: GPUs (and CPUs) hate small talk</h3>
+<p>Naive serving handles one request at a time; hardware sits idle between tokens. <strong>Continuous batching</strong> fixes this: at <em>every decoding step</em>, the scheduler can inject new requests into the running batch and evict finished ones. No waiting for the batch to drain. This is the single biggest throughput idea in LLM serving.</p>
+
+<h3>2. PagedAttention: virtual memory for the KV cache</h3>
+<p>Every generated token needs attention over all previous tokens — cached as the <strong>KV cache</strong>, the dominant memory consumer. vLLM's founding idea (<a href="https://arxiv.org/abs/2309.06180">SOSP 2023 paper</a>): manage KV cache in fixed-size <em>blocks</em> with an indirection table, like OS virtual memory pages. Result: near-zero fragmentation, memory shared between requests with common prefixes, far bigger batches.</p>
+
+<h3>3. One server, OpenAI's API</h3>
+<p><code>vllm serve MODEL</code> starts an HTTP server implementing <code>/v1/chat/completions</code>, <code>/v1/completions</code>, <code>/v1/models</code> — the <a href="https://docs.vllm.ai/en/latest/serving/openai_compatible_server.html">OpenAI-compatible API</a>. Any OpenAI client works by changing one base URL. This is why every UI, router, and SDK plugs in for free — and why phase 8's chat UI needs zero custom code.</p>
+
+<h3>4. CPU backend: same engine, different metal</h3>
+<p>vLLM's CPU backend (<a href="https://docs.vllm.ai/en/latest/getting_started/installation/cpu.html">docs</a>) runs the same scheduler and API on x86/ARM. Two knobs matter today:</p>
+<table>
+<tr><th>Knob</th><th>Meaning</th><th>Our value</th></tr>
+<tr><td><code>VLLM_CPU_KVCACHE_SPACE</code></td><td>GiB reserved for KV cache</td><td><code>4</code></td></tr>
+<tr><td><code>--dtype bfloat16</code></td><td>Weight precision (M4 supports bf16)</td><td>bfloat16</td></tr>
+<tr><td><code>--max-model-len</code></td><td>Cap context length → caps KV memory</td><td><code>4096</code></td></tr>
+</table>
+<div class="warning"><strong>Reality check</strong>
+CPU inference is ~10–50× slower than GPU. For a 0.8B model that's still a few tokens/sec — enough to learn every production pattern. The architecture you build is identical to the GPU version; only the image and one resource line differ.</div>
+
+<h2>Lab: build, serve, chat</h2>
+
+<div class="lab">
+
+<div class="step">
+<h3>Start the image build in the background (do this FIRST)</h3>
+<p>No official ARM CPU image exists, so we build one from vLLM's own <code>Dockerfile.cpu</code>. Takes 30–60 min — start it, then read on while it runs:</p>
+<pre><code>cd ~/PycharmProjects/AI
+git clone https://github.com/vllm-project/vllm.git
+cd vllm
+docker build -f docker/Dockerfile.cpu -t vllm-cpu:local . &gt; /tmp/vllm-build.log 2&gt;&amp;1 &amp;
+tail -f /tmp/vllm-build.log     # Ctrl+C anytime; build continues</code></pre>
+<div class="note"><strong>Why build and not pull?</strong>
+The doronmak repo pushes its own <code>doronmak/vllm-cpu-image</code> for the same reason — there's no official CPU image for every platform. Check any image's architecture with <code>docker manifest inspect IMAGE | grep architecture</code>. An amd64 image on your M4 runs under emulation: works, but ~5× slower.</div>
+</div>
+
+<div class="step">
+<h3>While it builds: read the engine</h3>
+<p>Read <a href="https://blog.vllm.ai/2023/06/20/vllm.html">the original vLLM announcement blog</a> (10 min) — the clearest PagedAttention explanation with figures. Then skim the <a href="../reference/vllm-cheatsheet.html">vLLM reference card</a> you'll use for the rest of the course.</p>
+</div>
+
+<div class="step">
+<h3>Run the server</h3>
+<p>When the build finishes (<code>docker images | grep vllm-cpu</code>):</p>
+<pre><code>docker run -d --name vllm \
+  -p 8000:8000 \
+  -v hf-cache:/root/.cache/huggingface \
+  -e VLLM_CPU_KVCACHE_SPACE=4 \
+  vllm-cpu:local \
+  --model Qwen/Qwen3.5-0.8B \
+  --max-model-len 4096 \
+  --dtype bfloat16
+
+docker logs -f vllm      # watch model download + engine init; Ctrl+C when "Uvicorn running"</code></pre>
+<p class="expect">expect (first run): weights download (~2 GB), then "Application startup complete"</p>
+<div class="warning"><strong>If Qwen3.5-0.8B errors with unsupported architecture</strong>
+<code>qwen3_5</code> is a 2026 multimodal arch; your built image tracks vLLM main, so it should work. If not: fall back to <code>--model Qwen/Qwen3-0.6B</code> (text-only, long-supported), note it in the learning record, and retry the target model after <code>git pull</code> + rebuild later. Every other lesson works identically with either model.</div>
+</div>
+
+<div class="step">
+<h3>Talk to it — the three endpoints</h3>
+<pre><code># 1. What models are loaded?
+curl -s localhost:8000/v1/models | python3 -m json.tool
+
+# 2. Chat (the endpoint everything else in this course uses)
+curl -s localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Qwen/Qwen3.5-0.8B",
+    "messages": [{"role":"user","content":"In one sentence: what is PagedAttention?"}],
+    "max_tokens": 60
+  }' | python3 -m json.tool
+
+# 3. Metrics — Prometheus format, phase 7 lives here
+curl -s localhost:8000/metrics | grep -E "^vllm:" | head -20</code></pre>
+<p class="expect">expect: JSON reply from Qwen; metrics lines like vllm:num_requests_running</p>
+</div>
+
+<div class="step">
+<h3>See continuous batching with your own eyes</h3>
+<p>Fire 5 concurrent requests, then check the running-request gauge:</p>
+<pre><code>for i in 1 2 3 4 5; do
+  curl -s localhost:8000/v1/chat/completions -H "Content-Type: application/json" \
+    -d '{"model":"Qwen/Qwen3.5-0.8B","messages":[{"role":"user","content":"Count to 30 slowly."}],"max_tokens":200}' &gt; /dev/null &amp;
+done
+sleep 3
+curl -s localhost:8000/metrics | grep -E "num_requests_(running|waiting)"</code></pre>
+<p class="expect">expect: num_requests_running &gt; 1 — multiple requests in ONE batch, simultaneously</p>
+<div class="win"><strong>The win</strong>
+You built the inference engine image every later phase deploys, chatted with Qwen through the exact API your UI will use, and watched continuous batching serve 5 requests at once. The engine is no longer a black box.</div>
+</div>
+
+<div class="step">
+<h3>Stop (keep image + model cache)</h3>
+<pre><code>docker stop vllm && docker rm vllm
+# model weights persist in the named volume:
+docker volume ls | grep hf-cache</code></pre>
+</div>
+
+</div>
+
+<h2>Check yourself</h2>
+<div class="quiz" data-quiz>
+  <div class="q">
+    <p class="stem">Request B arrives while request A is mid-generation. Continuous batching means…</p>
+    <button class="opt" data-correct>B joins the batch at next step</button>
+    <button class="opt">B waits until A fully completes</button>
+    <button class="opt">B preempts A, which restarts later</button>
+    <p class="explain">The scheduler recomposes the batch at every decoding step. No draining, no preemption in the normal path.</p>
+  </div>
+  <div class="q">
+    <p class="stem">What does PagedAttention primarily eliminate?</p>
+    <button class="opt" data-correct>KV cache memory fragmentation between requests</button>
+    <button class="opt">Attention computation cost during long generations</button>
+    <button class="opt">Model weight duplication across batch replicas</button>
+    <p class="explain">Block-based KV storage with an indirection table = near-zero fragmentation and prefix sharing. Compute cost and weights are unchanged.</p>
+  </div>
+  <div class="q">
+    <p class="stem">Why does capping --max-model-len help a memory-tight box?</p>
+    <button class="opt" data-correct>It bounds each request's KV cache</button>
+    <button class="opt">It shrinks the model weight footprint</button>
+    <button class="opt">It reduces the tokenizer vocabulary size</button>
+    <p class="explain">KV cache grows with sequence length. Capping length caps the per-request worst case, letting the scheduler admit more requests safely. Weights are untouched.</p>
+  </div>
+</div>
+
+<h2>Primary source</h2>
+<p><a href="https://blog.vllm.ai/2023/06/20/vllm.html">vLLM: Easy, Fast, and Cheap LLM Serving with PagedAttention</a> — the announcement blog. For depth: the <a href="https://arxiv.org/abs/2309.06180">SOSP paper</a>, §3–4.</p>
+
+<h2>Next</h2>
+<p><a href="0004-vllm-on-k8s.html">Lesson 4</a>: the two halves meet — this image, deployed into your cluster with the manifests-with-probes pattern from lesson 2.</p>
+
+<div class="lesson-footer">
+<p>References: <a href="../reference/vllm-cheatsheet.html">vLLM cheat sheet</a>.</p>
+<p>Build errors, weird logs? Paste them to your teacher — that's the fastest way to learn debugging.</p>
+</div>
+
+</div>
+<script src="../assets/quiz.js"></script>
+</body>
+</html>

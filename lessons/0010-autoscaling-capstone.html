@@ -1,0 +1,166 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lesson 10 — Autoscaling and the Capstone</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<div class="page">
+
+<p class="lesson-kicker">SLM Production Stack · Lesson 10 · Phase 10 · ~2 h</p>
+<h1>Autoscaling and the Capstone</h1>
+<p class="lesson-lede">The final loop: the cluster reacts to load by itself. Then you package ten lessons of work into a portfolio project that speaks for you in interviews.</p>
+
+<h2>Knowledge: closing the control loop</h2>
+
+<h3>1. HPA: desired replicas as a function of metrics</h3>
+<p>The <a href="https://kubernetes.io/docs/tasks/run-application/horizontal-pod-autoscale/">HorizontalPodAutoscaler</a> adjusts a Deployment's <code>replicas</code> to hold a metric near target: <code>desired = ceil(current × metricValue / target)</code>. It needs a metrics source — the <strong>metrics-server</strong> for CPU/memory (not installed by default on kind).</p>
+
+<h3>2. CPU% is the wrong metric for LLMs — know why anyway</h3>
+<p>An inference engine can be "full" (queue growing) while CPU sits at 60%, or pegged at 100% while healthy. The <em>right</em> signals are engine-native: <code>vllm:num_requests_waiting</code>, KV cache usage — exactly what production-stack's roadmap means by "autoscaling based on vLLM-specific metrics". Custom-metric scaling needs <a href="https://keda.sh/">KEDA</a> or prometheus-adapter bridging Prometheus → HPA. Today: CPU-based HPA (the mechanism), KEDA as documented stretch goal (the production answer). Knowing <em>why CPU is wrong</em> is the interview answer.</p>
+
+<h3>3. Scaling limits nobody escapes</h3>
+<p>Scale-out adds capacity but each new replica must load the model (minutes on CPU — this is why real platforms obsess over model-load time, use PV-cached weights, and pre-warm). Scale <em>down</em> too eagerly and you kill engines mid-generation. HPA's <code>behavior</code> stanza (stabilization windows) exists for exactly this.</p>
+
+<h2>Lab part A: reactive cluster</h2>
+
+<div class="lab">
+
+<div class="step">
+<h3>Install metrics-server (kind needs a flag)</h3>
+<pre><code>helm repo add metrics-server https://kubernetes-sigs.github.io/metrics-server/
+helm install metrics-server metrics-server/metrics-server \
+  -n kube-system --set args={--kubelet-insecure-tls}
+sleep 30 && kubectl top nodes && kubectl top pods -n llm</code></pre>
+<p class="expect">expect: CPU/memory numbers per node and pod (insecure-tls flag is kind-only: node certs lack SANs)</p>
+</div>
+
+<div class="step">
+<h3>Create the HPA</h3>
+<p>Save as <code>k8s/vllm-hpa.yaml</code>:</p>
+<pre><code>apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: vllm
+  namespace: llm
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: vllm
+  minReplicas: 1
+  maxReplicas: 2
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300</code></pre>
+<pre><code># let the HPA own replica count: set replicaCount back to 1 first
+helm upgrade slm charts/slm-stack --set vllm.replicaCount=1
+kubectl apply -f k8s/vllm-hpa.yaml
+kubectl get hpa -n llm -w</code></pre>
+<p class="expect">expect: TARGETS shows live cpu% vs 70%; REPLICAS 1</p>
+</div>
+
+<div class="step">
+<h3>Trigger it</h3>
+<p>Terminal 1: <code>kubectl get hpa,pods -n llm -w</code>. Terminal 2: run the lesson-9 k6 test (or the curl loop) for 3–4 minutes.</p>
+<p class="expect">expect: cpu% crosses 70 → REPLICAS 1→2 → second pod loads model → joins router automatically (service discovery!) → load spreads. After traffic stops: ~5 min stabilization, then back to 1</p>
+<div class="win"><strong>The win</strong>
+Load rises → HPA scales → router discovers → Grafana shows both engines → drain → scale-in. Every layer of the course in one autonomous feedback loop, with no human in it. That's a production stack.</div>
+</div>
+
+<div class="step">
+<h3>Stretch (optional, separate session): scale on queue depth with KEDA</h3>
+<pre><code>helm repo add kedacore https://kedacore.github.io/charts
+helm install keda kedacore/keda -n keda --create-namespace</code></pre>
+<p>Then a <code>ScaledObject</code> with a prometheus trigger on <code>sum(vllm:num_requests_waiting)</code>, threshold ~5. See <a href="https://keda.sh/docs/latest/scalers/prometheus/">KEDA prometheus scaler docs</a>. This is the real-world pattern — document it in the README even if you only prototype it.</p>
+</div>
+
+</div>
+
+<h2>Lab part B: the capstone writeup</h2>
+<p>The project is done; now make it <em>legible</em>. This half-lab is a checklist — work through it in the repo.</p>
+
+<div class="lab">
+
+<div class="step">
+<h3>Repo hygiene</h3>
+<p>Structure the repo so a stranger can rebuild everything:</p>
+<pre><code>llm-infra-playground/
+├── README.md            ← the showcase (next step)
+├── charts/slm-stack/    ← your Helm chart
+├── k8s/                 ← kind config, router, webui, servicemonitor, hpa
+├── load_tests/          ← k6 scripts + result tables
+├── lessons/  reference/ ← the course (leave it in — it shows learning process)
+└── docs/architecture.md ← diagram + design decisions</code></pre>
+<p>Delete <code>main.py</code> (PyCharm boilerplate). Commit with conventional messages (<code>feat: helm chart for vllm serving</code>…).</p>
+</div>
+
+<div class="step">
+<h3>The README that gets interviews</h3>
+<p>Structure (spend real time here — reviewers read READMEs, not templates/):</p>
+<ol>
+<li><strong>One-paragraph pitch</strong>: "Production-style SLM inference stack on Kubernetes: vLLM engines behind a session-aware router, Prometheus/Grafana observability, Open WebUI frontend, k6-gated performance, HPA autoscaling. Runs entirely on a laptop."</li>
+<li><strong>Architecture diagram</strong> (mermaid: browser → NodePort → WebUI → router → engines; Prometheus scraping all; HPA feedback arrow)</li>
+<li><strong>Quickstart</strong>: <code>kind create cluster --config k8s/kind-config.yaml && helm install slm charts/slm-stack && ...</code> — test it from scratch yourself; a broken quickstart is worse than none</li>
+<li><strong>Benchmark results</strong>: the lesson-9 table + Grafana-under-load screenshot</li>
+<li><strong>Design decisions &amp; limitations</strong>: why CPU backend, why NodePort, why CPU-based HPA is wrong and what KEDA would do, what changes on real GPUs (image, <code>nvidia.com/gpu</code> resource, node selectors, GPU operator)</li>
+</ol>
+<p>That last section is the differentiator: it proves you understand the gap between your laptop and production — which is precisely the judgment employers are hiring for.</p>
+</div>
+
+<div class="step">
+<h3>Tell your teacher</h3>
+<p>When the writeup is done, ask the agent for: a mock-interview grilling on the stack ("walk me through a request", "engine OOMs at 2 AM — what do you do", "how would you add a second model?"), and a final learning-record entry. Then consider the wisdom step: post the repo to r/LocalLLaMA or the vLLM Slack for real feedback.</p>
+</div>
+
+</div>
+
+<h2>Check yourself</h2>
+<div class="quiz" data-quiz>
+  <div class="q">
+    <p class="stem">Why is CPU utilization a poor autoscaling signal for LLM engines?</p>
+    <button class="opt" data-correct>Queue can grow while CPU moderate</button>
+    <button class="opt">CPU metrics arrive with minutes delay</button>
+    <button class="opt">Engines never exceed configured CPU limits</button>
+    <p class="explain">Engine fullness = admission/queue state (waiting requests, KV cache), which decouples from CPU%. Scale on <code>num_requests_waiting</code> via KEDA/prometheus-adapter.</p>
+  </div>
+  <div class="q">
+    <p class="stem">Why set a scale-down stabilization window on the HPA?</p>
+    <button class="opt" data-correct>Avoid killing engines on brief lulls</button>
+    <button class="opt">Give metrics-server time to start scraping</button>
+    <button class="opt">Prevent HPA conflicting with helm upgrades</button>
+    <p class="explain">Traffic dips briefly → instant scale-in would kill an engine mid-generation and force a minutes-long model reload when traffic returns. The window makes scale-in deliberate.</p>
+  </div>
+  <div class="q">
+    <p class="stem">New replica scales up but serves nothing for minutes. Why?</p>
+    <button class="opt" data-correct>Model loading gates readiness probe pass</button>
+    <button class="opt">Router refreshes discovery once per hour</button>
+    <button class="opt">HPA holds traffic until metrics stabilize</button>
+    <p class="explain">The pod isn't Ready until the engine loads the model and /health passes — so no traffic reaches it. This model-load latency is THE scaling bottleneck of LLM serving (and why weight-caching PVs matter).</p>
+  </div>
+</div>
+
+<h2>Primary source</h2>
+<p><a href="https://kubernetes.io/docs/tasks/run-application/horizontal-pod-autoscale/">HPA docs</a> + <a href="https://keda.sh/docs/latest/scalers/prometheus/">KEDA prometheus scaler</a>. For where the field is going: production-stack's <a href="https://github.com/vllm-project/production-stack/issues/855">2026 roadmap discussion</a>.</p>
+
+<h2>You're done — almost</h2>
+<p>Mastery isn't finishing lessons; it's rebuilding without them. The final exam, one week after the capstone: <code>kind delete cluster --name llm-stack</code>, then rebuild the entire stack from memory + your own README. What you reach for reveals what to review.</p>
+
+<div class="lesson-footer">
+<p>Course home: <a href="index.html">all lessons</a> · <a href="../MISSION.md">mission</a>.</p>
+<p>Ready for the mock interview? Tell your teacher.</p>
+</div>
+
+</div>
+<script src="../assets/quiz.js"></script>
+</body>
+</html>

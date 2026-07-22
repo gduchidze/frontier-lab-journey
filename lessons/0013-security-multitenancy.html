@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lesson 13 — Security and Multi-Tenancy</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<div class="page">
+
+<p class="lesson-kicker">SLM Production Stack · ADVANCED · Lesson 13 · ~2 h</p>
+<h1>Security and Multi-Tenancy</h1>
+<p class="lesson-lede">An inference platform holds two crown jewels: expensive compute anyone would love to borrow, and prompts full of user data. Today: defense in depth for both — network, identity, resources, and the engine's own front door.</p>
+
+<h2>Knowledge</h2>
+
+<h3>1. The 4C mental model</h3>
+<p>Cloud → Cluster → Container → Code: each layer only as strong as the outer ones. Today works Cluster (RBAC, NetworkPolicy, quotas) and Container/Code (image hygiene, engine auth). (<a href="https://kubernetes.io/docs/concepts/security/overview/">docs</a>)</p>
+
+<h3>2. NetworkPolicy: default-deny, then allow the graph you drew</h3>
+<p>Flat pod network = any compromised pod can curl your engines. <strong>NetworkPolicy</strong> is a pod-level firewall — but only if the CNI enforces it (kind's default kindnet does NOT; that's why lab 11 installed Cilium). The production pattern:</p>
+<pre><code>1. default-deny ingress in the namespace
+2. allow: ui → router (port 8000)
+3. allow: router → engines (port 8000)
+4. allow: monitoring → engines (/metrics)
+5. everything else stays dead — including engine → engine</code></pre>
+<p>Your architecture diagram from lesson 8 IS the allowlist. If you can draw it, you can enforce it.</p>
+
+<h3>3. RBAC as an auditable surface</h3>
+<p>Least privilege isn't a vibe, it's a query:</p>
+<pre><code>kubectl auth can-i --list --as=system:serviceaccount:llm:vllm-router -n llm
+kubectl auth can-i delete pods --as=system:serviceaccount:ui:default -n llm</code></pre>
+<p>Senior habit: audit ServiceAccounts quarterly; anything with <code>cluster-admin</code> or <code>*</code> verbs justifies itself or dies. Your router's 3-verb Role from lesson 6 is the model citizen.</p>
+
+<h3>4. Tenancy = namespace + quota + limits + netpol, as a unit</h3>
+<table>
+<tr><th>Object</th><th>Controls</th><th>LLM-platform example</th></tr>
+<tr><td><code>ResourceQuota</code></td><td>Namespace totals</td><td>Team A gets 8 GPUs, 200Gi RAM — hard cap</td></tr>
+<tr><td><code>LimitRange</code></td><td>Per-pod defaults/bounds</td><td>No limitless pods sneak onto GPU nodes</td></tr>
+<tr><td>NetworkPolicy</td><td>Who talks to whom</td><td>Tenant A cannot reach tenant B's engines</td></tr>
+<tr><td>PriorityClass</td><td>Who wins contention</td><td>Prod &gt; staging &gt; experiments (lesson 11)</td></tr>
+</table>
+<p>Namespaces are soft tenancy (one API server, one kernel). Hostile tenants ⇒ separate clusters or hard sandboxes (Kata/gVisor) — know the line.</p>
+
+<h3>5. Secrets and images, the honest version</h3>
+<p>K8s Secrets are base64 in etcd — protection comes from RBAC + etcd encryption-at-rest + short-lived tokens. Production pulls from a manager (<a href="https://external-secrets.io/">External Secrets Operator</a> + Vault/cloud SM); git holds references, never values (or sealed-secrets if it must hold ciphertext). Images: pin digests, scan (trivy), minimal bases, no <code>:latest</code> in prod — your <code>vllm-cpu:local</code> would be <code>registry/vllm-cpu@sha256:…</code>.</p>
+
+<h3>6. The engine's own door</h3>
+<p><code>vllm serve --api-key</code> (from a Secret, injected as env) means even a pod that sneaks past netpol still can't prompt the model. Defense in depth: edge auth (lesson 12) + network (this) + engine key.</p>
+
+<h2>Lab (labs/lab-13): lock the stack</h2>
+<div class="lab">
+<div class="step"><h3>Default-deny, watch it break</h3><p>Apply deny-all ingress to <code>llm</code>. UI dies, scrapes die, router→engine dies. Feel the blast radius — 30 seconds of controlled outage teaches more than an hour of reading.</p></div>
+<div class="step"><h3>Allow the drawn graph</h3><p>Add the four allow policies (ui→router, router→engines, monitoring→engines, edge→ui/router). Everything returns. Then prove isolation: <code>kubectl run attacker</code> in default ns → curl engine → timeout. Screenshot that timeout; it's a portfolio artifact.</p></div>
+<div class="step"><h3>Quota the tenant</h3><p>ResourceQuota (cpu 12, mem 20Gi, pods 10) + LimitRange defaults on <code>llm</code>. Try to scale engines to 5 — watch quota refuse politely in Events.</p></div>
+<div class="step"><h3>Engine API key</h3><p>Secret → env → <code>--api-key</code> arg in your chart (values-driven). Curl without key → 401; UI updated with the key → works. Audit RBAC with <code>auth can-i --list</code> for every ServiceAccount in llm/ui.</p></div>
+</div>
+
+<h2>Check yourself</h2>
+<div class="quiz" data-quiz>
+  <div class="q">
+    <p class="stem">NetworkPolicies applied on stock kind (kindnet) do…</p>
+    <button class="opt" data-correct>Nothing: the CNI ignores them silently</button>
+    <button class="opt">Enforce ingress rules but not egress</button>
+    <button class="opt">Block traffic after kubelet restarts pods</button>
+    <p class="explain">Policies are just objects; enforcement is the CNI's job. kindnet doesn't implement them — the #1 false sense of security in local clusters. Cilium/Calico enforce.</p>
+  </div>
+  <div class="q">
+    <p class="stem">Why is base64 in a Secret not encryption?</p>
+    <button class="opt" data-correct>It's reversible encoding with no key</button>
+    <button class="opt">It only encrypts values under 1KB</button>
+    <button class="opt">It hashes but never salts the value</button>
+    <p class="explain">base64 is decode-able by anyone holding the bytes. Real protection: RBAC on the object, etcd encryption at rest, external secret managers.</p>
+  </div>
+  <div class="q">
+    <p class="stem">Two paying customers demand hard isolation. Namespaces enough?</p>
+    <button class="opt" data-correct>No: shared control plane and kernels</button>
+    <button class="opt">Yes: quotas plus netpol fully isolate</button>
+    <button class="opt">Yes: if each namespace gets nodes</button>
+    <p class="explain">Namespace tenancy is soft — one API server, shared kernels, escape routes via misconfig. Hard requirements ⇒ cluster-per-tenant or hardware/VM sandboxes (and dedicated nodes still share the control plane).</p>
+  </div>
+</div>
+
+<h2>Primary source</h2>
+<p><a href="https://kubernetes.io/docs/concepts/services-networking/network-policies/">NetworkPolicy docs</a> + <a href="https://kubernetes.io/docs/concepts/security/rbac-good-practices/">RBAC good practices</a>. Skim <a href="https://docs.vllm.ai/en/latest/usage/security.html">vLLM security guide</a>.</p>
+
+<h2>Next</h2>
+<p><a href="0014-gitops-delivery.html">Lesson 14</a>: GitOps — the cluster follows git, and model rollouts become pull requests.</p>
+
+<div class="lesson-footer"><p><a href="index.html">Course home</a> · lab: <code>labs/lab-13/</code></p></div>
+</div>
+<script src="../assets/quiz.js"></script>
+</body>
+</html>

@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lesson 5 — Helm: Package the Stack</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<div class="page">
+
+<p class="lesson-kicker">SLM Production Stack · Lesson 5 · Phase 5 · ~90 min</p>
+<h1>Helm: Package the Stack</h1>
+<p class="lesson-lede">Your vLLM YAML works, but it's copy-paste infrastructure. Helm turns manifests into a parameterized, versioned, installable package — the way both reference repos ship, and the way you'll install Prometheus and Grafana next lesson.</p>
+
+<h2>Knowledge: Helm in four ideas</h2>
+
+<h3>1. Chart = templates + values</h3>
+<p>A <strong>chart</strong> is a directory: <code>Chart.yaml</code> (name, version), <code>values.yaml</code> (the knobs), <code>templates/</code> (manifests with <code>{{ .Values.* }}</code> holes). <code>helm install</code> renders templates with values and applies the result. (<a href="https://helm.sh/docs/topics/charts/">docs</a>)</p>
+
+<h3>2. Values are the public API of your infrastructure</h3>
+<p>Look at how the pros expose knobs — doronmak's <code>values.yaml</code>:</p>
+<pre><code>vllm:
+  replicaCount: 1
+  image: { repository: doronmak/vllm-cpu-image, tag: latest }
+  model: { name: facebook/opt-125m, dtype: auto }
+  resources: { limits: { memory: 10Gi, cpu: "4" } }
+  env:
+    VLLM_TARGET_DEVICE: "cpu"
+    VLLM_CPU_KVCACHE_SPACE: "5"</code></pre>
+<p>And production-stack's <code>modelSpec</code> list — one entry per model, each with <code>replicaCount</code>, <code>requestCPU/GPU</code>, <code>pvcStorage</code>. Same idea, industrial scale. A good <code>values.yaml</code> is what separates a demo chart from a production one.</p>
+
+<h3>3. Releases are stateful installs</h3>
+<p>A <strong>release</strong> = chart + values installed under a name. <code>helm upgrade</code> diffs and applies; <code>helm rollback</code> reverts; <code>helm history</code> shows every revision. Versioned infrastructure changes — interview gold.</p>
+
+<h3>4. Render-before-apply is the debugging superpower</h3>
+<p><code>helm template .</code> renders locally without touching the cluster. Broken chart? Look at what it <em>actually generates</em>. You'll use this constantly.</p>
+
+<h2>Lab: chart your vLLM stack</h2>
+
+<div class="lab">
+
+<div class="step">
+<h3>Scaffold, then gut</h3>
+<pre><code>cd ~/PycharmProjects/AI/llm-infra-playground
+helm create charts/slm-stack
+rm -rf charts/slm-stack/templates/*        # keep the scaffold structure, write our own templates
+ls charts/slm-stack</code></pre>
+<p class="expect">expect: Chart.yaml  charts/  templates/  values.yaml</p>
+</div>
+
+<div class="step">
+<h3>Define the values</h3>
+<p>Replace <code>charts/slm-stack/values.yaml</code>:</p>
+<pre><code>namespace: llm
+
+vllm:
+  replicaCount: 1
+  image:
+    repository: vllm-cpu
+    tag: local
+    pullPolicy: IfNotPresent
+  model:
+    name: Qwen/Qwen3.5-0.8B
+    maxModelLen: 4096
+    dtype: bfloat16
+  kvCacheSpaceGiB: 4
+  resources:
+    requests: { cpu: "4", memory: 6Gi }
+    limits:   { cpu: "6", memory: 8Gi }
+  pvc:
+    size: 10Gi
+  service:
+    port: 8000</code></pre>
+</div>
+
+<div class="step">
+<h3>Template the Deployment</h3>
+<p>Create <code>charts/slm-stack/templates/vllm-deployment.yaml</code> by converting your <code>k8s/vllm.yaml</code>. The pattern — every hardcoded value becomes a reference:</p>
+<pre><code>apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm
+  namespace: {{ .Values.namespace }}
+  labels: { app: vllm }
+spec:
+  replicas: {{ .Values.vllm.replicaCount }}
+  selector:
+    matchLabels: { app: vllm }
+  template:
+    metadata:
+      labels: { app: vllm }
+    spec:
+      containers:
+      - name: vllm
+        image: "{{ .Values.vllm.image.repository }}:{{ .Values.vllm.image.tag }}"
+        imagePullPolicy: {{ .Values.vllm.image.pullPolicy }}
+        args:
+          - "--model"
+          - {{ .Values.vllm.model.name | quote }}
+          - "--max-model-len"
+          - {{ .Values.vllm.model.maxModelLen | quote }}
+          - "--dtype"
+          - {{ .Values.vllm.model.dtype | quote }}
+        env:
+        - name: VLLM_CPU_KVCACHE_SPACE
+          value: {{ .Values.vllm.kvCacheSpaceGiB | quote }}
+        ports:
+        - containerPort: 8000
+        resources:
+          {{- toYaml .Values.vllm.resources | nindent 10 }}
+        startupProbe:
+          httpGet: { path: /health, port: 8000 }
+          periodSeconds: 10
+          failureThreshold: 60
+        readinessProbe:
+          httpGet: { path: /health, port: 8000 }
+          periodSeconds: 10
+        livenessProbe:
+          httpGet: { path: /health, port: 8000 }
+          periodSeconds: 20
+          failureThreshold: 3
+        volumeMounts:
+        - { name: hf-cache, mountPath: /root/.cache/huggingface }
+        - { name: dshm, mountPath: /dev/shm }
+      volumes:
+      - name: hf-cache
+        persistentVolumeClaim: { claimName: hf-cache }
+      - name: dshm
+        emptyDir: { medium: Memory, sizeLimit: 2Gi }</code></pre>
+<p>Then create <code>templates/vllm-service.yaml</code> and <code>templates/vllm-pvc.yaml</code> the same way (port and size from values). Peek at <a href="https://github.com/doronmak/VLLM-Kubernetes-Deployment/tree/main/charts/vllm-demo/templates">doronmak's templates</a> when unsure — it's the same conversion.</p>
+</div>
+
+<div class="step">
+<h3>Render locally, then install</h3>
+<pre><code>helm template charts/slm-stack | less     # inspect generated YAML — find your values in it
+
+# replace the raw-YAML deploy with the chart-managed release:
+kubectl delete -f k8s/vllm.yaml
+helm install slm charts/slm-stack
+helm list
+kubectl get pods -n llm -w</code></pre>
+<p class="expect">expect: release slm deployed; vllm pod READY 1/1 fast (PVC kept the weights? No — new PVC name means re-download unless names match. Did you name it hf-cache? Then yes: fast.)</p>
+</div>
+
+<div class="step">
+<h3>Feel the power: change a value, upgrade, roll back</h3>
+<pre><code>helm upgrade slm charts/slm-stack --set vllm.model.maxModelLen=2048
+kubectl get pods -n llm -w              # rolling replacement
+helm history slm
+helm rollback slm 1
+helm history slm</code></pre>
+<p class="expect">expect: history shows 3 revisions; rollback restored maxModelLen=4096</p>
+<div class="win"><strong>The win</strong>
+Your stack is now an installable, versioned package: <code>helm install slm charts/slm-stack</code> recreates everything from zero. That command in a README is portfolio language.</div>
+</div>
+
+</div>
+
+<h2>Check yourself</h2>
+<div class="quiz" data-quiz>
+  <div class="q">
+    <p class="stem">helm upgrade broke the release. Fastest safe recovery?</p>
+    <button class="opt" data-correct>helm rollback to previous known revision</button>
+    <button class="opt">helm uninstall then reinstall from chart</button>
+    <button class="opt">kubectl edit the deployment back manually</button>
+    <p class="explain">Rollback re-applies the stored previous revision — atomic, audited. Uninstall/reinstall loses release history and may drop PVCs; manual edits drift from the chart.</p>
+  </div>
+  <div class="q">
+    <p class="stem">Chart renders invalid YAML somewhere. Best first diagnostic?</p>
+    <button class="opt" data-correct>helm template and read the output</button>
+    <button class="opt">helm install and read cluster events</button>
+    <button class="opt">kubectl apply each template file directly</button>
+    <p class="explain">Render locally, see exactly what the template produced (usually an indentation bug — <code>nindent</code>). Template files aren't valid YAML on their own, so applying them directly is meaningless.</p>
+  </div>
+</div>
+
+<h2>Primary source</h2>
+<p><a href="https://helm.sh/docs/chart_template_guide/getting_started/">Helm Chart Template Guide</a> (the "Getting Started" through "Values Files" pages, ~25 min). Then read <a href="https://github.com/vllm-project/production-stack/blob/main/helm/values.yaml">production-stack's values.yaml</a> top-to-bottom — it's a masterclass in chart API design.</p>
+
+<h2>Next</h2>
+<p><a href="0006-router-scaleout.html">Lesson 6</a>: production-stack proper — multiple engine replicas and a request router with service discovery, session affinity, and its own metrics.</p>
+
+<div class="lesson-footer">
+<p>References: <a href="../reference/helm-cheatsheet.html">Helm cheat sheet</a>.</p>
+<p>Template errors are cryptic — paste them to your teacher with the template file.</p>
+</div>
+
+</div>
+<script src="../assets/quiz.js"></script>
+</body>
+</html>

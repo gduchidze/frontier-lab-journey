@@ -1,0 +1,68 @@
+# Lab 13 — default-deny + the allowed graph. Requires an enforcing CNI (Cilium).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+  namespace: llm
+spec:
+  podSelector: {}          # every pod in llm
+  policyTypes: [Ingress]   # no ingress rules listed → deny all inbound
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-ui-to-router
+  namespace: llm
+spec:
+  podSelector:
+    matchLabels: { app: vllm-router }
+  ingress:
+  - from:
+    - namespaceSelector:
+        matchLabels: { kubernetes.io/metadata.name: ui }
+    ports:
+    - port: 8000
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-router-to-engines
+  namespace: llm
+spec:
+  podSelector:
+    matchLabels: { app: vllm }
+  ingress:
+  - from:
+    - podSelector:
+        matchLabels: { app: vllm-router }
+    ports:
+    - port: 8000
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-monitoring-scrape
+  namespace: llm
+spec:
+  podSelector: {}          # engines AND router expose /metrics
+  ingress:
+  - from:
+    - namespaceSelector:
+        matchLabels: { kubernetes.io/metadata.name: monitoring }
+    ports:
+    - port: 8000
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-edge-to-router
+  namespace: llm
+spec:
+  podSelector:
+    matchLabels: { app: vllm-router }
+  ingress:
+  - from:
+    - namespaceSelector:
+        matchLabels: { kubernetes.io/metadata.name: ingress-nginx }
+    ports:
+    - port: 8000

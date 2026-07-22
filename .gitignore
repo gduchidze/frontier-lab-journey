@@ -1,0 +1,47 @@
+# --- OS ---
+.DS_Store
+Thumbs.db
+
+# --- IDEs ---
+.idea/
+.vscode/
+*.iml
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- Local agent/tool state (machine-specific, not course content) ---
+.omc/
+.agents/
+.claude/settings.local.json
+
+# --- Secrets & credentials: NEVER commit ---
+.env
+.env.*
+*.key
+*.pem
+*.crt
+kubeconfig
+*.kubeconfig
+**/secrets.yaml
+
+# --- Helm ---
+charts/**/*.tgz
+charts/*/charts/
+charts/*/Chart.lock
+
+# --- Kubernetes / local cluster scratch ---
+*.kubeconfig.yaml
+
+# --- Benchmark raw dumps (curated results in RESULTS.md / tuning/*.json ARE committed) ---
+load_tests/*.tmp
+*.log
+
+# --- Node (if a lesson ever pulls tooling in) ---
+node_modules/
