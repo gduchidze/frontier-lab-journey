@@ -95,7 +95,7 @@ kubectl cluster-info</code></pre>
 kubectl get pods -o wide</code></pre>
 <p class="expect">მოსალოდნელია: 2 pod hello-xxxx Running, node-ებზე გადანაწილებული</p>
 <p>ახლა დაამტკიცე reconciliation loop (#3 იდეა). წაშალე ერთი Pod და უყურე, როგორ აღადგენს მას K8s:</p>
-<pre><code>kubectl delete pod $(kubectl get pods -l app=hello -o name | head -1)
+<pre><code>kubectl delete $(kubectl get pods -l app=hello -o name | head -1)
 kubectl get pods -w        # Ctrl+C to stop watching</code></pre>
 <p class="expect">მოსალოდნელია: ᲐᲮᲐᲚᲘ pod (განსხვავებული სუფიქსით) წამებში გამოჩნდება</p>
 </div>

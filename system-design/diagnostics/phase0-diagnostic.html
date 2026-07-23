@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Phase 0 Diagnostic — 280 Questions</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<div class="lesson">
+  <header class="lesson-header">
+    <p class="kicker">Diagnostic · Phase 0 — Engineering, ML &amp; Math Foundations</p>
+    <h1>Phase 0 Gate Exam</h1>
+    <p class="dek">280 questions — 20 per topic across Track A (CS/systems), Track B (ML/DL/NLP), Track C (math). This IS the gate: STRONG topics get skipped entirely.</p>
+  </header>
+
+  <div class="callout"><span class="label">How the gates work</span>
+    <strong>One topic block (20 questions) = one sitting.</strong> Progress saves automatically.
+    Verdict per topic the moment its 20th answer lands:
+    <strong>STRONG</strong> (≥80% — topic SKIPPED, logged as a learning record) ·
+    <strong>SHAKY</strong> (50–79% — targeted mini-lesson on what you missed) ·
+    <strong>GAP</strong> (&lt;50% — full lesson + primary-source reading before Phase deep work).
+    Deep-dive links point at the canonical source for each topic. After each sitting, paste the summary block to your teacher.
+  </div>
+
+  <div class="quiz" id="diag"></div>
+
+  <footer class="lesson-footer">
+    <p>Suggested order: one Track A topic, then one Track B, then one Track C per week — interleaving beats blocking for retention. Wrong answers are the deliverable.</p>
+    <nav class="lesson-nav">
+      <span>◀ <a href="../index.html">Course index</a></span>
+      <span><a href="phase1-diagnostic.html">Phase 1 diagnostic</a> ▶</span>
+    </nav>
+  </footer>
+</div>
+
+<script src="phase0-topics.js"></script>
+<script src="bank0/a1.js"></script>
+<script src="bank0/a2.js"></script>
+<script src="bank0/a3.js"></script>
+<script src="bank0/a4.js"></script>
+<script src="bank0/a5.js"></script>
+<script src="bank0/b1.js"></script>
+<script src="bank0/b2.js"></script>
+<script src="bank0/b3.js"></script>
+<script src="bank0/b4.js"></script>
+<script src="bank0/b5.js"></script>
+<script src="bank0/c1.js"></script>
+<script src="bank0/c2.js"></script>
+<script src="bank0/c3.js"></script>
+<script src="bank0/c4.js"></script>
+<script src="../assets/diagnostic.js"></script>
+<script>
+renderDiagnostic(document.getElementById('diag'), {
+  topics: PHASE0_TOPICS,
+  questions: [].concat(PHASE0_BANK_A1, PHASE0_BANK_A2, PHASE0_BANK_A3,
+                       PHASE0_BANK_A4, PHASE0_BANK_A5,
+                       PHASE0_BANK_B1, PHASE0_BANK_B2, PHASE0_BANK_B3,
+                       PHASE0_BANK_B4, PHASE0_BANK_B5,
+                       PHASE0_BANK_C1, PHASE0_BANK_C2, PHASE0_BANK_C3,
+                       PHASE0_BANK_C4),
+  storageKey: 'phase0-diag-v1',
+});
+</script>
+</body>
+</html>

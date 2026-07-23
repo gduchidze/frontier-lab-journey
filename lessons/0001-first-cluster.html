@@ -96,8 +96,9 @@ kubectl cluster-info</code></pre>
 kubectl get pods -o wide</code></pre>
 <p class="expect">expect: 2 pods hello-xxxx Running, spread across nodes</p>
 <p>Now prove the reconciliation loop (idea #3). Delete one Pod and watch K8s resurrect it:</p>
-<pre><code>kubectl delete pod $(kubectl get pods -l app=hello -o name | head -1)
+<pre><code>kubectl delete $(kubectl get pods -l app=hello -o name | head -1)
 kubectl get pods -w        # Ctrl+C to stop watching</code></pre>
+<p><em>Note:</em> <code>-o name</code> already prints <code>pod/NAME</code> — the resource type is included, so <code>delete</code> gets no extra <code>pod</code> argument.</p>
 <p class="expect">expect: a NEW pod (different suffix) appears within seconds</p>
 </div>
 

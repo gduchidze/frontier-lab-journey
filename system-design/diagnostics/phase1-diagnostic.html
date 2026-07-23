@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Phase 1 Diagnostic — 45 Questions</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<div class="lesson">
+  <header class="lesson-header">
+    <p class="kicker">Diagnostic · Phase 1 — Distributed Systems Core</p>
+    <h1>Phase 1 Gap Detector</h1>
+    <p class="dek">180 questions — 20 per lesson topic. No notes, no peeking — wrong answers here are pure profit: they tell us exactly where to dig.</p>
+  </header>
+
+  <div class="callout"><span class="label">How to use (ADHD-fit)</span>
+    <strong>One topic block (20 questions) = one sitting.</strong> Progress saves automatically — close the tab anytime.
+    Each topic's verdict appears the moment its 20th answer lands: <strong>GAP</strong> (&lt;50% — full deep-dive session),
+    <strong>SHAKY</strong> (50–79% — redo the lab + targeted review), <strong>STRONG</strong> (≥80% — spaced recall only).
+    After each sitting, copy the summary block and paste it to your teacher — that becomes your deep-dive plan.
+  </div>
+
+  <div class="quiz" id="diag"></div>
+
+  <footer class="lesson-footer">
+    <p>Retake after the deep-dives — the delta between attempts is the progress measure. Questions rotate meaning across retakes poorly, so the second attempt is a floor check, not a victory lap.</p>
+    <nav class="lesson-nav">
+      <span>◀ <a href="../index.html">Course index</a></span>
+      <span><a href="../reference/0001-glossary.html">Glossary</a> ▶</span>
+    </nav>
+  </footer>
+</div>
+
+<script src="phase1-questions.js"></script>
+<script src="bank/t1.js"></script>
+<script src="bank/t2.js"></script>
+<script src="bank/t3.js"></script>
+<script src="bank/t4.js"></script>
+<script src="bank/t5.js"></script>
+<script src="bank/t6.js"></script>
+<script src="bank/t7.js"></script>
+<script src="bank/t8.js"></script>
+<script src="bank/t9.js"></script>
+<script src="../assets/diagnostic.js"></script>
+<script>
+renderDiagnostic(document.getElementById('diag'), {
+  topics: PHASE1_TOPICS,
+  questions: [].concat(PHASE1_BANK_T1, PHASE1_BANK_T2, PHASE1_BANK_T3,
+                       PHASE1_BANK_T4, PHASE1_BANK_T5, PHASE1_BANK_T6,
+                       PHASE1_BANK_T7, PHASE1_BANK_T8, PHASE1_BANK_T9),
+  storageKey: 'phase1-diag-v2',
+});
+</script>
+</body>
+</html>

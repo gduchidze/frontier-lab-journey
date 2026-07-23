@@ -129,6 +129,30 @@ Five stages, ~4–6 weeks: recruiter call → technical screen (coding + ML fund
 - 2026-07-23: **Broaden as SOFTWARE engineering, less AI-centric** — primary examples must be classic systems (e-commerce, social, payments, logistics); AI/LLM at most one short subsection per lesson. Roadmap restructured: new Phase 2 (software architecture & reliability, lessons 10–17), Phase 3 classic reps expanded to 11 (chat, Dropbox, notifications, payments added); AI phases moved to 4–6; interview execution now Phase 7. Total ≈ 47 lessons + Phase 0.
 - 2026-07-23: **"Doing > theory" — every lesson MUST ship a practical lab.** Convention: `labs/lab-NNNN-<slug>/` with runnable stdlib-Python (or real infra later) + README of predict-edit-rerun exercises; lesson links the lab; lab deliverable = prediction-vs-observed notes, which seed learning records. Lab 0001 (measure the tail) retrofitted to lesson 0001. Phase 1 lab ideas: L2 estimation → napkin-math checker script; L3 load balancing → toy LB with health checks in front of 3 local HTTP servers; L4 replication → simulate replication lag; L5–7 → SQLite/Redis-style experiments; L8 → queue + backpressure simulation with 503s.
 
+## ADHD accommodations (disclosed 2026-07-23 — shapes ALL future lesson/session design)
+User has attention deficit. Rules:
+- **Micro-blocks, not marathons**: 2h day = 4 × 25-min pomodoros with 5-min movement breaks; never design a task assuming 2h unbroken focus.
+- **Lab FIRST, lesson second**: start each session by RUNNING the lab (action hooks attention), read the lesson after the first run when curiosity is primed. Reverse of the default order.
+- **Minimum viable session** on bad days: 15-min recall + one quiz = chain unbroken. Never "catch up" with double sessions.
+- **Fast feedback everywhere**: quizzes immediately after each section when possible; labs already predict→run→compare.
+- **10-minute rule**: stuck >10 min → ask the teacher, don't grind. Grinding kills the next session too.
+- **One tab, phone away, same hour daily** (habit anchor beats willpower).
+- Split lesson consumption: read/lab/quiz can be separate sittings same day.
+- Keep future lessons' sections SHORT even in "comprehensive" mode — depth via more sections, not longer ones.
+
+## Diagnostics (built 2026-07-23)
+Component: `assets/diagnostic.js` — per-topic verdicts appear as soon as a topic's block is complete; progress persists in localStorage; copy-paste summary for teacher. Verdicts: GAP <50% / SHAKY 50–79% / STRONG ≥80%.
+- **Phase 1**: `diagnostics/phase1-diagnostic.html` — 180 Qs (20 × 9 topics), banks in `diagnostics/bank/t1..t9.js` (5 original + 15 new each; recall/scenario/numeric mix). Validated: word counts equal, answers 63/63/54, no dupes.
+- **Phase 0**: `diagnostics/phase0-diagnostic.html` — 280 Qs (20 × 14 topics: a1–a5 CS, b1–b5 ML/DL/NLP, c1–c4 math), banks in `diagnostics/bank0/`. **This replaces the per-lesson gate quizzes**: STRONG topic = skipped, log a learning record; SHAKY = targeted mini-lesson on missed items; GAP = full lesson + primary source. Deep-dive links point to external canonical resources (no local Phase 0 lessons yet — author only for GAP/SHAKY topics, on demand).
+Flow both phases: one topic per sitting (ADHD fit) → paste summary → teacher plans deep-dives → retake later as floor-check.
+
+## Pace & schedule (set 2026-07-23)
+User capacity: **2 h/day × 6 days = 12 h/week.** Target: full coverage in ~14 weeks (±2).
+- Wk 1: Phase 0 gates (fail → lesson) · Wk 2–4: Phase 1 (lessons+labs, ~3/wk) · Wk 5–6: Phase 2 · Wk 7–9: Phase 3 reps (~4/wk) · Wk 10: Phase 4 · Wk 11–12: Phase 5 · Wk 13: Phase 6 · Wk 14+: Phase 7 drills + 2 human mocks.
+- Daily shape: 15 min spaced recall (teacher fires 3 Qs from ≥2 lessons back) → 75–90 min lesson+lab (or timed rep) → 15–20 min quiz + project step + notes.
+- Day 6 = review day: failed quiz items, glossary sweep, 1 case study, 15-min behaviour drill (from behaviour/ workspace, starts ~wk 8).
+- Rep-day shape (Phase 3+): 10 min recall → 40 min solo timed design ALOUD → 40 min compare vs reference + deltas → 30 min next-lesson read.
+
 ## Working notes
 - Workspace strictly `system-design/`. Root-level MISSION.md/lessons/ belong to another workspace — do not touch.
 - Quiz answers: equal word counts per question.

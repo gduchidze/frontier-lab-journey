@@ -25,11 +25,146 @@
     <tr><td><strong>Saturation</strong></td><td>The state where a resource (CPU, GPU, queue) is near capacity; latency explodes as load approaches saturation.</td></tr>
   </table>
 
+  <h2>Estimation</h2>
+  <table>
+    <tr><th>Term</th><th>Definition</th></tr>
+    <tr><td><strong>Back-of-envelope estimation</strong></td><td>Five minutes of powers-of-ten arithmetic that turns a prompt's numbers into machines. Within an order of magnitude is success; a third significant digit is theater.</td></tr>
+    <tr><td><strong>DAU</strong></td><td>Daily Active Users — the top of every estimation pipeline: DAU × actions/user ÷ 10⁵ seconds/day ≈ average QPS.</td></tr>
+    <tr><td><strong>Peak factor</strong></td><td>Multiplier from average to peak traffic, ×2–10. A business fact, not a math constant: social evenings ~2–5×, retail promos 10×+.</td></tr>
+    <tr><td><strong>Read:write ratio</strong></td><td>Reads per write — 10:1 typical, 100:1 for feeds. The single number that decides whether you buy caches or queues.</td></tr>
+    <tr><td><strong>Replication factor</strong></td><td>Nothing durable is stored once: multiply raw storage by ×3 for replicas (or ~×1.5 with erasure coding), and say which you assumed.</td></tr>
+    <tr><td><strong>Erasure coding</strong></td><td>Durability via parity fragments instead of full copies — ~1.5× storage overhead instead of 3×, paid for with slower recovery.</td></tr>
+    <tr><td><strong>Hot set</strong></td><td>The data actually being read right now. If it fits in RAM (a few hundred GB), cache it whole and the design changes shape.</td></tr>
+    <tr><td><strong>Metadata/blob split</strong></td><td>Small hot rows in a database, large immutable blobs in object storage behind a CDN. The shape of every photo, video, and document system.</td></tr>
+    <tr><td><strong>False precision</strong></td><td>Saying "13,889 QPS" instead of "~15k". Precision beyond one significant figure is noise wearing rigor's clothes.</td></tr>
+  </table>
+
+  <h2>Traffic &amp; Edge</h2>
+  <table>
+    <tr><th>Term</th><th>Definition</th></tr>
+    <tr><td><strong>DNS</strong></td><td>The hierarchy that maps names to IPs, cached at every step. Usually free, slow to change (TTL), and itself a dependency that fails.</td></tr>
+    <tr><td><strong>DNS routing</strong></td><td>Weighted (canaries), latency-based (nearest region), or geolocation (data-residency law) answers. Good for geography and coarse shaping; too slow for failover.</td></tr>
+    <tr><td><strong>CDN</strong></td><td>Content Delivery Network — copies of static content on hundreds of edge servers, so the request never crosses the ocean at all.</td></tr>
+    <tr><td><strong>Push vs pull CDN</strong></td><td>Push uploads content at release time (fast first hit, pays for storage everywhere); pull fetches from origin on first miss (fits long tails).</td></tr>
+    <tr><td><strong>Versioned URLs</strong></td><td>Ship <code>app.9f3ab2.js</code>, cache forever, never purge. The professional answer to CDN invalidation, which is unreliable at the worst moments.</td></tr>
+    <tr><td><strong>Load balancer</strong></td><td>One virtual IP (VIP), many real servers. Earns its keep the moment a backend dies.</td></tr>
+    <tr><td><strong>L4 load balancing</strong></td><td>Transport layer: sees IPs and ports, forwards packets near line-rate. Fast and blind.</td></tr>
+    <tr><td><strong>L7 load balancing</strong></td><td>Application layer: terminates TLS, reads the HTTP request, routes by path/header/cookie. Smart, and you pay CPU for it.</td></tr>
+    <tr><td><strong>Least-connections</strong></td><td>Route to the backend with fewest in-flight requests. The self-correcting choice when request costs vary — and they always do.</td></tr>
+    <tr><td><strong>Sticky sessions</strong></td><td>Pinning a client to one server so in-memory state survives. How small systems grow into unscalable ones — it makes servers non-interchangeable.</td></tr>
+    <tr><td><strong>Stateless / shared-nothing</strong></td><td>No request depends on one box's local state; sessions live in Redis, files in object storage. The prerequisite for horizontal scaling.</td></tr>
+    <tr><td><strong>Health check</strong></td><td>Periodic probe (<code>GET /health</code>) gating rotation membership. Detection time ≈ interval × failure threshold; over-eager checks cause flapping.</td></tr>
+    <tr><td><strong>Floating IP</strong></td><td>An IP the passive balancer claims (via VRRP/keepalived) when the active dies — the standard answer to "who balances the balancer?"</td></tr>
+    <tr><td><strong>Reverse proxy</strong></td><td>A server fronting your app servers: TLS termination, compression, rate limiting, a stable public face. A load balancer is just one that balances.</td></tr>
+  </table>
+
+  <h2>Consistency &amp; Replication</h2>
+  <table>
+    <tr><th>Term</th><th>Definition</th></tr>
+    <tr><td><strong>CAP theorem</strong></td><td>Not "pick two" — partitions are forced on you. During one, each request chooses: refuse (CP) or answer possibly stale (AP). Operations choose, not systems.</td></tr>
+    <tr><td><strong>PACELC</strong></td><td>CAP's completion: if Partitioned, Availability vs Consistency; Else, Latency vs Consistency. The trade you make every day, not just on bad days.</td></tr>
+    <tr><td><strong>Eventual consistency</strong></td><td>Stop writing and replicas converge, on no particular deadline. A weak promise — never say it without naming the anomaly you're accepting.</td></tr>
+    <tr><td><strong>Strong consistency</strong></td><td>Linearizable: every read sees the latest write, as if one copy existed. For payments, inventory decrement, unique usernames — bought with write latency.</td></tr>
+    <tr><td><strong>Read-your-writes</strong></td><td>A session guarantee: you always see your own writes, even if strangers' replicas lag. Fixes the "my comment vanished" bug via leader pinning.</td></tr>
+    <tr><td><strong>Monotonic reads</strong></td><td>Time never runs backwards across your reads. Pin a session to one replica so a user may lag but never time-travels.</td></tr>
+    <tr><td><strong>Leader–follower replication</strong></td><td>All writes to one leader; followers replay the change stream and serve reads. The default RDBMS topology.</td></tr>
+    <tr><td><strong>Replication lag</strong></td><td>The window where followers are behind the leader. Every follower read races it; every async failover can lose it.</td></tr>
+    <tr><td><strong>Multi-leader replication</strong></td><td>Several nodes accept writes (multi-region, offline clients). Buys locality; pays with write conflicts — never propose it without a conflict story.</td></tr>
+    <tr><td><strong>Last-write-wins</strong></td><td>Conflict "resolution" by timestamp. Simple, and it silently destroys data — fine for a view counter, unforgivable for orders.</td></tr>
+    <tr><td><strong>CRDT</strong></td><td>Data structures mathematically guaranteed to converge regardless of delivery order. The machinery under collaborative editors.</td></tr>
+    <tr><td><strong>Quorum (R + W &gt; N)</strong></td><td>If read set and write set must overlap, a read cannot miss the latest acknowledged write. Pigeonhole arithmetic, not probability.</td></tr>
+    <tr><td><strong>Failover</strong></td><td>Promoting a replacement when the leader dies. The wounds: lost in-flight writes, premature promotion, and timeouts that are only ever tuned, never correct.</td></tr>
+    <tr><td><strong>Split-brain</strong></td><td>The "dead" leader wasn't dead, and now two leaders accept conflicting writes. Prevented by quorum election and fencing (STONITH).</td></tr>
+    <tr><td><strong>RTO / RPO</strong></td><td>Recovery Time Objective (how long until recovered) and Recovery Point Objective (how much data you may lose — for async replication, the lag at crash time).</td></tr>
+    <tr><td><strong>Nines</strong></td><td>Availability targets as downtime: 99.9% = 8.8 h/year, 99.99% = 53 min. Series dependencies multiply availabilities down; parallel redundancy multiplies failure probabilities down.</td></tr>
+  </table>
+
+  <h2>Databases</h2>
+  <table>
+    <tr><th>Term</th><th>Definition</th></tr>
+    <tr><td><strong>ACID</strong></td><td>Atomicity, Consistency, Isolation, Durability — the transaction contract. Needed when several rows must change together and a partial state is unacceptable.</td></tr>
+    <tr><td><strong>BASE</strong></td><td>Basically Available, Soft state, Eventually consistent. Not "no guarantees" — a different contract: availability and scale, bought with staleness.</td></tr>
+    <tr><td><strong>B-tree</strong></td><td>The index structure: wide, shallow, sorted. Depth 4 reaches billions of rows; a point read is ~one 150&nbsp;µs SSD touch.</td></tr>
+    <tr><td><strong>Write amplification</strong></td><td>Every index is another B-tree updated on every write. Indexes are prepaid reads, billed to the write path.</td></tr>
+    <tr><td><strong>Covering index</strong></td><td>An index containing every column the query touches — the engine never visits the table at all.</td></tr>
+    <tr><td><strong>Leftmost-prefix rule</strong></td><td>A composite index <code>(user_id, created_at)</code> serves equality-then-range, and is useless for a range on the second column alone. Phone books work the same way.</td></tr>
+    <tr><td><strong>Scaling ladder</strong></td><td>Read replicas → caching → federation → sharding, in that order. Each rung is cheaper and more reversible than the next; say why you're stopping.</td></tr>
+    <tr><td><strong>Federation</strong></td><td>Split by function: users DB, catalog DB, orders DB. Buys independent failure domains; costs cross-database joins.</td></tr>
+    <tr><td><strong>Sharding</strong></td><td>Splitting one table's rows across machines by a shard key. The only rung that scales writes — and the last resort, priced accordingly.</td></tr>
+    <tr><td><strong>Shard key</strong></td><td>The column that maps rows to shards. Choose it by asking what the dominant query filters on — then defend it against the hot key.</td></tr>
+    <tr><td><strong>Hot key</strong></td><td>The celebrity problem: hashing balances keys, not load, and Zipf traffic puts 100M followers on one shard. Salt it, isolate it, or route it differently.</td></tr>
+    <tr><td><strong>Snowflake ID</strong></td><td>Structured ID (timestamp + worker + sequence in 64 bits), because every shard's auto-increment happily generates the same colliding 1, 2, 3…</td></tr>
+    <tr><td><strong>Denormalization</strong></td><td>Copying data so a three-way join becomes one lookup. Paying writes to buy reads — the right trade whenever reads dominate, which is nearly always.</td></tr>
+    <tr><td><strong>Materialized view</strong></td><td>Denormalization with the bookkeeping handled by the database: a precomputed query result, refreshed on schedule.</td></tr>
+    <tr><td><strong>Fan-out on write</strong></td><td>Precompute each follower's feed at post time; reads become one lookup. Twitter's hybrid: fan out for normal accounts, pull-on-read for celebrities.</td></tr>
+    <tr><td><strong>Key-value store</strong></td><td><code>get/put/delete</code> and nothing else — that austerity is the point. Redis for caches and sessions, sub-millisecond, no query planner in the way.</td></tr>
+    <tr><td><strong>Document store</strong></td><td>The whole aggregate in one JSON document, indexed and queryable. Schema evolves per document; if you constantly join, you chose wrong.</td></tr>
+    <tr><td><strong>Wide-column store</strong></td><td>Partition key routes, clustering key sorts, LSM trees append. Cassandra swallows write-heavy firehoses — but the primary key <em>is</em> the query plan.</td></tr>
+    <tr><td><strong>Graph database</strong></td><td>Nodes and edges with direct pointers: "friends of friends of friends" is a walk, not N self-joins. Use only when traversal is the workload.</td></tr>
+    <tr><td><strong>LSM tree</strong></td><td>Log-structured storage: writes append sequentially, compaction tidies later. Why wide-column stores love write-heavy time series.</td></tr>
+    <tr><td><strong>Consistent hashing</strong></td><td>Hash nodes and keys onto one ring; a key belongs to the first node clockwise. Adding a node moves ~1/(N+1) of keys, not the ~83% that <code>mod N</code> moves.</td></tr>
+    <tr><td><strong>Virtual nodes</strong></td><td>Give each physical node hundreds of ring positions so arc sizes stop being a lottery — 3.2× overload smooths to ~1.1×, and a dead node's load disperses.</td></tr>
+    <tr><td><strong>Polyglot persistence</strong></td><td>Orders in Postgres, sessions in Redis, events in Cassandra, fraud in Neo4j — each store earned its place through a named pressure. Start SQL; leave when forced.</td></tr>
+  </table>
+
+  <h2>Caching</h2>
+  <table>
+    <tr><th>Term</th><th>Definition</th></tr>
+    <tr><td><strong>Cache-aside</strong></td><td>App checks cache; on miss reads DB and fills. On writes, delete the entry rather than update it. The default pattern; Facebook runs memcache this way.</td></tr>
+    <tr><td><strong>Write-through</strong></td><td>Every write hits cache and DB synchronously. Never stale, always warm after writes — paid for with slower writes and caching data nobody reads.</td></tr>
+    <tr><td><strong>Write-behind</strong></td><td>Write to cache, ack, flush to DB later. Fast, batches beautifully — and loses data if the cache dies before the flush. Treat with fear near money.</td></tr>
+    <tr><td><strong>Refresh-ahead</strong></td><td>Re-fetch hot entries before they expire so users never see the miss. Strongest for keys you can predict — which is exactly its limit.</td></tr>
+    <tr><td><strong>TTL</strong></td><td>Time-to-live: an expiry clock on each entry. A freshness bound, not a space policy — and "prices may be 60&nbsp;s stale" said aloud is what makes it engineering.</td></tr>
+    <tr><td><strong>LRU / LFU</strong></td><td>Evict least-recently vs least-frequently used. LRU loves temporal locality but a scan flushes it; LFU resists scans but forgets yesterday's hot keys slowly.</td></tr>
+    <tr><td><strong>Hit rate</strong></td><td>Fraction of reads served from cache — simultaneously a latency number and a capacity number. Size at the knee of the curve; Zipf skew front-loads the value.</td></tr>
+    <tr><td><strong>Zipf distribution</strong></td><td>The k-th most popular key gets ~1/k of the traffic. Caching works because traffic is unfair; on uniform traffic a small cache is nearly useless.</td></tr>
+    <tr><td><strong>Cache stampede</strong></td><td>Thundering herd / dogpile: a hot key expires and every in-flight request recomputes at once — a self-inflicted 200× spike on your hottest data.</td></tr>
+    <tr><td><strong>Singleflight</strong></td><td>Per-key locking: one request recomputes, the rest wait for its result. Instagram's "promises", Facebook's leases — the stampede fix with a guarantee.</td></tr>
+    <tr><td><strong>TTL jitter</strong></td><td>Randomize expiries so thousands of keys never expire in the same instant. The fix for cache avalanche; it decorrelates reloads, it doesn't reduce them.</td></tr>
+    <tr><td><strong>Cache penetration</strong></td><td>Requests for keys that don't exist miss forever and hammer the DB — accidentally or adversarially. No amount of capacity helps a key with no value.</td></tr>
+    <tr><td><strong>Negative caching</strong></td><td>Cache the "not found" itself, with a short TTL. Pair with a Bloom filter ("definitely not present") for hostile or vast keyspaces.</td></tr>
+    <tr><td><strong>Cache invalidation</strong></td><td>One of the two hard things: a message about a write, delivered to a different system, racing the reads. Event-driven for expensive staleness, TTL as backstop.</td></tr>
+  </table>
+
+  <h2>Async &amp; Communication</h2>
+  <table>
+    <tr><th>Term</th><th>Definition</th></tr>
+    <tr><td><strong>Message queue</strong></td><td>Buffers data between services so producers and consumers are decoupled (Kafka, RabbitMQ, SQS). Absorbs bursts; does not create capacity.</td></tr>
+    <tr><td><strong>Task queue</strong></td><td>One level up: manages the execution of background jobs — workers, retries, schedules — on top of a broker (Celery, Sidekiq).</td></tr>
+    <tr><td><strong>Queue depth</strong></td><td>The best early-warning signal you have: depth ÷ drain rate is next-minute latency. Latency percentiles report the past; depth predicts.</td></tr>
+    <tr><td><strong>Backpressure</strong></td><td>Pushing overload back toward the source instead of absorbing it into an unbounded queue. Bound every queue, reject early, tell clients how to come back.</td></tr>
+    <tr><td><strong>At-least-once delivery</strong></td><td>The honest default: the broker redelivers on ambiguity, so duplicates happen. The standard pairing is at-least-once plus an idempotent consumer.</td></tr>
+    <tr><td><strong>Exactly-once delivery</strong></td><td>Mostly a lie above the transport. Real within Kafka's own boundary; the moment you touch the outside world, it's at-least-once plus idempotency again.</td></tr>
+    <tr><td><strong>Idempotency key</strong></td><td>A unique key per logical operation; the server records processed keys and duplicates return the stored result. How Stripe makes payment retries safe.</td></tr>
+    <tr><td><strong>Exponential backoff with jitter</strong></td><td>Wait 1&nbsp;s, 2&nbsp;s, 4&nbsp;s… plus a random smear. The jitter is the half people forget — without it, synchronized retries re-create the outage forever.</td></tr>
+    <tr><td><strong>Retry amplification</strong></td><td>3 retries × 3 layers = 27 requests from one tap, exactly when the bottom service can least serve them. Retry at one layer, cap attempts, budget retries.</td></tr>
+    <tr><td><strong>Little's law</strong></td><td>L = λW: items in system = arrival rate × time in system. Sizes queue bounds, worker pools, and wait forecasts, distribution-free.</td></tr>
+    <tr><td><strong>Utilization hockey stick</strong></td><td>Queue wait scales like ρ/(1−ρ): flat until ~70–80% utilization, then 90%→95% doubles the wait. "We're at 95% and fine" is a lit fuse.</td></tr>
+    <tr><td><strong>Load shedding</strong></td><td>Dropping the cheapest-to-lose work first, by pre-declared priority: telemetry before recommendations before search, never checkout.</td></tr>
+    <tr><td><strong>TCP vs UDP</strong></td><td>TCP: ordered, reliable, and willing to wait for late packets. UDP: just sends. Choose UDP when late data is worse than lost data — live media, game state.</td></tr>
+    <tr><td><strong>REST vs gRPC</strong></td><td>REST (HTTP + JSON) at the public edge for loose coupling and curl-ability; gRPC (HTTP/2 + protobuf) inside the datacenter for typed contracts and streaming.</td></tr>
+  </table>
+
+  <h2>Interview Process</h2>
+  <table>
+    <tr><th>Term</th><th>Definition</th></tr>
+    <tr><td><strong>4-step framework</strong></td><td>Clarify (5–8 min) → estimate (~5) → high-level design (~15) → deep dive (~20). You drive; silence reads as lost, an agenda reads as seniority.</td></tr>
+    <tr><td><strong>Functional requirements</strong></td><td>What the system <em>does</em>: add to cart, charge the card exactly once, email the receipt.</td></tr>
+    <tr><td><strong>Non-functional requirements</strong></td><td>How <em>well</em> it must do it: p99 &lt; 500&nbsp;ms at 30k QPS, 99.99% availability, no double-charges ever. The grading contract for the hour.</td></tr>
+    <tr><td><strong>Out-of-scope list</strong></td><td>Written exclusions ("auth and fraud are existing services"). Scoping is not dodging — it is what senior engineers do to real projects every week.</td></tr>
+    <tr><td><strong>Spending a number</strong></td><td>Every estimate must justify a decision: "50:1 reads is why this cache exists." Numbers computed and never referenced again are ritual, not engineering.</td></tr>
+    <tr><td><strong>Scatter-gather</strong></td><td>Fanning a query out to every shard or service and merging the results — as slow as the slowest responder, and the tax on any query not anchored on the shard key.</td></tr>
+    <tr><td><strong>Signposting</strong></td><td>Enumerate → choose → <em>because</em>: "three options, I'd pick B because…". Proves you saw the design space and can still commit.</td></tr>
+    <tr><td><strong>Deep dive</strong></td><td>The largest time budget for a reason: two components dissected under load — bottleneck and failure mode named unprompted — beat ten components named.</td></tr>
+  </table>
+
   <h2>LLM serving (preview — deep dive in Phase 3)</h2>
   <table>
     <tr><th>Term</th><th>Definition</th></tr>
     <tr><td><strong>TTFT</strong></td><td>Time To First Token — latency until the first output token arrives. What users feel as "responsiveness".</td></tr>
     <tr><td><strong>TPOT</strong></td><td>Time Per Output Token — average gap between tokens after the first. What users feel as "typing speed".</td></tr>
+    <tr><td><strong>KV cache</strong></td><td>Per-session attention state kept on the GPU (~2 × layers × kv_heads × head_dim × 2 bytes per token). The memory that decides how many sessions fit per GPU.</td></tr>
+    <tr><td><strong>Prefix caching</strong></td><td>Routing requests that share a prompt prefix (consistent-hashed) to the worker already holding that prefix's KV cache. The system prompt is the ultimate hot key.</td></tr>
   </table>
 
   <footer class="lesson-footer">
