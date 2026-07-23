@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lesson p0-07 · Deep Learning Foundations: Backprop From Scratch</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<div class="lesson">
+  <header class="lesson-header">
+    <p class="kicker">Lesson p0-07 · Phase 0 Track B — ML/DL/NLP · <a href="p0-07-dl-foundations.ka.html">ქართული ვერსია</a></p>
+    <h1>Deep Learning Foundations: Backprop From Scratch</h1>
+    <p class="dek">One algorithm — reverse-mode chain rule on a graph — powers every model you will ever serve. Build it in 60 lines, then never fear it again.</p>
+  </header>
+
+  <div class="mission-tie">
+    <strong>Mission tie.</strong> Every Anthropic infrastructure conversation assumes you know what a training step <em>is</em>: forward pass, loss, backward pass, optimizer update. Why is inference cheaper than training? Why does Adam double optimizer memory? Why do activations dominate training GPU memory but vanish at serving time? All four answers live in this lesson. The source is the best free DL course in existence: <a href="https://karpathy.ai/zero-to-hero.html">Karpathy's Neural Networks: Zero to Hero</a>, videos 1–4.
+  </div>
+
+  <div class="callout"><span class="label">Lab first (ADHD rule)</span>
+    Open <code>labs/lab-p0-07-micrograd-backprop/</code> and run <code>python3 micrograd_lab.py</code> <em>before</em> reading on. It builds the exact engine this lesson describes and prints the numbers this lesson quotes. Read with the output next to you.
+  </div>
+
+  <h2>1 · A neural net is an expression graph</h2>
+  <p>Forget the brain metaphor. A neural network is a big nested arithmetic expression: multiplies, adds, and a few nonlinearities (<code>tanh</code>, ReLU), evaluated left to right. Writing it down as a <strong>directed acyclic graph</strong> — each node an operation, each edge a value flowing forward — is the whole trick. <a href="https://github.com/karpathy/micrograd">micrograd</a> is famous because it shows the complete machinery in ~100 lines of Python: a <code>Value</code> that remembers its inputs and how it was made. (<a href="https://www.youtube.com/watch?v=VMj-3S1tku0">Karpathy, "spelled-out intro to backpropagation"</a>)</p>
+  <p>Once the graph exists, the <strong>forward pass</strong> is just evaluating it. Everything else in deep learning — and most of what a GPU does all day — is this graph, run at scale.</p>
+
+  <h2>2 · Backprop = chain rule + bookkeeping</h2>
+  <p>Training needs <code>∂loss/∂w</code> for every weight <code>w</code>. Backprop computes all of them in <em>one</em> reverse sweep. The rule at each node: <strong>my input's gradient += local derivative × my output's gradient</strong>. That is the chain rule, applied node by node, in reverse topological order — every node waits until its downstream gradient is fully accumulated before passing it back. (<a href="https://cs231n.github.io/optimization-2/">CS231n backprop notes</a>)</p>
+  <p>Two details people get wrong in interviews: gradients <em>accumulate</em> with <code>+=</code> (a value used twice gets two contributions — hence PyTorch's <code>zero_grad()</code>), and reverse mode costs roughly <em>one</em> extra forward-pass-worth of work no matter how many millions of parameters you differentiate. That asymmetry is why training a trillion-parameter model is possible at all.</p>
+
+  <h2>3 · A worked backward pass</h2>
+  <p>Trace <code>L = (a·b + c)²</code> — the shape of every loss you'll meet — at <code>a=2, b=−3, c=10</code>:</p>
+  <pre><code>forward:  e = a·b = −6      d = e + c = 4       L = d² = 16
+backward: ∂L/∂d = 2d = 8
+          ∂L/∂e = ∂L/∂d · 1 = 8        (add passes gradient through)
+          ∂L/∂c = ∂L/∂d · 1 = 8
+          ∂L/∂a = ∂L/∂e · b = 8·(−3) = −24   (mul swaps in the other input)
+          ∂L/∂b = ∂L/∂e · a = 8·2    =  16</code></pre>
+  <p>Reading: increase <code>a</code> by a tiny ε and the loss falls by 24ε. Gradient descent just nudges every parameter a small step <em>against</em> its gradient. Lab experiment 1 checks exactly this kind of arithmetic against finite differences and matches to ~9 digits.</p>
+
+  <h2>4 · From SGD to Adam</h2>
+  <p>The optimizer decides how the step is taken. The whole zoo is variations on one line, <code>w ← w − lr·grad</code>: (<a href="https://arxiv.org/abs/1412.6980">Adam paper, Kingma &amp; Ba 2014</a>)</p>
+  <table>
+    <tr><th>Optimizer</th><th>Update idea</th><th>What it fixes</th><th class="num">Extra memory</th></tr>
+    <tr><td>SGD</td><td>step = lr × grad</td><td>— (the baseline)</td><td class="num">0×</td></tr>
+    <tr><td>+ Momentum</td><td>velocity smooths successive grads</td><td>zig-zag in ravines, plateaus</td><td class="num">1× params</td></tr>
+    <tr><td>RMSProp</td><td>divide by running RMS of grad</td><td>per-parameter scale differences</td><td class="num">1× params</td></tr>
+    <tr><td>Adam</td><td>momentum <em>and</em> RMS scaling</td><td>both; works with little tuning</td><td class="num">2× params</td></tr>
+  </table>
+  <p>Lab experiment 3, same initial weights, same target loss: <strong>SGD 2188 steps, momentum 551, Adam 51</strong>. That "2× params extra memory" line is systems-relevant: Adam states are why training a model takes ~4× the memory of its weights before activations even enter — and why serving the same model is so much lighter.</p>
+
+  <div class="callout"><span class="label">Vocabulary</span>
+    <strong>Step</strong>: one forward+backward+update. <strong>Learning rate (lr)</strong>: the step-size multiplier, the most-tuned number in DL. <strong>Plateau</strong>: a flat loss region where gradients are tiny — lab experiment 2 sits on one near loss = 1.0 for ~1,800 steps before escaping.
+  </div>
+
+  <h2>5 · Initialization &amp; normalization: keeping signals sized</h2>
+  <p>Backprop multiplies one factor per layer. If each layer scales signals by <em>g</em>, depth <em>D</em> gives <em>g<sup>D</sup></em>: for <em>g</em>&lt;1 gradients <strong>vanish</strong>, for <em>g</em>&gt;1 they <strong>explode</strong>. Lab experiment 4 shows it across 8 layers: init scale 0.1 → input gradients ~10<sup>−13</sup>; scale 2.0 → ~10<sup>8</sup>; scale ≈ √(3/width) → ~1. Choosing that stable scale is <strong>Xavier/He initialization</strong>. (<a href="https://arxiv.org/abs/1502.01852">He et al. 2015</a>)</p>
+  <p>Initialization only fixes step zero; training drifts. <strong>Normalization layers</strong> re-standardize activations continuously: BatchNorm across the batch (<a href="https://arxiv.org/abs/1502.03167">Ioffe &amp; Szegedy 2015</a>), LayerNorm across features (<a href="https://arxiv.org/abs/1607.06450">Ba et al. 2016</a>) — the latter is what every transformer block uses, twice. Karpathy's <a href="https://karpathy.ai/zero-to-hero.html">video 4</a> devotes an hour to watching activation statistics with and without it.</p>
+
+  <h2>6 · Why depth works</h2>
+  <p>A wide-enough single hidden layer can approximate any function — in theory. In practice depth wins because <strong>layers compose</strong>: early layers learn simple features, later layers combine them into increasingly abstract ones (edges → textures → parts → objects; characters → words → syntax → meaning). Composition reuses features exponentially more efficiently than a flat lookup. (<a href="https://www.3blue1brown.com/topics/neural-networks">3Blue1Brown, neural networks series</a>)</p>
+  <p>Depth's tax is the <em>g<sup>D</sup></em> problem from section 5. <strong>Residual connections</strong> (<a href="https://arxiv.org/abs/1512.03385">ResNet, He et al. 2015</a>) pay it down: <code>output = layer(x) + x</code> gives gradients an identity highway, which is why 100+-layer networks train at all — and why every transformer block is wrapped in two residual connections.</p>
+
+  <h2>7 · Sixty years in two paragraphs</h2>
+  <p><strong>CNNs</strong>: convolutions share one small weight kernel across all image positions — translation invariance baked into the architecture. LeNet read checks in the 1990s; AlexNet's 2012 ImageNet win (GPUs + ReLU + dropout) ignited the modern era; ResNet (2015) made depth itself trainable. CNNs taught the field that <em>architecture encodes assumptions about data</em>.</p>
+  <p><strong>RNNs</strong>: process sequences one token at a time, carrying a hidden state — a loop, which unrolled is just a very deep network, hence chronic vanishing gradients. LSTMs patched that with gated memory cells, powering translation and speech in the mid-2010s. But the loop forces sequential computation — no parallelism across time steps — and that bottleneck is precisely what attention (lessons p0-08/p0-09) removed.</p>
+
+  <h2>8 · Sharp edges (how training fails)</h2>
+  <p>Failure modes you should recognize on sight — most appear in the lab:</p>
+  <ul>
+    <li><strong>LR too high</strong>: loss oscillates or diverges to NaN (README E2 makes you find the cliff). Too low: converges geologically.</li>
+    <li><strong>Saturated units</strong>: tanh/sigmoid at ±1 pass ~zero gradient. Experiment 2's 1,800-step plateau is this, live.</li>
+    <li><strong>Dead ReLUs</strong>: a big update pushes a unit's input permanently negative → zero gradient forever → the unit never recovers.</li>
+    <li><strong>Forgotten <code>zero_grad()</code></strong>: gradients accumulate across steps because of the <code>+=</code> in section 2 — README E5 has you inflict this bug deliberately.</li>
+    <li><strong>Bad init at depth</strong>: <em>g<sup>D</sup></em> vanish/explode from section 5; the silent version is a net that "trains" but early layers never move.</li>
+    <li><strong>Loss down, task not solved</strong>: optimizing a proxy. Only held-out evaluation (lesson p0-06) catches it.</li>
+  </ul>
+
+  <h2>9 · Lab — build and break the engine</h2>
+  <div class="callout"><span class="label">Hands-on (do this before the quiz)</span>
+    In <code>labs/lab-p0-07-micrograd-backprop/</code>: <code>python3 micrograd_lab.py</code> runs four experiments — the finite-difference gradient check, XOR training with its plateau, the SGD/momentum/Adam race from identical weights, and vanish/explode vs init scale. Then do README exercises E1–E4 (E5 stretch: the zero-grad bug): <em>predict, edit CONFIG, re-run, compare.</em> Wrong predictions are the deliverable.
+  </div>
+
+  <h2>10 · Project step</h2>
+  <p>Connect this to the spine project's capacity math. A transformer forward pass costs ≈ <code>2·N·D</code> FLOPs (N params, D tokens); backprop adds ≈ 2× the forward cost, so a <strong>training</strong> step is ≈ <code>6·N·D</code> — three times the FLOPs of inference on the same tokens, <em>plus</em> optimizer states (2× params for Adam) <em>plus</em> stored activations for the backward pass. (<a href="https://stanford-cs336.github.io/">Stanford CS336</a>) In a scratch note, compute for a 7B model in bf16: weights-only serving memory (~14 GB) vs training memory with Adam in fp32 states (weights + grads + 2 Adam moments ≈ 4–8× more). This single contrast — inference keeps only weights + KV-cache, training keeps everything — will anchor the GPU-sizing lessons in Phase 4.</p>
+
+  <h2>Interview talking points</h2>
+  <ul>
+    <li>"Backprop is reverse-mode automatic differentiation: chain rule applied over the computation graph in reverse topological order, gradients accumulating with +=."</li>
+    <li>"One backward pass costs about two forward passes — regardless of parameter count. That's why we can train billion-parameter models but also why training is ~3× inference FLOPs."</li>
+    <li>"Adam keeps two extra floats per parameter — first and second gradient moments — so optimizer state alone doubles model memory; that's a big reason training needs far more GPU memory than serving."</li>
+    <li>"Gradients through D layers scale like gain-to-the-D: bad init vanishes or explodes them. Xavier/He init, normalization layers, and residual connections are the three standard fixes."</li>
+    <li>"Depth wins because layers compose features hierarchically — not because deep nets have more parameters than wide ones."</li>
+    <li>"Vanishing gradients killed vanilla RNNs at long range; LSTMs gated around it, and attention removed the sequential bottleneck entirely."</li>
+  </ul>
+
+  <h2>Check yourself</h2>
+  <div class="quiz" id="quiz"></div>
+
+  <h2>Primary source</h2>
+  <p>Watch <strong>Karpathy, <a href="https://karpathy.ai/zero-to-hero.html">Neural Networks: Zero to Hero</a>, videos 1–4</strong> — build micrograd yourself alongside video 1 (<a href="https://www.youtube.com/watch?v=VMj-3S1tku0">direct link</a>). Free alternative with more visual intuition: <a href="https://www.3blue1brown.com/topics/neural-networks">3Blue1Brown's neural networks series</a>, plus <a href="https://mml-book.github.io/">MML book</a> ch. 5 for the calculus underneath.</p>
+
+  <footer class="lesson-footer">
+    <p><strong>Stuck or curious?</strong> Ask your teacher (the agent) anything — "why is the backward pass ~2× the forward, not N×?" is an excellent follow-up question.</p>
+    <nav class="lesson-nav">
+      <span>◀ Prev: <a href="p0-06-ml-foundations.html">p0-06 · ML Foundations</a></span>
+      <span>Next: <a href="p0-08-nlp-evolution.html">p0-08 · NLP Evolution</a> ▶</span>
+    </nav>
+  </footer>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+renderQuiz(document.getElementById('quiz'), {
+  title: 'Check yourself',
+  questions: [
+    {
+      q: 'In backprop, what does the gradient stored on each parameter represent?',
+      options: [
+        'How much the parameter changed during the previous update step',
+        'How much the loss changes per unit change in it',
+        'How much the input data shifted the network output value',
+      ],
+      answer: 1,
+      explain: 'grad = ∂loss/∂parameter: the local sensitivity of the loss to that parameter. Gradient descent steps each parameter against it.',
+    },
+    {
+      q: 'Why must backprop visit nodes in reverse topological order?',
+      options: [
+        'Because gradients must be normalized before flowing into earlier nodes',
+        'Because forward activations get deleted right after each node fires',
+        'Because each node needs its output gradient fully accumulated first',
+      ],
+      answer: 2,
+      explain: 'A node can only apply the chain rule once every downstream consumer has contributed its share (via +=) to the node\'s output gradient.',
+    },
+    {
+      q: 'What does Adam add on top of plain SGD?',
+      options: [
+        'Per-parameter step sizes built from gradient first and second moments',
+        'A single global step size that is tuned before training',
+        'Random restarts of network weights whenever the loss stops improving',
+      ],
+      answer: 0,
+      explain: 'Adam keeps a running mean (momentum) and running variance of each gradient, adapting each parameter\'s effective step size — at the cost of 2× parameter memory.',
+    },
+    {
+      q: 'Why do gradients vanish or explode in deep unnormalized networks?',
+      options: [
+        'Because deeper networks always contain many more trainable parameters overall',
+        'Because backprop multiplies many layer Jacobians whose scales compound multiplicatively',
+        'Because the loss function becomes discontinuous once depth grows large',
+      ],
+      answer: 1,
+      explain: 'Each layer contributes a multiplicative factor; gain g over depth D gives g^D. Xavier/He init, normalization, and residual connections keep g near 1.',
+    },
+    {
+      q: 'What is the main reason depth helps neural networks?',
+      options: [
+        'Deep networks can memorize every training sample they ever see',
+        'Deep networks always train faster than any equivalent shallow network',
+        'Layers compose simple features into hierarchies of increasingly abstract ones',
+      ],
+      answer: 2,
+      explain: 'Depth buys compositionality — edges to textures to objects, characters to syntax to meaning — which reuses features far more efficiently than one wide layer. Deep nets actually train slower without init/normalization care.',
+    },
+  ],
+});
+</script>
+</body>
+</html>

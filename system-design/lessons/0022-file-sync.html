@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lesson 22 · File Sync — Dropbox</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<div class="lesson">
+  <header class="lesson-header">
+    <p class="kicker">Lesson 0022 · Phase 3 — Classic Design Reps · <a href="0022-file-sync.ka.html">ქართული ვერსია</a></p>
+    <h1>File Sync — Dropbox</h1>
+    <p class="dek">Chunking, content addressing, delta sync, and honest conflict resolution — the rep where the client is as much of the system as the servers are.</p>
+  </header>
+
+  <div class="mission-tie">
+    <strong>Mission tie.</strong> Content-addressing and dedup thinking transfers directly to model-weight distribution across GPU fleets and to KV-cache prefix reuse — same trick, different bytes.
+  </div>
+
+  <div class="callout"><span class="label">REP PROTOCOL</span>
+    Do a <strong>40-minute solo timed rep FIRST</strong> — out loud, whiteboard or paper, prompt: <em>"Design a file-sync service like Dropbox."</em> Only then read this lesson, compare against your design, and log the deltas as a learning record. Reading first turns a rep into a recital.
+  </div>
+
+  <h2>1 · The prompt, and what it actually tests</h2>
+  <p><em>"Design Dropbox: users install a client, drop files in a folder, and the files appear on all their devices — even after offline edits."</em> Every previous rep let you treat the client as a dumb browser. This is the first design where <strong>the client is part of the system</strong>: it runs a file watcher, a chunker, a local index database, and an offline operation queue, and the interesting protocol lives <em>between</em> client and server. Interviewers use this prompt to test three things: whether you split metadata from bulk data (the design's load-bearing decision), whether you know why files are chunked and hashed rather than uploaded whole, and whether you handle two offline devices editing the same file without hand-waving. Candidates who draw only server boxes have already missed half the problem.</p>
+
+  <h2>2 · Clarify (5–8 min)</h2>
+  <table>
+    <tr><th>Functional requirement</th><th>Note</th></tr>
+    <tr><td>Sync a folder across all of a user's devices</td><td>Desktop clients + mobile + web</td></tr>
+    <tr><td>Offline edits reconcile on reconnect</td><td>No locks; conflicts must be handled</td></tr>
+    <tr><td>File history &amp; restore</td><td>Old versions recoverable — implies immutable storage</td></tr>
+    <tr><td>Sharing folders between users</td><td>Permissions; changes fan out to all members</td></tr>
+    <tr><td>Large files</td><td>Up to tens of GB — whole-file upload is off the table</td></tr>
+  </table>
+  <table>
+    <tr><th>Non-functional</th><th>Target</th></tr>
+    <tr><td>Bandwidth efficiency</td><td>A 1-byte edit must not re-upload 1 GB</td></tr>
+    <tr><td>Correctness</td><td>Never a corrupted or half-written file version visible</td></tr>
+    <tr><td>Convergence</td><td>All devices reach the same state, typically in seconds</td></tr>
+  </table>
+  <p>Out of scope: document collaborative editing (that's Google Docs — a different design), payment, client UI. Say so at minute three.</p>
+
+  <h2>3 · Estimate (~5 min) — and spend every number</h2>
+  <pre><code>Users:    500M registered, ~100M daily-active syncers
+Storage:  500M × 10 GB avg = 5 EB raw
+Dedup:    assume 2:1 (installers, media, shared files) → ~2.5 EB stored
+Upload:   100M DAU × ~10 MB changed blocks/day = 1 PB/day
+          ÷ ~100k s/day ≈ 10 GB/s ≈ 80 Gbit/s avg, ×3 peak ≈ 240 Gbit/s
+Metadata: 10 GB ÷ 4 MB blocks = 2,500 blocks/user
+          500M × 2,500 = 1.25×10¹² block rows × ~100 B ≈ 125 TB</code></pre>
+  <p>Now <strong>spend</strong> them: 2.5 EB of blocks can never live in a database → S3-style blob store. 125 TB of metadata is ~0.005% of the data — small enough for a sharded relational DB with real transactions. 240 Gbit/s peak means clients must upload blocks <strong>directly to block storage</strong>, never through the metadata service. And the 2:1 dedup assumption is itself an architecture argument: dedup only falls out for free if blocks are named by their content — section 5.</p>
+
+  <h2>4 · High-level design: split the brain</h2>
+  <p>The load-bearing decision is splitting the system along the metadata/data seam:</p>
+  <table>
+    <tr><th>Component</th><th>Holds</th><th>Properties</th></tr>
+    <tr><td><strong>Metadata service</strong></td><td>Namespaces, file→blocklist records, version journal, ACLs</td><td>Small (TB), consistent, transactional — sharded SQL</td></tr>
+    <tr><td><strong>Block storage</strong></td><td>The chunks themselves, keyed by content hash</td><td>Huge (EB), immutable, append-only — S3-style</td></tr>
+    <tr><td><strong>Notification service</strong></td><td>Millions of idle long-poll connections</td><td>Stateless "something changed" pings — no payloads</td></tr>
+  </table>
+  <p>And the client mirrors the split with three components: a <strong>watcher</strong> (OS file-system events → detect changes), a <strong>chunker</strong> (split files into blocks, hash each), and an <strong>indexer</strong> (local SQLite mapping files → block hashes → sync state, so the client knows what the server has without asking). Draw both halves; narrate one file's journey through them before going deep.</p>
+
+  <h2>5 · Deep dive: chunking and content addressing</h2>
+  <p>Split every file into blocks — Dropbox uses <strong>fixed 4 MB</strong> blocks — and name each block by its <strong>SHA-256 hash</strong>. That one choice buys three properties at once: <strong>dedup for free</strong> (same bytes → same hash → server says "already have it", upload skipped — across files <em>and across users</em>), <strong>immutability</strong> (a block never changes; edits create new blocks, which is exactly what file history needs), and <strong>integrity</strong> (re-hash after download; mismatch means corruption).</p>
+  <p>Fixed chunking has one famous weakness: <strong>the insert-shift problem</strong>. Insert one byte at the front of a 1 GB file and every 4 MB boundary shifts by one — every downstream block re-hashes as "new" and the whole file re-uploads. The fix is <strong>content-defined chunking (CDC)</strong>: run a rolling hash (Rabin fingerprint) over a small sliding window and cut a boundary wherever the hash matches a pattern (e.g. lowest 13 bits all ones → ~8 KB average). Boundaries become functions of local <em>content</em>, not position, so they re-align right after an edit. Trade-off: CDC costs CPU per byte and variable block sizes; fixed is simple and fine for append-heavy or whole-file-rewrite workloads — which is why Dropbox shipped fixed and rsync/restic/borg ship CDC. Your lab makes both behave in front of you.</p>
+
+  <h2>6 · Deep dive: delta sync</h2>
+  <p>A file, to the server, is just an <strong>ordered list of block hashes</strong> — the blocklist. Edit a file and the client re-chunks it, diffs the new blocklist against the old, and uploads <em>only the blocks whose hashes the server lacks</em>. A 4 MB edit in a 10 GB file costs one or two blocks, not 10 GB. Each committed change appends a <strong>file-version record</strong> to a per-namespace <strong>journal</strong>: <code>(namespace_id, journal_id, path, blocklist, size, mtime)</code>. The journal is append-only — which gives you file history and restore for free (old versions are just old journal rows whose blocks still exist), and gives clients a cursor to sync from (section 7).</p>
+  <table>
+    <tr><th></th><th>rsync</th><th>Dropbox-style sync</th></tr>
+    <tr><td>Server state</td><td>None — recomputes checksums per transfer</td><td>Stores all block hashes permanently</td></tr>
+    <tr><td>Comparison cost</td><td>Paid on every sync, per file pair</td><td>Paid once at write; lookups after</td></tr>
+    <tr><td>N devices</td><td>N pairwise transfers</td><td>Upload once, all devices pull</td></tr>
+    <tr><td>Cross-user dedup</td><td>None</td><td>Free via content addressing</td></tr>
+  </table>
+
+  <h2>7 · Deep dive: the sync protocol</h2>
+  <p>Downstream: every client holds a <strong>long-poll</strong> connection to the notification service. On any change in a namespace the client subscribes to, the poll returns — carrying <em>no data</em>, just "wake up". The client then calls the metadata service: <code>list_changes(namespace, cursor)</code> — give me all journal entries after my cursor — then fetches whichever blocks it's missing from block storage, assembles files, advances the cursor. Cursor-based pull means a client offline for a week catches up with the same code path as one that blinked for a second.</p>
+  <p>Upstream, the ordering is the crash-safety argument interviewers listen for: <strong>upload blocks first, commit metadata second.</strong> The client pushes new blocks to block storage, and only when all of them are durable does it call <code>commit(path, new_blocklist, parent_version)</code> on the metadata service. Why that order? A crash mid-upload leaves <em>orphan blocks</em> — invisible garbage, cleaned by a GC job later. The reverse order would leave a committed version pointing at blocks that don't exist: a visibly corrupted file on every other device. Metadata commit is the atomic switch; blocks are just inert bytes until a journal row points at them.</p>
+
+  <h2>8 · Deep dive: conflict resolution</h2>
+  <p>Two devices, both offline, edit the same file. Locks are impossible — you cannot lock a laptop on a plane. So the commit carries the version the edit was based on: <code>commit(..., parent_version)</code>. First committer wins normally. The second commit's <code>parent_version</code> is now stale — the server detects the conflict. Two policies:</p>
+  <table>
+    <tr><th>Policy</th><th>Behavior</th><th>Cost</th></tr>
+    <tr><td>Last-writer-wins</td><td>Newest commit silently replaces</td><td>Silently destroys a user's work</td></tr>
+    <tr><td>Conflicted copy</td><td>Keep both; rename the loser <em>"report (conflicted copy — Ann's laptop, 2026-07-23)"</em></td><td>User must merge by hand</td></tr>
+  </table>
+  <p>Dropbox makes the conflicted copy — and that is the <em>honest</em> choice: a sync engine cannot merge arbitrary binary formats, so pretending to (LWW) means losing data quietly, while surfacing both versions loses nothing and tells the user the truth. Mention <strong>version vectors</strong> (per-device counters) as the general mechanism for distinguishing "concurrent edits" from "stale copy" — one sentence is enough. Offline edits queue in the client's local journal and replay through the exact same commit path on reconnect; conflicts fall out of <code>parent_version</code> checks with no special offline logic.</p>
+
+  <h2>9 · Failure modes and monitoring</h2>
+  <table>
+    <tr><th>Failure</th><th>Handling</th></tr>
+    <tr><td>Crash mid-upload (half-uploaded file)</td><td>Blocks-then-commit ordering → only orphan blocks; GC sweeps unreferenced blocks; no version ever points at missing data</td></tr>
+    <tr><td>Hash collision (two blocks, one SHA-256)</td><td>Address honestly: probability ~2⁻¹²⁸ — orders of magnitude below disk/RAM corruption rates; adding byte-compare "just in case" adds cost, not safety</td></tr>
+    <tr><td>Notification storm (shared folder, 10k members, one change)</td><td>Fan-out amplification: 1 commit → 10k wakeups → 10k journal pulls. Coalesce notifications per namespace, add jitter to client pulls, and let pings carry no payload so storms are cheap</td></tr>
+    <tr><td>Sync loops (client A and B endlessly re-writing — e.g. antivirus touching mtime)</td><td>Compare content hashes, not timestamps, before committing; detect commit cycles per file and back off with alerting</td></tr>
+  </table>
+  <p>Monitoring: the metric that pages a human is <strong>p99 sync convergence time</strong> (change on device A → visible on device B), plus journal-pull lag, block-store error rate, and conflicted-copy rate (a spike means a client bug, not user behavior).</p>
+
+  <h2>10 · Variants and twists</h2>
+  <ul>
+    <li><strong>Sharing &amp; permissions.</strong> A shared folder is a namespace <em>mounted</em> into multiple users' trees; ACL checks happen on journal pull and commit. Re-sharing = re-mounting; unsharing = unmounting plus cursor invalidation.</li>
+    <li><strong>Bandwidth throttling.</strong> The client rate-limits itself and backs off on 429s — sync is a background citizen; never saturate the user's uplink.</li>
+    <li><strong>LAN sync.</strong> Devices on one network discover each other (UDP broadcast) and fetch blocks peer-to-peer — the content hash makes any source trustworthy: verify by re-hashing. This is the twist interviewers love, and it only works because blocks are content-addressed.</li>
+  </ul>
+  <p><strong>AI corner.</strong> The same content-addressed dedup runs modern ML infra: distributing a 100 GB model to 1,000 GPU nodes is a Dropbox problem (chunk the weights, hash the chunks, nodes fetch missing blocks from peers — fine-tunes dedup against the base model's unchanged layers), and KV-cache prefix reuse is hash-the-prefix-tokens, reuse-the-cached-blocks — content addressing over attention states instead of file bytes.</p>
+
+  <h2>11 · Interview talking points</h2>
+  <ul>
+    <li><em>Opening scope:</em> "The client is half this system — I'll design the watcher/chunker/indexer as first-class components, not just the servers."</li>
+    <li><em>The split:</em> "Metadata is 125 TB and needs transactions; blocks are 2.5 EB and immutable — those numbers are why they're different systems."</li>
+    <li><em>Chunking:</em> "Fixed 4 MB is what Dropbox ships; content-defined chunking fixes the insert-shift problem at CPU cost — I'd start fixed and justify CDC only for edit-heavy workloads."</li>
+    <li><em>Unprompted crash safety:</em> "Before you ask: upload blocks first, commit metadata second — a crash leaves invisible garbage instead of a visible corrupt version."</li>
+    <li><em>Conflicts:</em> "No locks — offline devices exist. Conflicted copy over last-writer-wins, because silently destroying a user's edit is worse than asking them to merge."</li>
+    <li><em>Closing:</em> "I'd page on p99 convergence time and conflicted-copy rate; with more time: LAN sync and shared-folder notification coalescing."</li>
+  </ul>
+
+  <h2>12 · Lab &amp; project step</h2>
+  <div class="callout"><span class="label">Hands-on (do this before the quiz)</span>
+    In <code>labs/lab-0022-chunk-and-sync/</code>, <code>python3 sync_lab.py</code> chunks a seeded
+    synthetic file with fixed blocks AND content-defined chunking, then inserts <strong>one byte</strong>
+    near the start and prints how much each scheme re-uploads — the insert-shift
+    catastrophe as a table, plus cross-file dedup percentages. Do E1's written
+    prediction <em>before</em> the first run.
+  </div>
+  <p><strong>Project step.</strong> After the lab, redo your 40-minute rep's weakest section from memory — most first reps miss the blocks-then-commit ordering or hand-wave conflicts. Then write the two E1 numbers (fixed vs CDC re-upload % after a 1-byte insert) into your rep notes; that pair is the entire chunking argument, and quoting it in an interview is a one-line senior signal. Log prediction-vs-observed deltas as a learning record.</p>
+
+  <h2>Check yourself</h2>
+  <div class="quiz" id="quiz"></div>
+
+  <h2>Primary source</h2>
+  <p>Watch <strong>Kowshik Prakasam's <a href="https://www.youtube.com/watch?v=PE4gwstWhmc">"How We've Scaled Dropbox"</a></strong> — the engineers themselves on the metadata/block split and what broke at scale. Companion: Dropbox's <a href="https://dropbox.tech/infrastructure/streaming-file-synchronization">streaming file synchronization</a> post, which shows the block/journal pipeline evolving toward streaming — read it after the lesson and notice how much of section 7 survives contact with production.</p>
+
+  <footer class="lesson-footer">
+    <p><strong>Stuck or curious?</strong> Ask your teacher (the agent) anything — "how would this design change if files were append-only logs instead of documents?" is an excellent follow-up question.</p>
+    <nav class="lesson-nav">
+      <span>◀ <a href="0021-chat-system.html">0021 · Chat System</a></span>
+      <span><a href="0023-notifications-scheduler.html">0023 · Notifications &amp; Scheduler</a> ▶</span>
+    </nav>
+  </footer>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+renderQuiz(document.getElementById('quiz'), {
+  title: 'Check yourself',
+  questions: [
+    {
+      q: 'Why does Dropbox derive each block\'s ID from a hash of its content?',
+      options: [
+        'Sequential numeric IDs would exhaust the available 64-bit ID space',
+        'Hashing encrypts every block so the server cannot read files',
+        'Identical blocks dedupe automatically because equal content yields equal IDs',
+      ],
+      answer: 2,
+      explain: 'Content addressing makes dedup free: if two blocks hash the same, the server already has the bytes and the upload is skipped — across files and across users. Hashing is not encryption, and ID-space exhaustion is not the concern.',
+    },
+    {
+      q: 'One byte is inserted at the start of a 1 GB file. What happens under fixed 4 MB chunking?',
+      options: [
+        'Every block boundary shifts, so nearly all blocks change',
+        'Only the single first block changes and gets re-uploaded',
+        'The metadata journal absorbs the change without any uploads',
+      ],
+      answer: 0,
+      explain: 'Fixed boundaries are absolute positions. One inserted byte shifts every downstream boundary by one, so every block re-hashes as new — the insert-shift problem, and the argument for content-defined chunking. Your lab prints this as ~100% re-upload.',
+    },
+    {
+      q: 'Why does the client upload blocks first and commit metadata second?',
+      options: [
+        'Metadata commits are slower, so uploading first saves total time',
+        'A crash mid-upload then leaves no visible corrupted file version',
+        'Block storage requires metadata locks before accepting any new writes',
+      ],
+      answer: 1,
+      explain: 'The metadata commit is the atomic switch. Crash before it and you have only orphan blocks — invisible garbage for GC. The reverse order could publish a version pointing at blocks that don\'t exist: visible corruption on every device.',
+    },
+    {
+      q: 'Two offline devices edited the same file. What does Dropbox do when both reconnect?',
+      options: [
+        'Applies last-writer-wins, silently discarding the older device\'s edited version',
+        'Merges both edits automatically using operational transforms on content',
+        'Keeps both versions, renaming one as a conflicted copy',
+      ],
+      answer: 2,
+      explain: 'A sync engine cannot merge arbitrary binary formats, so the honest choice is to surface both versions and let the user decide. Last-writer-wins silently destroys work; automatic merging is a collaborative-editor feature, not a sync-engine one.',
+    },
+    {
+      q: 'How does a client learn that another device changed a shared file?',
+      options: [
+        'The client re-downloads the entire namespace listing every few seconds',
+        'Long-poll fires, then it pulls journal entries after its cursor',
+        'The server pushes every changed block directly to the client',
+      ],
+      answer: 1,
+      explain: 'The notification ping carries no data — just "wake up". The client then pulls journal entries past its cursor and fetches only missing blocks. Payload-free pings keep notification storms cheap; cursor pull makes offline catch-up the same code path.',
+    },
+    {
+      q: 'A candidate worries that two different blocks could share one SHA-256 hash. Best response?',
+      options: [
+        'Collision probability is roughly 2^-128, far below hardware failure rates',
+        'Add a second hash function so collisions become impossible forever',
+        'Compare full block contents byte-by-byte on every single dedup hit',
+      ],
+      answer: 0,
+      explain: 'Address it honestly with the number: ~2⁻¹²⁸ is negligible next to disk and RAM corruption rates you already tolerate. Byte-comparing every dedup hit or stacking hashes adds real cost against a risk that is already below the noise floor.',
+    },
+  ],
+});
+</script>
+</body>
+</html>

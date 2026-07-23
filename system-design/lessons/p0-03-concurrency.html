@@ -1,0 +1,187 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lesson p0-03 · Concurrency</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<div class="lesson">
+  <header class="lesson-header">
+    <p class="kicker">Lesson p0-03 · Phase 0 Track A — Programming/CS · <a href="p0-03-concurrency.ka.html">ქართული ვერსია</a></p>
+    <h1>Concurrency: Races, Locks, Event Loops, and the GIL</h1>
+    <p class="dek">Why "it worked on my laptop" is the most expensive sentence in multithreaded code.</p>
+  </header>
+
+  <div class="mission-tie">
+    <strong>Mission tie.</strong> Anthropic's most-reported design prompt — an inference batching service where <em>synchronous callers</em> block while a scheduler groups their requests and routes responses back to the right waiter — is a concurrency problem before it is an ML problem: shared queue, worker pool, locking discipline, and an event loop holding thousands of open connections. Every mechanism in this lesson appears in that design. (<a href="https://www.tryexponent.com/blog/anthropic-system-design-interview">Exponent's Anthropic guide</a>, <a href="https://blog.vllm.ai/2025/09/05/anatomy-of-vllm.html">Inside vLLM</a>)
+  </div>
+
+  <div class="callout"><span class="label">Lab first (ADHD rule)</span>
+    Before reading further, run <code>python3 concurrency_lab.py</code> in <code>labs/lab-p0-03-races-and-gil/</code>. Watch a counter lose 70% of its updates, a deadlock fire, and threads fail to speed up CPU work. Then read on — every section below explains something you just saw.
+  </div>
+
+  <h2>1 · Concurrency is not parallelism</h2>
+  <p><strong>Concurrency</strong> is structure: many tasks <em>in progress</em> at once, interleaved on however many CPUs you have — possibly one. <strong>Parallelism</strong> is execution: many tasks literally running <em>at the same instant</em> on multiple cores. A single-threaded web server handling 10,000 open connections is highly concurrent and not parallel at all. The distinction decides which tool you reach for. (<a href="https://pages.cs.wisc.edu/~remzi/OSTEP/threads-intro.pdf">OSTEP: Concurrency and Threads</a>)</p>
+  <p>Threads (lesson <a href="p0-02-os-essentials.html">p0-02</a>) share one address space — same heap, separate stacks. That sharing is the entire value proposition <em>and</em> the entire danger: any thread can write memory any other thread is reading.</p>
+
+  <h2>2 · The lost update: anatomy of a race</h2>
+  <p><code>counter += 1</code> is not one operation. It is <em>read → modify → write</em>, and the scheduler may preempt a thread between any two steps:</p>
+  <pre><code>Thread A: read counter (=100)
+Thread B: read counter (=100)      &lt;- preempted A; reads the SAME value
+Thread B: write 101
+Thread A: write 101                &lt;- B's update is silently destroyed
+
+Two increments happened. The counter moved by one. No error was raised.</code></pre>
+  <p>This is a <strong>race condition</strong>: the result depends on the timing of interleavings you do not control. The nasty property is silence — no exception, no crash, just wrong data. In the lab, 4 threads × 50,000 increments lose 50–75% of updates, a <em>different amount every run</em>. (<a href="https://pages.cs.wisc.edu/~remzi/OSTEP/threads-locks.pdf">OSTEP: Locks</a>)</p>
+  <div class="callout"><span class="label">Vocabulary</span>
+    The code region that must not interleave is the <strong>critical section</strong>. <strong>Atomicity</strong> means the section executes as one indivisible unit — all or nothing, with no observable middle state.
+  </div>
+
+  <h2>3 · Locks: correctness at a price</h2>
+  <p>A <strong>mutex</strong> (lock) makes a critical section atomic: acquire before, release after; only one holder at a time. In the lab, the locked counter is exact — and roughly 4× slower, because threads now queue for the section. That queue has a name you already know: <strong>contention</strong>, and it shows up in p99 first.</p>
+  <p>The senior-level knob is <strong>granularity</strong>. One coarse lock over everything is easy to reason about but serializes the world (this is literally what Python's GIL is — section 7). Fine-grained locks scale better but multiply the ways to deadlock. Real systems also use <strong>reader–writer locks</strong> (many concurrent readers, one writer) and <strong>atomic instructions</strong> (compare-and-swap) for single-word updates.</p>
+
+  <h2>4 · Deadlock, and how to never write one</h2>
+  <p>Deadlock requires four conditions <em>simultaneously</em>: <strong>mutual exclusion</strong>, <strong>hold-and-wait</strong> (grab one lock, wait for another), <strong>no preemption</strong> (locks can't be forcibly taken), and <strong>circular wait</strong> (T1 holds A wants B; T2 holds B wants A). Break any one and deadlock is impossible. (<a href="https://pages.cs.wisc.edu/~remzi/OSTEP/threads-bugs.pdf">OSTEP: Common Concurrency Problems</a>)</p>
+  <p>The industrial-strength fix is the cheapest one: <strong>a global lock ordering</strong> — every code path acquires locks in the same agreed order, so a cycle can never form. The lab shows the same two locks deadlocking in opposite order and completing instantly in a fixed order. Secondary defenses: acquire with timeouts, or hold at most one lock at a time.</p>
+
+  <h2>5 · Thread pools and the sizing math</h2>
+  <p>Spawning a thread per request does not survive contact with production: stacks cost megabytes, and creation/teardown costs dominate at high request rates. A <strong>thread pool</strong> pre-creates N workers pulling tasks from a shared queue (<a href="https://docs.python.org/3/library/concurrent.futures.html">Python: concurrent.futures</a>). The queue is itself a lock-protected structure — the pattern is called <em>producer–consumer</em>.</p>
+  <p>How big should N be? For I/O-bound work, the answer is Little's law applied to threads:</p>
+  <pre><code>Gateway target: 2,000 req/s; each request waits 45 ms on a downstream
+call and needs 5 ms of CPU.
+
+In-flight requests   L = λ × W = 2,000/s × 0.050 s = 100
+Threads (1/request)  ≈ 100, round up for headroom → 128
+Stack memory         100 × 8 MB default stacks = 800 MB of pure bookkeeping
+asyncio alternative  100 coroutines × ~few KB   &lt; 1 MB for the same concurrency</code></pre>
+  <p>That last comparison is why the next section exists.</p>
+
+  <h2>6 · Async I/O and the event loop</h2>
+  <p>Most server "work" is waiting — for sockets, disks, databases, downstream APIs. Waiting needs no thread. An <strong>event loop</strong> runs on one thread, asks the OS "which of my 10,000 file descriptors are ready?" (epoll/kqueue), and resumes only the tasks that can make progress. Tasks are <strong>coroutines</strong> that <code>await</code> at every wait-point, yielding the thread voluntarily — <em>cooperative</em> scheduling, versus the OS's <em>preemptive</em> kind. (<a href="https://docs.python.org/3/library/asyncio.html">Python: asyncio</a>)</p>
+  <p>In the lab, 1,000 concurrent 50 ms waits finish in ~0.05 s on one asyncio thread; a 50-worker thread pool needs ~1 s (1,000/50 × 50 ms). Nginx, Node.js, and every serious API gateway are built on this model. The iron law: <strong>never block the loop</strong> — one CPU-heavy or synchronously-blocking call starves every other task (lab E5 makes you cause this).</p>
+
+  <h2>7 · The Python GIL — one lock to rule them all</h2>
+  <p>CPython's <strong>Global Interpreter Lock</strong> allows only one thread to execute Python bytecode at a time, per process — a single coarse lock protecting the interpreter's internals. (<a href="https://docs.python.org/3/glossary.html#term-global-interpreter-lock">Python glossary: GIL</a>)</p>
+  <p>Consequences, measured in the lab:</p>
+  <ul>
+    <li><strong>CPU-bound threads don't scale.</strong> Four threads of pure-Python math ≈ sequential time (sometimes worse — GIL hand-offs cost). Use <strong>processes</strong> (one GIL each) or push work into C/NumPy/GPU kernels, which release the GIL.</li>
+    <li><strong>I/O-bound threads are fine.</strong> The GIL is released during blocking syscalls, so threads waiting on sockets overlap freely.</li>
+    <li><strong>The GIL does not make your code thread-safe.</strong> The lab's lost-update race happens <em>with the GIL on</em> — it protects interpreter internals, not your read-modify-write sequences.</li>
+  </ul>
+  <p>For LLM serving this is why vLLM and friends run the model in GPU kernels (GIL released), keep the Python layer as an async coordinator, and scale CPU-heavy steps like tokenization with separate worker processes. <a href="https://peps.python.org/pep-0703/">PEP 703</a> (free-threaded CPython) is removing the GIL, but the architecture lesson stands. (<a href="https://blog.vllm.ai/2025/09/05/anatomy-of-vllm.html">Inside vLLM</a>)</p>
+
+  <h2>8 · Choosing a model: the one table to remember</h2>
+  <table>
+    <tr><th>Model</th><th>Parallel CPU?</th><th>Best for</th><th>Cost per unit</th><th>Sharp edge</th></tr>
+    <tr><td>Threads + locks</td><td>Yes (no, in CPython)</td><td>Blocking I/O, shared state</td><td>~MB stack, ~10 µs switch</td><td>Races, deadlock, contention</td></tr>
+    <tr><td>Processes</td><td>Yes</td><td>CPU-bound work, isolation</td><td>~10 ms spawn, IPC copies</td><td>No shared memory, IPC overhead</td></tr>
+    <tr><td>Async event loop</td><td>No (one thread)</td><td>Huge numbers of waits</td><td>~KB per coroutine</td><td>One blocking call starves all</td></tr>
+  </table>
+  <p>Production servers compose all three: an async loop at the edge, a thread pool for blocking libraries, process workers for CPU. That composition <em>is</em> the standard answer to "how does your gateway handle 10k concurrent connections?"</p>
+
+  <h2>9 · Sharp edges (failure modes)</h2>
+  <ul>
+    <li><strong>Check-then-act (TOCTOU).</strong> <code>if balance >= amount: withdraw()</code> — the balance can change between the check and the act. The check and act must share one critical section (or one atomic DB operation).</li>
+    <li><strong>The race that "never happens."</strong> Timing-dependent bugs hide for months, then fire under production load or on different hardware. Lab E2 shows the same race going quiet when the preemption interval grows — it is still there.</li>
+    <li><strong>Deadlock only under load.</strong> Lock cycles need the unlucky interleaving; low traffic rarely finds it. Load tests and lock-order audits do.</li>
+    <li><strong>Blocking call on the event loop.</strong> One synchronous <code>requests.get()</code> or heavy loop inside an async handler freezes every connection on that loop — the #1 async production bug.</li>
+    <li><strong>Pool exhaustion.</strong> All N workers stuck on a slow downstream → queue grows → timeouts cascade. Fix with timeouts, bounded queues, and circuit breakers (Phase 2, lesson 0015).</li>
+    <li><strong>Assuming the GIL protects you.</strong> It serializes bytecodes, not your multi-step invariants. You still need locks in threaded Python.</li>
+  </ul>
+
+  <h2>10 · Lab — races you can reproduce on demand</h2>
+  <div class="callout"><span class="label">Hands-on (before the quiz)</span>
+    <code>labs/lab-p0-03-races-and-gil/</code> → <code>python3 concurrency_lab.py</code>. Four experiments: the lost-update race (watch non-determinism across trials), deadlock vs lock ordering, GIL throttling CPU threads while processes scale, and 1,000 fake I/O calls on an event loop vs a thread pool. Then exercises E1–E5 in the README: <em>predict, edit CONFIG, re-run, compare.</em> Wrong predictions are the deliverable.
+  </div>
+
+  <h2>11 · Project step</h2>
+  <p>Sketch (paper or scratch file) the concurrency plan for our <strong>LLM inference gateway</strong>: which layer is an async event loop (client connections, streaming), where a thread pool appears (blocking calls to storage/auth), where processes appear (tokenizer workers, model workers), and which shared structure needs a lock (the batching queue between gateway and scheduler). Mark one place a lost-update race could corrupt state (hint: request-count accounting for rate limits) and one potential deadlock (two workers exchanging both queue and cache locks). Bring it to the next session.</p>
+
+  <h2>Interview talking points</h2>
+  <ul>
+    <li>"Concurrency is structure — tasks in progress; parallelism is simultaneous execution. A single-threaded event loop can be massively concurrent."</li>
+    <li>"<code>counter += 1</code> is read-modify-write; unsynchronized threads silently lose updates — I'd protect it with a lock or an atomic, and keep the critical section minimal because contention shows up in p99."</li>
+    <li>"Deadlock needs mutual exclusion, hold-and-wait, no preemption, and circular wait — I prevent it by imposing a global lock acquisition order."</li>
+    <li>"For I/O-bound thread pools I size with Little's law: threads ≈ arrival rate × wait time, plus headroom."</li>
+    <li>"The GIL serializes Python bytecode, so CPU-bound work needs processes or C/GPU kernels that release it; I/O threads are fine — and the GIL still doesn't make compound operations thread-safe."</li>
+    <li>"My default server shape: async loop at the edge, thread pool for blocking libraries, process workers for CPU — never block the event loop."</li>
+  </ul>
+
+  <h2>Check yourself</h2>
+  <div class="quiz" id="quiz"></div>
+
+  <h2>Primary source</h2>
+  <p>Read <strong>OSTEP's concurrency chapters</strong> — start with <a href="https://pages.cs.wisc.edu/~remzi/OSTEP/threads-intro.pdf">Concurrency and Threads</a>, then <a href="https://pages.cs.wisc.edu/~remzi/OSTEP/threads-locks.pdf">Locks</a> and <a href="https://pages.cs.wisc.edu/~remzi/OSTEP/threads-bugs.pdf">Common Concurrency Problems</a> (all free at <a href="https://pages.cs.wisc.edu/~remzi/OSTEP/">pages.cs.wisc.edu/~remzi/OSTEP</a>). Free alternative for the Python-specific half: the official <a href="https://docs.python.org/3/library/threading.html">threading</a> and <a href="https://docs.python.org/3/library/asyncio.html">asyncio</a> docs, plus <a href="https://peps.python.org/pep-0703/">PEP 703</a> for where the GIL is heading.</p>
+
+  <footer class="lesson-footer">
+    <p><strong>Stuck or curious?</strong> Ask your teacher (the agent) anything — "why does the GIL exist at all if it hurts this much?" is an excellent follow-up question.</p>
+    <nav class="lesson-nav">
+      <span>◀ Prev: <a href="p0-02-os-essentials.html">p0-02 · OS Essentials</a></span>
+      <span>Next: <a href="p0-04-networking.html">p0-04 · Networking</a> ▶</span>
+    </nav>
+  </footer>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+renderQuiz(document.getElementById('quiz'), {
+  title: 'Check yourself',
+  questions: [
+    {
+      q: 'Two threads each run "counter += 1" 100,000 times with no lock. What is the most likely final value?',
+      options: [
+        'Always 200,000 because increments are atomic',
+        'Often less than 200,000, varying run-to-run',
+        'Exactly 100,000 because one thread wins',
+      ],
+      answer: 1,
+      explain: 'The increment is read-modify-write; interleaved threads overwrite each other\'s writes, silently losing updates. The count differs on every run — that non-determinism is the signature of a race.',
+    },
+    {
+      q: 'Which single intervention makes deadlock impossible for a fixed set of locks?',
+      options: [
+        'Break the circular wait',
+        'Add many more threads',
+        'Retry the lock forever',
+      ],
+      answer: 0,
+      explain: 'Deadlock needs all four conditions at once; imposing a global lock acquisition order removes circular wait, so no cycle of waiting threads can ever form.',
+    },
+    {
+      q: 'A pure-Python CPU-bound job must use all 4 cores. In standard CPython, what actually delivers the speedup?',
+      options: [
+        'Spawning more threads per core',
+        'Using asyncio tasks instead everywhere',
+        'Using processes with separate interpreters',
+      ],
+      answer: 2,
+      explain: 'The GIL lets only one thread run bytecode at a time per process, and asyncio is still one thread. Processes each carry their own GIL, so they run truly in parallel.',
+    },
+    {
+      q: 'Which workload is the strongest case for an asyncio event loop over a thread pool?',
+      options: [
+        'Many concurrent connections waiting on I/O',
+        'Heavy numeric loops on one core',
+        'Tasks needing true parallel CPU execution',
+      ],
+      answer: 0,
+      explain: 'Waits cost an event loop almost nothing — thousands of paused coroutines fit in one thread. CPU-heavy work is the loop\'s worst case: one blocking task starves every other.',
+    },
+    {
+      q: 'A service receives 200 requests/second and each request blocks 50 ms on downstream I/O. Roughly how many pool threads keep up?',
+      options: [
+        'About one hundred',
+        'About ten threads',
+        'About two threads',
+      ],
+      answer: 1,
+      explain: 'Little\'s law: in-flight requests L = λ × W = 200/s × 0.05 s = 10. One thread per in-flight request means ~10 threads, plus some headroom for bursts.',
+    },
+  ],
+});
+</script>
+</body>
+</html>

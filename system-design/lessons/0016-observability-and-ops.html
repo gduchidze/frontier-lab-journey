@@ -1,0 +1,216 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lesson 16 · Observability &amp; Ops</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<div class="lesson">
+  <header class="lesson-header">
+    <p class="kicker">Lesson 0016 · Phase 2 — Software Architecture &amp; Reliability · <a href="0016-observability-and-ops.ka.html">ქართული ვერსია</a></p>
+    <h1>Observability &amp; Ops</h1>
+    <p class="dek">You can't fix what you can't see. Logs, metrics, and traces; SLOs and error budgets; and alerting that pages a human only for human-worthy problems.</p>
+  </header>
+
+  <div class="mission-tie">
+    <strong>Mission tie.</strong> Every Anthropic design prompt ends the same way: <em>"how do you know it's working — and how do you know when it isn't?"</em> Candidates who answer "add monitoring" stall; candidates who name three SLIs, a burn-rate page, and what the on-call does at 3 a.m. sound like they have carried a pager. This lesson is a compression of the <a href="https://sre.google/sre-book/table-of-contents/">Google SRE book</a> — the industry's canonical answer — into the vocabulary you deploy live, using an e-commerce checkout and a payments API as the running examples.
+  </div>
+
+  <h2>1 · Three pillars, honestly</h2>
+  <p>Three telemetry signals, three different questions, three very different bills (<a href="https://sre.google/sre-book/monitoring-distributed-systems/">SRE book ch. 6</a>, <a href="https://opentelemetry.io/docs/concepts/signals/">OpenTelemetry signals</a>):</p>
+  <table>
+    <tr><th>Signal</th><th>What it is</th><th>Question it answers</th><th>Cost profile</th></tr>
+    <tr><td><strong>Logs</strong></td><td>Discrete events, arbitrary detail</td><td>"What exactly happened to request X?"</td><td>Scales with traffic × verbosity — the expensive one</td></tr>
+    <tr><td><strong>Metrics</strong></td><td>Pre-aggregated numbers over time</td><td>"Is checkout healthy <em>right now</em>? Trending how?"</td><td>Scales with <em>cardinality</em> (distinct label sets), not traffic</td></tr>
+    <tr><td><strong>Traces</strong></td><td>Request-scoped causality across services</td><td>"Which hop made <em>this</em> request slow?"</td><td>Scales with traffic — hence sampling</td></tr>
+  </table>
+  <p>The cardinality trap, up front: a metric's storage cost is the number of distinct label combinations, because each combination is its own time series. <code>checkout_requests_total{service, status}</code> is a handful of series. Add a <code>user_id</code> label and you mint one series <em>per user</em> — a million users is a million series, and your metrics bill now scales with your user base. Rule: labels are for <strong>bounded</strong> dimensions (service, status, region); unbounded identity (user, order, trace) belongs in logs and traces (<a href="https://prometheus.io/docs/practices/instrumentation/#do-not-overuse-labels">Prometheus: do not overuse labels</a>). You will detonate this bomb safely in the lab.</p>
+
+  <h2>2 · Structured logging</h2>
+  <p>Logs are for machines first, humans second. That means <strong>JSON, not prose</strong>: <code>{"ts":…, "level":"error", "service":"payments", "request_id":"r-8f3a", "msg":"card_declined", "latency_ms":212}</code>. Three disciplines make the difference (<a href="https://12factor.net/logs">12-Factor: logs as event streams</a>):</p>
+  <ul>
+    <li><strong>Correlation IDs everywhere.</strong> The gateway mints a request ID and every hop — orders, payments, retries, queue consumers — carries it. One grep reconstructs one request's story across twelve services; without it, logs are twelve unrelated diaries.</li>
+    <li><strong>Levels used honestly.</strong> ERROR means a human should eventually look; WARN means degraded-but-handled; INFO is the narrative; DEBUG is off in production. A codebase where everything is ERROR has no ERROR level.</li>
+    <li><strong>Sampling for volume.</strong> Keep every error log; sample the happy path. The errors are where the information is.</li>
+  </ul>
+  <p><strong>Worked cost — the arithmetic interviewers want to hear.</strong> A checkout flow at 1,000 RPS emitting ~2 KB of logs per request = 2 MB/s = <strong>173 GB/day ≈ 5.2 TB per 30-day month</strong>, raw. Index and replicate 3× and you are storing ~15 TB; at managed-vendor ingest pricing of roughly $0.50/GB that is <strong>~$2,600/month before you query anything</strong>. Sample INFO at 1:10 (keeping all WARN/ERROR) and the bill drops ~80% while incidents stay fully debuggable. Logging is a product decision with a unit cost, not free exhaust.</p>
+
+  <h2>3 · Metrics that matter: RED vs USE</h2>
+  <p>Two checklists cover nearly every dashboard you will ever need. <strong>RED</strong> is for <em>services</em> (request-driven things); <strong>USE</strong> is for <em>resources</em> (things with capacity) (<a href="https://grafana.com/blog/2018/08/02/the-red-method-how-to-instrument-your-services/">Tom Wilkie: the RED method</a>, <a href="https://www.brendangregg.com/usemethod.html">Brendan Gregg: the USE method</a>):</p>
+  <table>
+    <tr><th></th><th>RED — per service</th><th>USE — per resource</th></tr>
+    <tr><td><strong>Letters</strong></td><td><strong>R</strong>ate, <strong>E</strong>rrors, <strong>D</strong>uration</td><td><strong>U</strong>tilization, <strong>S</strong>aturation, <strong>E</strong>rrors</td></tr>
+    <tr><td><strong>Applies to</strong></td><td>Gateway, orders, payments — anything with requests</td><td>CPU, memory, disk, connection pools, queues, GPUs</td></tr>
+    <tr><td><strong>Asks</strong></td><td>"Are users being served, correctly, quickly?"</td><td>"Is this component full, backed up, or failing?"</td></tr>
+    <tr><td><strong>Audience</strong></td><td>The on-call at 3 a.m. — symptoms</td><td>Capacity planning and diagnosis — causes</td></tr>
+  </table>
+  <p><strong>Percentiles, not averages</strong> — recap from Phase 1: a 30 ms average checkout latency is compatible with a p99 of 2 s, and at 30 object-fetches per page nearly every user <em>experiences</em> the tail. Report p50/p95/p99. Since you cannot average percentiles across hosts, production systems record <strong>histograms</strong> — counters per latency bucket — which aggregate correctly and let you compute any quantile server-side (<a href="https://prometheus.io/docs/practices/histograms/">Prometheus: histograms and summaries</a>). Choose bucket boundaries around your SLO threshold (e.g. one bucket edge exactly at 400 ms) so "fraction of requests under SLO" is exact, not interpolated.</p>
+
+  <h2>4 · Distributed tracing</h2>
+  <p>A <strong>trace</strong> is one request's tree: each hop records a <strong>span</strong> (name, start, duration, parent) and the whole tree shares a trace ID. Context rides along in the <code>traceparent</code> HTTP header — the <a href="https://www.w3.org/TR/trace-context/">W3C Trace Context</a> standard — so gateway, orders, and payments all stamp the same ID without coordination. The design descends from Google's <a href="https://research.google/pubs/dapper-a-large-scale-distributed-systems-tracing-infrastructure/">Dapper paper</a>; <a href="https://opentelemetry.io/docs/concepts/signals/traces/">OpenTelemetry</a> is its open standardization.</p>
+  <p>What traces uniquely find: metrics tell you checkout p99 jumped to 900 ms; only the trace shows the 12-service fan-out where 835 of those milliseconds sit inside the payments hop. Aggregates say <em>when and what</em>; traces say <em>where and why, for this request</em>.</p>
+  <p><strong>Sampling</strong>, because tracing everything at 100k RPS is unaffordable: <strong>head sampling</strong> decides at trace start (cheap, simple — but blind: it drops interesting traces as readily as boring ones), while <strong>tail sampling</strong> decides after the outcome is known (keep all errors and slow traces, 1% of the rest) at the cost of buffering every trace until it completes (<a href="https://opentelemetry.io/docs/concepts/sampling/">OpenTelemetry: sampling</a>). The classic failure: 1:1000 head sampling means the one trace you need during the incident was probably discarded — the lab's E4 makes you feel this.</p>
+
+  <h2>5 · SLI, SLO, error budget</h2>
+  <p>The SRE book's central machinery (<a href="https://sre.google/sre-book/service-level-objectives/">Service Level Objectives</a>):</p>
+  <ul>
+    <li><strong>SLI</strong> — a service level <em>indicator</em>, best expressed as a ratio: good events / total events. Checkout availability SLI = non-5xx responses / all responses. Latency SLI = responses under 400 ms / all responses.</li>
+    <li><strong>SLO</strong> — the target on that ratio over a window: "99.9% of checkout requests succeed, measured over 30 days."</li>
+    <li><strong>Error budget</strong> — the complement: 1 − SLO. It reframes reliability as a resource you deliberately <em>spend</em> — on deploys, experiments, and risk — rather than a purity contest (<a href="https://sre.google/sre-book/embracing-risk/">Embracing Risk</a>).</li>
+  </ul>
+  <p><strong>Worked math.</strong> A 30-day month is 43,200 minutes. A 99.9% SLO leaves a budget of 0.1% → <strong>43.2 minutes</strong> of full outage (or the equivalent spread thin: 0.1% of requests failing continuously). At 99.95% the budget halves to 21.6 min; at 99.99% it is 4.3 min — less than one bad deploy plus one slow rollback, which is why every extra nine multiplies cost. In request terms: at 201,600 requests/month, a 99.9% SLO allows ~202 bad requests — and in the lab you will watch one 11-minute error burst spend 72% of that budget.</p>
+  <p><strong>Budget policy</strong> is what gives the number teeth: while budget remains, ship fast; when the budget is spent, feature releases freeze and engineering shifts to reliability until the window recovers. Agreed in advance between product and engineering, so the 3 a.m. argument was already settled at noon. And keep the terms straight: an <strong>SLO</strong> is an internal target that pages engineers; an <strong>SLA</strong> is an external contract that pages lawyers — your SLO must be stricter than your SLA.</p>
+
+  <h2>6 · Alerting philosophy: page on burn rate</h2>
+  <p>Rule one, from <a href="https://sre.google/sre-book/monitoring-distributed-systems/">SRE book ch. 6</a>: <strong>page on symptoms, not causes</strong>. "CPU at 95%" is a cause — maybe harmless, maybe not; it becomes a ticket. "Users are failing checkout fast enough to threaten the SLO" is a symptom — it pages. Every page must be <em>actionable</em>: if the responder's first thought is "so what?", the alert is miscalibrated and is training humans to ignore pages.</p>
+  <p>The modern mechanism is the <strong>burn rate</strong>: how fast you are consuming error budget, as a multiple of the sustainable rate. Burn 1× = spending exactly the budget over the window; burn 14.4× = the whole 30-day budget gone in 50 hours. <strong>Worked example</strong> (<a href="https://sre.google/workbook/alerting-on-slos/">SRE workbook: Alerting on SLOs</a>): with a 99.9% SLO, an hour at 1.44% error rate is a 14.4× burn and spends 1/720 × 14.4 = <strong>2% of the monthly budget in one hour</strong> — page-worthy. The workbook's recommended shape is <strong>multi-window, multi-burn-rate</strong>: page when burn ≥ 14.4× over <em>both</em> 1 h and 5 min (the short window makes the alert reset promptly); open a ticket when burn ≥ 6× over 6 h + 30 min (slow leaks that erode the budget without drama). Compare with the naive alternative — "page if error rate &gt; 2% in any minute" — which pages for 60-second self-healing blips, and, because it watches raw errors instead of the SLI, never notices a latency-only incident at all. The lab scores exactly this contest.</p>
+
+  <h2>7 · Incident response</h2>
+  <p>When the page fires, process beats heroics (<a href="https://sre.google/sre-book/managing-incidents/">SRE book: Managing Incidents</a>). One person becomes <strong>Incident Commander</strong> — coordinating, not typing; separate hands do <strong>Ops</strong> (mitigation) and <strong>Comms</strong> (stakeholder updates on a fixed cadence, e.g. every 30 min, so nobody interrupts the responders to ask "any update?"). Severity levels decide the machinery:</p>
+  <table>
+    <tr><th>Sev</th><th>Example (payments API)</th><th>Response</th></tr>
+    <tr><td><strong>SEV-1</strong></td><td>Checkout down / money moving wrongly</td><td>Page now; IC assigned; comms cadence; all hands as needed</td></tr>
+    <tr><td><strong>SEV-2</strong></td><td>Degraded: elevated declines, one region slow</td><td>Page on-call; mitigate; may escalate</td></tr>
+    <tr><td><strong>SEV-3</strong></td><td>Budget-eroding slow leak, no user pain yet</td><td>Ticket; business-hours fix</td></tr>
+  </table>
+  <p><strong>MTTR anatomy:</strong> time-to-recover = detect → diagnose → mitigate. Observability compresses the first two (burn-rate alert detects; RED dashboard + trace diagnose); Lesson 0015's patterns compress the third (rollback, failover, feature flag off). Mitigate first, root-cause later — the incident ends when users stop hurting, not when you understand why.</p>
+  <p>Afterwards, the <strong>blameless postmortem</strong> (<a href="https://sre.google/sre-book/postmortem-culture/">Postmortem Culture</a>): timeline, contributing causes framed as system gaps rather than human failings — people who fear blame hide the details you need — and, crucially, <strong>action items with owners and due dates</strong>. A postmortem without tracked action items is a confession, not an improvement.</p>
+
+  <h2>8 · Ops maturity: the boring superpowers</h2>
+  <p>What separates teams that survive their own growth:</p>
+  <ul>
+    <li><strong>Runbooks.</strong> Every page links to a doc: what this alert means, first three checks, mitigation steps, escalation path. Written when calm, executed when panicking.</li>
+    <li><strong>One dashboard per service</strong>, RED across the top row, dependencies below. The on-call should reach the right graph in two clicks, not scroll through forty vanity boards.</li>
+    <li><strong>Deploy observability.</strong> Deploys cause most incidents, so make them observable: canary a new version to a slice and <em>diff its RED metrics against the baseline</em> before promoting — automated rollback if error or latency deltas exceed a bound.</li>
+    <li><strong>Toil budget.</strong> Cap manual, repetitive ops work (~50% in Google's practice) and spend the rest engineering it away — else operations consumes the team that runs it (<a href="https://sre.google/sre-book/eliminating-toil/">Eliminating Toil</a>).</li>
+    <li><strong>Error-budget-driven release gating.</strong> The CI/CD pipeline reads the budget: budget healthy → deploys flow; budget spent → only reliability fixes ship. Policy enforced by machinery, not by arguments.</li>
+  </ul>
+
+  <h2>9 · The failure modes that decide interviews</h2>
+  <p>Observability itself fails, and interviewers probe for the scars (<a href="https://sre.google/sre-book/monitoring-distributed-systems/">SRE book ch. 6</a>):</p>
+  <ul>
+    <li><strong>Alert fatigue.</strong> Dozens of non-actionable pages a week train the on-call to swipe them away — and the real SEV-1 page gets swiped with them. Every false page you tolerate is a tax on the true one. Fix: delete or demote every alert that did not lead to action; measure pages-per-shift.</li>
+    <li><strong>Dashboard sprawl.</strong> Forty dashboards nobody opens is negative value: during an incident, choice paralysis. Fix: one per service, RED top row, everything else earns its place or dies.</li>
+    <li><strong>Unbounded cardinality.</strong> The <code>user_id</code> label from §1 — the bill arrives as a six-figure metrics invoice or an OOM'd Prometheus. Fix: lint label sets in code review; cardinality budgets per team.</li>
+    <li><strong>Tracing sampled to uselessness.</strong> 1:1000 head sampling saves money all year, then the one trace that explains the outage was dropped. Fix: tail-based sampling — keep 100% of errors and slow traces, sample only the boring majority.</li>
+    <li><strong>Postmortems without follow-through.</strong> A beautiful document, zero completed action items, same outage next quarter. Fix: action items live in the sprint board with owners; review completion monthly.</li>
+    <li><strong>Nobody monitors the monitoring.</strong> The alert pipeline dies silently and the silence reads as health. Fix: a <strong>dead-man's switch</strong> — an alert that fires <em>continuously</em> by design (Alertmanager's Watchdog); a downstream system pages when it <em>stops</em> arriving (<a href="https://prometheus.io/docs/alerting/latest/overview/">Prometheus alerting overview</a>).</li>
+  </ul>
+
+  <h2>10 · One AI note, then back to fundamentals</h2>
+  <p>Model serving changes the SLI menu, not the machinery. For the inference platform: <strong>TTFT p99</strong> (time to first token — the user-perceived latency), <strong>tokens/s per request</strong> (streaming throughput), and <strong>queue depth per tenant</strong> (the saturation signal that predicts the next minute's pain) are your RED-side SLIs; <strong>GPU utilization and KV-cache occupancy are USE territory</strong> — dashboards and capacity, not pages. One discipline matters: <em>eval-quality metrics are not ops metrics</em>. "Is the model giving good answers" is measured by offline eval pipelines on their own cadence; "is the service up and fast" is measured by the SLIs above — mixing the pipelines gets you paged for a benchmark regression at 3 a.m. (<a href="https://opentelemetry.io/docs/specs/semconv/gen-ai/">OpenTelemetry GenAI semantic conventions</a>). Same SLO math, same burn-rate pages, new indicator names.</p>
+
+  <h2>11 · Interview talking points</h2>
+  <p>How to deploy this lesson live, in order:</p>
+  <ol>
+    <li><strong>Open with SLIs, unprompted.</strong> "Success criteria: availability SLI = non-5xx/total, latency SLI = under-400ms/total, both at 99.9% over 30 days." Instant credibility.</li>
+    <li><strong>Say the budget number.</strong> "99.9% monthly is 43.2 minutes of budget — that bounds how aggressive our deploys can be."</li>
+    <li><strong>Name the three signals with jobs</strong> (§1): metrics for detection, traces for localization, logs for the request-level story — joined by a correlation ID.</li>
+    <li><strong>RED per service, USE per resource</strong> (§3), histograms not averages, bucket edge at the SLO threshold.</li>
+    <li><strong>Page on burn rate, not thresholds</strong> (§6): "14.4× over 1h+5m pages; 6× over 6h tickets; CPU alerts are tickets, never pages."</li>
+    <li><strong>Sketch the incident path</strong> (§7): page → IC → mitigate (rollback/flag) → blameless postmortem with owned action items. Mention MTTR = detect + diagnose + mitigate.</li>
+    <li><strong>Volunteer a failure mode</strong> (§9): "the risk in my design is cardinality — I'd lint label sets and keep identity in traces." Raising it first is the strong-hire move.</li>
+  </ol>
+
+  <h2>12 · Lab — page yourself, correctly</h2>
+  <div class="callout"><span class="label">Hands-on (do this before the quiz)</span>
+    Everything above is now verifiable in <code>labs/lab-0016-observability-lab/</code>:
+    <code>python3 observability_lab.py</code> replays a compressed "month" through a
+    gateway → orders → payments chain with two injected faults, then runs three
+    experiments — RED tables that expose both faults in numbers, SLO math showing one
+    6-minute window eating ~78% of the monthly latency budget, and burn-rate paging
+    beating a naive threshold on false pages and incident coverage — plus a span-tree
+    reconstruction that names the guilty hop. Then do exercises E1–E4 in the lab README:
+    <em>predict, edit config, re-run, compare.</em> Wrong predictions are the deliverable.
+  </div>
+
+  <h2>13 · Project step</h2>
+  <p>Decision time for the <strong>LLM inference gateway</strong>: define its three SLIs + SLOs and one burn-rate page, and defend the package in two sentences. A defensible pick: <em>availability (non-5xx/total, 99.9%/30d), TTFT p99 &lt; 1.5 s (as a good-event ratio, 99%/30d), and per-tenant queue depth as the saturation dashboard signal — with one page: burn ≥ 14.4× over 1h+5m on the availability SLI, everything else a ticket. Two sentences: users feel failures and first-token delay, so those two page; queue depth predicts them but predicts imperfectly, so it informs capacity instead of waking anyone.</em> Write your own three SLIs + one page and bring them to the next session for critique.</p>
+
+  <h2>Check yourself</h2>
+  <div class="quiz" id="quiz"></div>
+
+  <h2>Primary source</h2>
+  <p>Read the <strong>Google SRE book</strong>, chapters 4 and 6 — <a href="https://sre.google/sre-book/service-level-objectives/">Service Level Objectives</a> and <a href="https://sre.google/sre-book/monitoring-distributed-systems/">Monitoring Distributed Systems</a> — then the <strong>SRE workbook's</strong> <a href="https://sre.google/workbook/alerting-on-slos/">Alerting on SLOs</a> chapter for the full multi-window multi-burn-rate derivation. All free at sre.google, and together they are the exact vocabulary interviewers grade against. For tracing depth, the <a href="https://research.google/pubs/dapper-a-large-scale-distributed-systems-tracing-infrastructure/">Dapper paper</a> is the origin of everything OpenTelemetry does.</p>
+
+  <footer class="lesson-footer">
+    <p><strong>Stuck or curious?</strong> Ask your teacher (the agent) anything — "why must the burn-rate page use two windows instead of one?" is an excellent follow-up question.</p>
+    <nav class="lesson-nav">
+      <span><a href="0015-reliability-patterns.html">◀ Prev: 0015 · Reliability Patterns</a></span>
+      <span><a href="0017-security-and-multitenancy.html">Next: 0017 · Security &amp; Multi-Tenancy ▶</a></span>
+    </nav>
+  </footer>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+renderQuiz(document.getElementById('quiz'), {
+  title: 'Check yourself',
+  questions: [
+    {
+      q: 'During checkout, one request in a 12-service fan-out is slow and you must find which hop. Which signal answers this directly?',
+      options: [
+        'Metrics, because aggregates reveal each service latency',
+        'Traces, because spans show per-hop request causality',
+        'Logs, because entries record each event somewhere',
+      ],
+      answer: 1,
+      explain: 'A trace is exactly this: one request’s span tree with per-hop durations, so the guilty hop is visible at a glance. Metrics aggregate away the individual request; logs contain the facts but only if you join twelve services’ entries by correlation ID yourself.',
+    },
+    {
+      q: 'Your team adds a user_id label to the checkout request counter. What is the operational consequence?',
+      options: [
+        'Metric series explode with cardinality; storage costs balloon',
+        'Metrics become more precise and dashboards get better',
+        'Nothing changes because labels are free in Prometheus',
+      ],
+      answer: 0,
+      explain: 'Each distinct label combination is its own time series, so an unbounded label like user_id mints one series per user — cardinality explosion. Metrics cost scales with cardinality, not traffic. Identity-level detail belongs in logs and traces.',
+    },
+    {
+      q: 'A payments API promises a 99.9% monthly availability SLO. How much downtime does its error budget allow?',
+      options: [
+        'About 4.32 minutes of full outage per month',
+        'About 432.0 minutes of full outage per month',
+        'About 43.2 minutes of full outage per month',
+      ],
+      answer: 2,
+      explain: 'A 30-day month is 43,200 minutes; the budget is 1 − 0.999 = 0.1% of that, i.e. 43.2 minutes. Each extra nine divides the budget by ten — 99.99% leaves only 4.3 minutes, which is why every added nine multiplies engineering cost.',
+    },
+    {
+      q: 'An SLO burn-rate alert fires at 14.4× over one hour. Why is that multiplier the standard fast-page threshold?',
+      options: [
+        'That rate always means the whole budget is gone',
+        'That rate spends two percent of monthly budget hourly',
+        'That rate matches the maximum error percentage services allow',
+      ],
+      answer: 1,
+      explain: 'One hour is 1/720 of a 30-day window, so burning at 14.4× consumes 14.4/720 = 2% of the monthly budget in a single hour — fast enough that a human must intervene now, which is exactly what a page means (SRE workbook, Alerting on SLOs).',
+    },
+    {
+      q: 'CPU on an orders host sits at 95% but users see normal checkout latency and no errors. Should this page a human at 3 a.m.?',
+      options: [
+        'Yes, saturation is a cause worth waking someone',
+        'Yes, every threshold breach deserves an immediate page',
+        'No, page on symptoms; ticket the capacity investigation',
+      ],
+      answer: 2,
+      explain: 'Page on symptoms (SLO-threatening user pain), not causes. High CPU with healthy SLIs is a capacity question for business hours — a ticket. Paging on causes breeds alert fatigue, and fatigued on-calls eventually ignore the page that matters.',
+    },
+    {
+      q: 'After a checkout outage, what makes a postmortem actually valuable per Google’s SRE practice?',
+      options: [
+        'Blameless analysis plus tracked action items with owners',
+        'Identifying which engineer caused the outage this quarter',
+        'A detailed timeline document filed away for compliance',
+      ],
+      answer: 0,
+      explain: 'Blamelessness keeps the details flowing — people who fear punishment hide facts — and owned, dated action items are what turn the incident into system improvement. A timeline without follow-through is a confession, and blame guarantees the next postmortem is fiction.',
+    },
+  ],
+});
+</script>
+</body>
+</html>

@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html lang="ka">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>გაკვეთილი 23 · Notification სისტემა + Distributed Scheduler</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<div class="lesson">
+  <header class="lesson-header">
+    <p class="kicker">გაკვეთილი 0023 · ფაზა 3 — კლასიკური დიზაინ-რეპები · <a href="0023-notifications-scheduler.html">English version</a></p>
+    <h1>Notification სისტემა + Distributed Scheduler — ორი დიზაინი საერთო ხერხემლით</h1>
+    <p class="dek">„გააგზავნე 100M push/SMS/email დღეში, საიმედოდ" და „გაუშვი cron მთელ ფლოტზე, ზუსტად ერთხელ" სხვადასხვა ამოცანებად გამოიყურება. სიღრმეში ერთი და იგივე მანქანაა: მდგრადი (durable) მომლოდინე სამუშაო, worker-ები რომლებმაც ორჯერ არ უნდა „გაისროლონ", და მილის ბოლოში — მუდამ მერყევი (flaky) დამოკიდებულება.</p>
+  </header>
+
+  <div class="mission-tie">
+    <strong>მისიასთან კავშირი.</strong> Eval-pipeline-ის ორკესტრაცია და batch-job scheduling AI ლაბებში ზუსტად ეს დიზაინია, უბრალოდ სხვა ტანსაცმლით — cron-ის ფენა ისვრის eval batch-ებს judge worker-ების fanout-ში, ხოლო rate-cap-იანი model API თამაშობს flaky provider-ის როლს.
+  </div>
+
+  <div class="callout"><span class="label">Rep-პროტოკოლი — ჯერ ეს გააკეთე</span>
+    სანამ წაიკითხავ: გაუშვი <strong>40-წუთიანი სოლო, დროში გაზომილი rep-ი</strong> ორი ამოცანიდან ერთზე —
+    <em>„დააპროექტე notification სისტემა (push, SMS, email) 100M შეტყობინება/დღეზე"</em> ან
+    <em>„დააპროექტე distributed job scheduler-ი (cron მასშტაბზე)."</em>
+    ხმამაღლა, მარტო, 0009 გაკვეთილის 4-ნაბიჯიანი ჩარჩოთი. მერე წაიკითხე გაკვეთილი და ყველა
+    დელტა (გამორჩენილი კომპონენტი, დაუხარჯავი რიცხვი, დაუსახელებელი failure mode) ჩაწერე learning record-ად.
+  </div>
+
+  <h2>1 · ორი ამოცანა, ერთი გაკვეთილი</h2>
+  <p>ორივე ამოცანა ერთ წინადადებამდე დადის: <strong>საიმედო async fanout დროის სემანტიკით</strong>. Notification სისტემა = „მიაწოდე ეს სამუშაო N ბოლო წერტილს <em>ახლავე</em>, გადაურჩი retry-ებსა და flaky provider-ებს." Scheduler-ი = „მიაწოდე ეს სამუშაო worker-ს <em>T დროს</em>, გადაურჩი crash-ებსა და საათის დრიფტს (clock drift)." ლექსიკა მოაშორე და ორგანოები იდენტურია:</p>
+  <table>
+    <tr><th>ორგანო</th><th>Notification სისტემა</th><th>Distributed scheduler</th></tr>
+    <tr><td>მდგრადი მომლოდინე სამუშაო</td><td>თითო-არხის რიგები (queues)</td><td>Job store დალაგებული fire დროით</td></tr>
+    <tr><td>ერთი ელემენტის მფლობელობა</td><td>Queue visibility / ack</td><td>Lease + fencing token</td></tr>
+    <tr><td>გულწრფელი მიწოდების კონტრაქტი</td><td>At-least-once + dedup გასაღები</td><td>At-least-once + იდემპოტენტური handler</td></tr>
+    <tr><td>Flaky დამოკიდებულება</td><td>APNs / SMS / email provider</td><td>თავად job-ის გვერდითი ეფექტები</td></tr>
+    <tr><td>დამცავი სარქველი</td><td>DLQ + circuit breaker</td><td>Missed-fire catch-up პოლიტიკა</td></tr>
+  </table>
+  <p>ამიტომ იზიარებენ ერთ გაკვეთილს: აითვისე ერთი ხერხემალი, მოჰყევი ორჯერ. ინტერვიუერი ორივეგან ერთსა და იმავე კუნთებს აფასებს — durable state, ownership, retries, idempotency.</p>
+
+  <h2>2 · Clarify — იყიდე სწორი notification-პრობლემა</h2>
+  <p>ამოცანა განზრახ დაუზუსტებელია. 0009-ის ოთხი კითხვის ოჯახი, პლუს არხ-სპეციფიკური:</p>
+  <table>
+    <tr><th>მოთხოვნა</th><th>ტიპური პასუხი</th><th>რა გადაწყვეტილებას აიძულებს</th></tr>
+    <tr><td>არხები</td><td>Push (APNs + FCM), SMS (მესამე მხარე, მაგ. Twilio), email (SES/SendGrid)</td><td>თითო-არხის რიგები + provider-ადაპტერები</td></tr>
+    <tr><td>პრეფერენსები / opt-out</td><td>თითო-მომხმარებელი, თითო-არხი, იურიდიულად სავალდებულო (GDPR)</td><td>Preference-ფილტრი რიგში ჩაყენებამდე და არა შემდეგ</td></tr>
+    <tr><td>პრიორიტეტის კლასები</td><td>OTP &gt; ტრანზაქციული &gt; მარკეტინგი</td><td>ცალკე რიგები ან პრიორიტეტული ზოლები; OTP კამპანიას არ ელოდება</td></tr>
+    <tr><td>დუბლიკატის გარანტია</td><td><strong>რბილი (soft)</strong> no-duplicate: იშვიათი დუბლი ასატანია, ნაკადი — არა</td><td>At-least-once + dedup ფანჯარა და არა exactly-once თეატრი</td></tr>
+    <tr><td>Latency SLO</td><td>OTP p99 &lt; 30 s; მარკეტინგისთვის საათებიც კარგია</td><td>თითო-კლასის SLO-ები → თითო-კლასის shedding-წესები</td></tr>
+  </table>
+  <p>Out of scope: კამპანიის კონტენტის შედგენა, in-app inbox-ის რენდერი, ანალიტიკის საწყობი.</p>
+
+  <h2>3 · Estimate — რიცხვები, რომლებსაც დახარჯავ</h2>
+  <pre><code>100M შეტყობინება/დღეში ÷ ~100k წმ/დღეში ≈ 1.2k/წმ საშუალო
+Flash-მოვლენა (breaking news, დიდი sale): ×20 პიკი ≈ 25k/წმ წუთებით
+არხების გაყოფა: 70M push · 25M email · 5M SMS დღეში
+
+Provider-ის rate cap-ები (საკონტრაქტო, შენ ვერ ცვლი):
+  push ~10k/წმ   email ~2k/წმ   SMS ~200/წმ
+SMS საშუალო = 5M/86,400 ≈ 60/წმ  → წესრიგშია
+SMS flash-პიკზე = ×20 ≈ 1.2k/წმ vs 200/წმ cap
+  → რიგი იზრდება ~1k/წმ; 10-წუთიანი პიკი ≈ 600k backlog
+  → დაცლის დრო 600k ÷ 200/წმ = 50 წუთი
+
+Storage: 100M/დღეში × ~0.5 KB ლოგ-სტრიქონი ≈ 50 GB/დღეში → 30 დღე ≈ 1.5 TB</code></pre>
+  <p>ყველა რიცხვი დახარჯე: 25k/წმ პიკი ნიშნავს stateless-ჰორიზონტალურ ingestion-ფენას LB-ის უკან. SMS-ის cap-მათემატიკა <em>ამტკიცებს</em>, რომ გჭირდება თითო-არხის რიგები (50-წუთიანმა SMS backlog-მა push OTP-ები არ უნდა დააგვიანოს) და პრიორიტეტული ზოლები SMS-ის შიგნით (OTP კამპანიის backlog-ს გვერდს უვლის). 1.5 TB ლოგი ერთ დაპარტიციებულ საცავში ეტევა — აუდიტი იაფია, შეინახე.</p>
+
+  <h2>4 · Notification-დიზაინი მაღალ დონეზე</h2>
+  <pre><code>კლიენტები / სერვისები
+   → Ingestion API  (ვალიდაცია, auth, event_id-ის მინიჭება)
+   → Preference + opt-out ფილტრი  (ჩამოაგდე რიგამდე)
+   → Template სერვისი  (თითო-არხის ტექსტის აწყობა)
+   → თითო-არხის რიგები  [push] [email] [sms — პრიორიტეტული ზოლები]
+   → არხის worker-ები  (provider-ის cap-ებზე შეზღუდული)
+   → Provider-ადაპტერები  (APNs, FCM, Twilio, SES)
+   → Notification log  (ყოველი მცდელობა, ყოველი შედეგი)</code></pre>
+  <p>ერთი არააშკარა თანმიმდევრობა ახსენი: ფილტრი <em>რიგამდე</em> — opt-out-იანი შეტყობინების ჩაყენება რიგში კარგავს ტევადობას და კომპლაენს-ინციდენტს რისკავს, თუ ფილტრი dequeue-ის დროს წაქცეულია. და თქვი წინადადება, რომელიც მთელ deep dive-ს კარკასს აძლევს: <strong>provider-ი ყოველთვის bottleneck-ია და ყოველთვის flaky</strong>. APNs-ს ვერ აკონტროლებ, Twilio-ს cap-ები და outage-ები აქვს, email კი greylist-ში გაგდებს. რიგის ქვემოთ ყველაფერი ამ ფაქტის გარშემოა დაპროექტებული.</p>
+
+  <h2>5 · Deep dive: საიმედოობა — at-least-once, გულწრფელად</h2>
+  <p>კონტრაქტი: <strong>at-least-once მიწოდება + idempotency</strong>; ვინც მესამე მხარის HTTP API-ზე exactly-once-ს გპირდება, ბლეფავს. ნაკრები:</p>
+  <ul>
+    <li><strong>Idempotency / dedup გასაღები.</strong> ყოველ შეტყობინებას ingestion-ზე მინიჭებული <code>event_id</code> მიჰყვება. Worker-ები და idempotency-key-ს მიმღები provider-ები ამაზე დედუპლიცირებენ; შენი retry-გზა — ყოველთვის.</li>
+    <li><strong>Retries: exponential backoff + jitter</strong> — 0008 გაკვეთილის retry storm-ი, სიტყვასიტყვით. Provider-ი, რომელმაც ახლახან 10k შეტყობინება ჩააგდო, ერთსა და იმავე მომენტში მიიღებს 10k retry-ს, თუ jitter-მა არ გაფანტა.</li>
+    <li><strong>DLQ.</strong> k მცდელობის შემდეგ — გვერდზე გადადება შეცდომების ისტორიით. Poison message-მა (გაფუჭებული token, მკვდარი მოწყობილობა) retry-ბიუჯეტი სამუდამოდ არ უნდა ჭამოს.</li>
+    <li><strong>Circuit breaker თითო provider-ზე.</strong> Twilio-ს შეცდომების პიკზე — შეწყვიტე ბრახუნი: სწრაფად ჩავარდი რიგში, გაზონდე მცირე ტრაფიკით, თანდათან გახსენი.</li>
+    <li><strong>Notification log.</strong> Append-only ჩანაწერი ყოველი მცდელობისა და შედეგისა. პასუხობს „მიიღო X-მა OTP?"-ს support-ში და კვებავს delivery-rate მონიტორინგს.</li>
+  </ul>
+
+  <h2>6 · Deep dive: dedup და collapsing</h2>
+  <p>რბილი no-duplicate გარანტია რეალიზდება <strong>dedup ფანჯარით</strong>: dequeue-ზე <code>SETNX dedup:{event_id} 1 EX 3600</code> Redis-ში — თუ გასაღები უკვე იყო, ეს event ფანჯარაში სხვამ მიიტანა (ან მიაქვს); ჩამოაგდე. ეს ფანჯარაა და არა დავთარი: TTL-ის შემდეგ გამეორებული event შეიძლება გაძვრეს — ზუსტად ამას ნიშნავს „soft" და ამას ხმამაღლა ამბობ.</p>
+  <p>იმავე ვიწრო წერტილში კიდევ ორი თითო-მომხმარებლის კონტროლი ზის:</p>
+  <ul>
+    <li><strong>თითო-მომხმარებლის rate limit</strong> (0018 გაკვეთილის token bucket-ი, თითო user-ზე თითო არხზე): ვერავინ მიიღებს 40 push-ს წუთში, upstream-ი რასაც უნდა შვრებოდეს. ეს პროდუქტის გარანტიაცაა <em>და</em> ბაგების ცეცხლგამძლე კედელიც.</li>
+    <li><strong>Digest / collapse.</strong> „17-მა მოიწონა შენი პოსტი" 17 push-ის ნაცვლად. Collapse-გასაღები (<code>user:post:like</code>) + მოკლე ბუფერული დაყოვნება: დაიჭირე, დათვალე, ერთი გაუშვი. მარკეტინგს უყვარს; ბატარეებს — მეტად.</li>
+  </ul>
+
+  <h2>7 · Distributed scheduler — მაღალი დონე</h2>
+  <p>მეორე ამოცანა: cron მასშტაბზე — ათასობით განმეორებადი და ერთჯერადი job-ი, გასროლილი განრიგიდან წამებში, ფლოტზე სადაც ნებისმიერი კვანძი შეიძლება მოკვდეს. ანატომია: <strong>job store</strong> (განსაზღვრებები + <code>next_fire_at</code>, მდგრადი DB), <strong>due-job ინდექსი</strong> fire-დროით დალაგებული, და <strong>scheduler worker-ები</strong>, რომლებიც due job-ებს იჭერენ და ისვრიან. ინდექსის სამი კლასიკური ფორმა:</p>
+  <table>
+    <tr><th>ფორმა</th><th>როგორ</th><th>Trade-off</th></tr>
+    <tr><td>Timing wheel</td><td>დროის ბაკეტების in-memory რგოლი; ისარი ტიკზე მიიწევს</td><td>O(1) insert/fire; მეხსიერებაზეა, restart-ზე აღდგენა უნდა</td></tr>
+    <tr><td>Sorted set poll</td><td>Redis <code>ZADD</code> fire-დროით; worker-ები ციკლში <code>ZRANGEBYSCORE 0 now</code></td><td>მარტივი, თვალსაჩინო; polling-ი ერთი ინტერვალის lag-ს ამატებს</td></tr>
+    <tr><td>Delay queue</td><td>Broker-ის ჩაშენებული დაყოვნება (SQS delay, RabbitMQ TTL+DLX)</td><td>ყველაზე ცოტა კოდი; შეზღუდული დაყოვნება, გაუქმება/გადატანა ძნელია</td></tr>
+  </table>
+  <p>მასშტაბზე — <strong>partition დროის ბაკეტით</strong> (მაგ. თითო წუთი-საათში, ან job_id-ის hash): თითო partition-ს ერთდროულად ერთი scheduler-ი ფლობს, ამიტომ არცერთი კვანძი მთელ განრიგს არ სკანირებს და „ყველაფერი 00:00-ზე ისვრის" thundering herd-ი მფლობელებზე ნაწილდება.</p>
+
+  <h2>8 · Deep dive: scheduler-ის კორექტულობა</h2>
+  <p>კითხვა კითხვის შიგნით: <em>რა აჩერებს ორ scheduler-ს, ერთი და იგივე job-ი არ გაისროლონ?</em></p>
+  <ul>
+    <li><strong>Leader-ი თითო partition-ზე.</strong> თითო partition-ს ჰყავს ერთი არჩეული მფლობელი — lease-ით საკოორდინაციო საცავში (etcd/ZooKeeper, ან DB-სტრიქონი ვადით). Lease ამოიწურა → სხვა იბარებს.</li>
+    <li><strong>Fencing token-ები</strong> (ფაზა 2-ის იდეა, ადგილზე შეხსენება): ყოველ lease-ს მოჰყვება მონოტონურად მზარდი token-ი. Downstream მდგომარეობა — job-run ჩანაწერი, გვერდითი ეფექტების საცავი — <strong>უარყოფს ჩანაწერს, რომელსაც უკვე ნანახზე ძველი token-ი მოაქვს</strong>. რატომ არ ყოფნის მარტო lease: leader-ი შეიძლება გაიჭედოს (GC-პაუზა, VM-გაყინვა), lease ამოიწუროს, ახალმა leader-მა job-ი გაისროლოს — მერე ზომბი გაიღვიძებს და ისიც ისვრის. ზომბის token-ი მოძველებულია, ამიტომ მისი downstream ჩანაწერი ბრუნდება. Lease = ალბათ ერთი მფლობელი; fencing = მკვდარი მფლობელის ჩანაწერები უვნებელია.</li>
+    <li><strong>Missed-fire catch-up პოლიტიკა.</strong> Scheduler-ი 10 წუთი წაქცეული იყო; job-ს 10-ჯერ უნდა ესროლა. თითო-job-ის პოლიტიკა: <em>fire-all</em> (ბილინგის ტიკები), <em>fire-once-latest</em> (რეპორტის გენერაცია), ან <em>skip</em> (cache warmer-ები). ამის კონფიგურირებადობა სენიორის სიგნალია — უნივერსალურად სწორი პასუხი არ არსებობს.</li>
+    <li><strong>გულწრფელი კონტრაქტი:</strong> at-least-once სროლა + იდემპოტენტური job handler-ები. Fencing + idempotency-გასაღებები იძლევა exactly-once <em>ეფექტს</em>; exactly-once <em>სროლა</em> crash-ების გავლით დაუპირებელია.</li>
+    <li><strong>საათები.</strong> Worker-ები დრიფტავენ; NTP ზღუდავს, მაგრამ არ სპობს. „Due"-ს ერთი ავტორიტეტი წყვეტს: job store-ის საათი და არასდროს თითო worker-ის მაჯის საათი — თორემ 1.5 წმ-ით აჩქარებული worker-ი lease-ებს მოიპარავს და ადრე ისვრის (შენი ლაბი ზუსტად ამას აჩვენებს).</li>
+  </ul>
+
+  <h2>9 · Failure mode-ები და მონიტორინგი</h2>
+  <table>
+    <tr><th>ჩავარდნა</th><th>არასწორი პასუხი</th><th>სწორი პასუხი</th></tr>
+    <tr><td>Provider-ი 20 წუთი წევს</td><td>ჩამოაგდო ან retry-ბრახუნი</td><td><strong>Backpressure და არა ამნეზია</strong>: დააბუფერე არხის რიგში, breaker ღია, გამოჯანმრთელების შემდეგ დაცალე cap-ების ფარგლებში; ასაკით ჩამოაგდე მხოლოდ მარკეტინგის კლასი</td></tr>
+    <tr><td>Scheduler-ის leader-ი ტიკის შუაში კვდება</td><td>ჩათვალო რომ ტიკი შედგა</td><td>ახალი leader-ი due job-ებს მდგრადი <code>next_fire_at</code>-იდან ითვლის; fencing ზომბის დაგვიანებულ ჩანაწერებს ბლოკავს</td></tr>
+    <tr><td>Poison message</td><td>უსასრულო retry-ციკლი</td><td>DLQ k მცდელობის შემდეგ, alert DLQ-ის სიღრმეზე, replay-ინსტრუმენტი</td></tr>
+    <tr><td>Flash-მოვლენის პიკი</td><td>SMS provider-ის დასქეილება (ვერ შეძლებ)</td><td>რიგები შთანთქავს; პრიორიტეტული ზოლები OTP-ს იცავს; წინასწარ შეთანხმებული burst cap-ები</td></tr>
+  </table>
+  <p>ორი მეტრიკა, რომელიც ადამიანს აღვიძებს: <strong>end-to-end მიწოდების p99 თითო არხზე თითო კლასზე</strong> (enqueue → provider-accepted) და <strong>scheduler fire-lag</strong> (ფაქტიური სროლის დრო − დაგეგმილი). დამხმარეები: DLQ-ის სიღრმე, provider-ის შეცდომების მაჩვენებელი, dedup-drop მაჩვენებელი (მკვეთრი ზრდა = upstream retry-ციკლი).</p>
+
+  <h2>10 · ვარიანტები და twist-ები</h2>
+  <ul>
+    <li><strong>Webhook-ები მესამე მხარეებთან</strong> — სარკისებური სურათი: notification სისტემა, სადაც flaky provider-ი <em>შენ</em> ხარ. ამიტომ კარგივით მოიქეცი: მოაწერე payload-ებს ხელი, ჩადე event id, რომ მომხმარებლებმა დედუპლიცირება შეძლონ, გამოაქვეყნე შენი retry-with-backoff პოლიტიკა, დანებდი „failed webhooks" დაფაში, საიდანაც კლიენტი replay-ს გააკეთებს.</li>
+    <li><strong>თანმიმდევრობა თითო user-ზე.</strong> „პაროლი შეიცვალა" არ უნდა მოვიდეს „პაროლის შეცვლა მოთხოვნილია"-ზე ადრე. დააპარტიციე რიგები <code>user_id</code>-ით, რომ ერთი user-ის შეტყობინებები ერთ ზოლზე სერიალიზდეს — გლობალური თანმიმდევრობა არასდროსაა მოთხოვნა; თითო-გასაღების — თითქმის ყოველთვის.</li>
+    <li><strong>Quiet hours / დროის სარტყლები.</strong> „3 საათზე ღამით ნუ push-ავ ადრესატის ლოკალურით" ყოველ შეტყობინებას <em>დაგეგმილ</em> მიწოდებად აქცევს შემდეგ დაშვებულ ლოკალურ დროზე — ამ გაკვეთილის ორი დიზაინი პირდაპირ ერთ სისტემად ერწყმის. ეს წინადადება ინტერვიუზე თქვი.</li>
+  </ul>
+  <p><strong>AI twist (მოკლედ).</strong> Eval pipeline ეს ხერხემალი სიტყვასიტყვით არის: scheduler-ი ღამის eval batch-ებს ისვრის; fanout-ფენა სამუშაოს judge worker-ებს აწვდის; model API — rate-cap-იანი flaky provider-ია; fencing გაჭedილ ორკესტრატორს eval-ის ორჯერ გაშვებას უშლის; DLQ-ში judge-ის ჩამგდები prompt-ები წვანან.</p>
+
+  <h2>11 · ინტერვიუს სალაპარაკო პუნქტები</h2>
+  <ul>
+    <li><em>ჩარჩო:</em> „ორივე საიმედო async fanout-ია დროის სემანტიკით — ავაშენებ საერთო ხერხემალს, მერე დავაზუსტებ."</li>
+    <li><em>რიცხვის დახარჯვა:</em> „SMS-ის cap 200/წმ-ია, flash-პიკს კი 1.2k/წმ სჭირდება — ეს სხვაობაა მიზეზი, რომ SMS-ის რიგი ღრმაა, პრიორიტეტულ-ზოლიანი და push-ისგან იზოლირებული."</li>
+    <li><em>გულწრფელი კონტრაქტი:</em> „ვპირდები at-least-once-ს + idempotency-ს და დუბლიკატებს ინჟინერიით ვამცირებ; exactly-once Twilio-ს API-ზე დაპირება არაა, რომელსაც შევასრულებ."</li>
+    <li><em>Failure mode შეკითხვამდე:</em> „საშიში ის გაჭედილი leader-ია, რომელიც lease-ის ამოწურვის შემდეგ იღვიძებს — fencing token-ები მის დაგვიანებულ ჩანაწერებს აბრუნებს."</li>
+    <li><em>ოპერაციული დახურვა:</em> „Pager-მეტრიკები: მიწოდების p99 თითო კლასზე და scheduler fire-lag — და არა CPU."</li>
+  </ul>
+
+  <h2>12 · ლაბი + პროექტის ნაბიჯი</h2>
+  <div class="callout"><span class="label">პრაქტიკა (ქვიზამდე გააკეთე)</span>
+    <code>labs/lab-0023-scheduler/</code>-ში <code>python3 scheduler_lab.py</code> უშვებს scheduler
+    worker-ების სიმულირებულ ფლოტს delayed-job store-ის წინააღმდეგ: worker-ი სროლის შუაში კვდება,
+    მეორეს საათი დრიფტავს, lease-ები რბოლაში ეჯახებიან — და ხედავ დუბლირებულ სროლებს fencing-ის
+    <em>გარეშე</em>, მერე მათ გაქრობას fencing + იდემპოტენტური handler-ებით. ექსპერიმენტი 3
+    შეტყობინებებს 30%-ით flaky provider-ში ატარებს backoff + jitter-ითა და DLQ-ით.
+    ყოველ გაშვებამდე იწინასწარმეტყველე — README-ში E1–E4-ია.
+  </div>
+  <p><strong>პროექტის ნაბიჯი.</strong> ჩაწერე rep-დელტები (სხვაობა შენს 40-წუთიან დიზაინსა და ამ გაკვეთილს შორის) learning record-ად. მერე spine-პროექტის ჩანაწერებს დაამატე ერთი აბზაცი, რომელიც ამ გაკვეთილს inference-პლატფორმაზე გადაიტანს: რომელი კომპონენტია scheduler-ი (eval cron), რომელია არხის რიგები (judge fanout) და რომელი provider-cap-ი თამაშობს Twilio-ს როლს (model API-ის rate limit-ები).</p>
+
+  <h2>შეამოწმე შენი თავი</h2>
+  <div class="quiz" id="quiz"></div>
+
+  <h2>ძირითადი წყარო</h2>
+  <p>წაიკითხე AWS Builders' Library-ის <a href="https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/">"Timeouts, retries, and backoff with jitter"</a> — retry-მექანიკის კანონიკური ტექსტი, რომელზეც ამ გაკვეთილის ორივე ნახევარი დგას. თანამგზავრი: <a href="https://github.com/donnemartin/system-design-primer#asynchronism">Primer-ის asynchronism სექცია</a> fanout-ის ქვეშ მდებარე queue-and-worker პატერნებისთვის.</p>
+
+  <footer class="lesson-footer">
+    <p><strong>გაიჭედე ან გაინტერესებს?</strong> ჰკითხე მასწავლებელს (აგენტს) ნებისმიერი რამ — „როგორ გავაუქმო ან გადავიტანო job-ი, რომელიც უკვე broker-ის delay queue-შია?" შესანიშნავი დამატებითი კითხვაა.</p>
+    <nav class="lesson-nav">
+      <span>◀ <a href="0022-file-sync.ka.html">0022 · File Sync</a></span>
+      <span><a href="0024-web-crawler.ka.html">0024 · Web Crawler</a> ▶</span>
+    </nav>
+  </footer>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+renderQuiz(document.getElementById('quiz'), {
+  title: 'შეამოწმე შენი თავი',
+  questions: [
+    {
+      q: 'რატომ იზიარებს notification სისტემა და distributed scheduler-ი ერთ გაკვეთილს?',
+      options: [
+        'ორივე არის საიმედო async fanout დროის სემანტიკით',
+        'ორივე არის მარტივი stateless სინქრონული request-response სერვისი',
+        'ორივე არის read-heavy caching პრობლემა TTL სემანტიკით',
+      ],
+      answer: 0,
+      explain: 'Notification სისტემა სამუშაოს „ახლავე" აწვდის; scheduler-ი — T დროს. ორგანოები ერთია: მდგრადი მომლოდინე სამუშაო, ერთი ელემენტის მფლობელობა, at-least-once + idempotency, დამცავი სარქველი.',
+    },
+    {
+      q: 'რა არის ორივე სისტემის გულწრფელი მიწოდების კონტრაქტი ამ გაკვეთილში?',
+      options: [
+        'Exactly-once მიწოდება გარანტირებული თავად message broker-ის მიერ',
+        'At-least-once მიწოდება იდემპოტენტურ downstream handler-ებთან ერთად წყვილში',
+        'At-most-once მიწოდება რომ მომხმარებლებმა დუბლიკატები ვერასდროს დაინახონ',
+      ],
+      answer: 1,
+      explain: 'Exactly-once crash-ის ან მესამე მხარის API-ის გავლით დაუპირებელია. At-least-once + dedup გასაღებები + იდემპოტენტური handler-ები იძლევა exactly-once ეფექტს — ერთადერთ დაცვად პრეტენზიას.',
+    },
+    {
+      q: 'Notification-მილსადენში რომელი კომპონენტია მუდმივი bottleneck-ი?',
+      options: [
+        'Ingestion API რომელიც ამოწმებს და რიგში აყენებს მოთხოვნებს',
+        'Template სერვისი რომელიც აწყობს არხისთვის განკუთვნილ შეტყობინების ტექსტებს',
+        'გარე provider-ები რომლებსაც აქვთ rate cap-ები და outage-ები',
+      ],
+      answer: 2,
+      explain: 'Ingestion და templating stateless-ია და ჰორიზონტალურად სქეილდება. APNs, Twilio და email provider-ები საკონტრაქტო cap-ებს გახვევენ და საკუთარი განრიგით ეცემიან — რიგის ქვემოთ ყველაფერი ამის გარშემოა აგებული.',
+    },
+    {
+      q: 'რას ამატებს fencing token-ი, რასაც lease TTL მარტო ვერ იძლევა?',
+      options: [
+        'Downstream უარყოფა ჩანაწერებისა რომლებიც მოძველებული lease-ის მფლობელებისგან მოდის',
+        'ავტომატური lease-ის განახლება იმ worker-ებისთვის რომლებიც ნელა ასრულებენ',
+        'უფრო სწრაფი leader election როცა მიმდინარე მფლობელი კვდება',
+      ],
+      answer: 0,
+      explain: 'გაჭედილმა leader-მა შეიძლება lease-ის ამოწურვისა და მემკვიდრის მოსვლის შემდეგ გაიღვიძოს. Lease მის დაგვიანებულ ჩანაწერებს ვერ აჩერებს — მხოლოდ downstream საცავი, რომელიც ნანახ მაქსიმუმზე ძველ token-ებს უარყოფს.',
+    },
+    {
+      q: 'SMS provider-ი ოცი წუთით ითიშება. სისტემის სწორი პასუხი?',
+      options: [
+        'გადააგდო რიგში მდგომი შეტყობინებები რომ latency დაბალი დარჩეს',
+        'გაიმეორო ყველა შეტყობინება დაუყოვნებლივ სანამ provider-ი არ გამოჯანმრთელდება',
+        'დააბუფერო backpressure-ით და შემდეგ დაცალო provider-ის cap-ების ფარგლებში',
+      ],
+      answer: 2,
+      explain: 'Backpressure და არა ამნეზია: breaker იხსნება, არხის რიგი შთანთქავს, გამოჯანმრთელების შემდეგ worker-ები provider-ის cap-ის ტემპით ცლიან. ჩამოგდების კანდიდატი მხოლოდ ასაკგასული მარკეტინგის კლასია.',
+    },
+    {
+      q: 'რატომ არის retry jitter-ი მნიშვნელოვანი provider-ის მასობრივი ჩავარდნის შემდეგ?',
+      options: [
+        'ის ამოკლებს ყველა backoff-ს რომ მიწოდებები უფრო ადრე დასრულდეს',
+        'ის შლის სინქრონს retry-ებს შორის რომლებიც სხვაგვარად ერთად ჩამოვიდოდნენ',
+        'ის იძლევა retry-ების მკაცრი თანმიმდევრობის გარანტიას მთელი რიგის მასშტაბით',
+      ],
+      answer: 1,
+      explain: 'ერთ მომენტში ჩავარდნილი 10k შეტყობინება 10k retry-ს ერთსა და იმავე მოგვიანებულ მომენტზე გეგმავს — სინქრონული მეორე ტალღა. Jitter თითო backoff-ს თანაბრად ფანტავს და ტალღას წვიმად აქცევს.',
+    },
+  ],
+});
+</script>
+</body>
+</html>

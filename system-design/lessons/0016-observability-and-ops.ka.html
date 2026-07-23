@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="ka">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>გაკვეთილი 16 · Observability და Ops</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<div class="lesson">
+  <header class="lesson-header">
+    <p class="kicker">გაკვეთილი 0016 · ფაზა 2 — პროგრამული არქიტექტურა და საიმედოობა · <a href="0016-observability-and-ops.html">English version</a></p>
+    <h1>Observability და Ops</h1>
+    <p class="dek">ვერ გაასწორებ იმას, რასაც ვერ ხედავ. Logs, metrics და traces; SLO-ები და error budget-ები; და alerting, რომელიც ადამიანს მხოლოდ ადამიანის ღირს პრობლემაზე აღვიძებს.</p>
+  </header>
+
+  <div class="mission-tie">
+    <strong>მისიასთან კავშირი.</strong> Anthropic-ის ყველა დიზაინის ამოცანა ერთნაირად მთავრდება: <em>„საიდან იცი, რომ მუშაობს — და საიდან იცი, როცა აღარ მუშაობს?"</em> ვინც პასუხობს „დავამატოთ monitoring", ჩერდება; ვინც ასახელებს სამ SLI-ს, burn-rate page-ს და რას აკეთებს on-call ღამის 3 საათზე, ისე ჟღერს, თითქოს პეიჯერი უტარებია. ეს გაკვეთილი <a href="https://sre.google/sre-book/table-of-contents/">Google-ის SRE წიგნის</a> — ინდუსტრიის კანონიკური პასუხის — შეკუმშვაა, e-commerce checkout-ისა და payments API-ის მაგალითებზე.
+  </div>
+
+  <h2>1 · სამი სვეტი, გულახდილად</h2>
+  <p>სამი ტელემეტრიის სიგნალი, სამი სხვადასხვა კითხვა, სამი ძალიან განსხვავებული ქვითარი (<a href="https://sre.google/sre-book/monitoring-distributed-systems/">SRE წიგნი, თ. 6</a>, <a href="https://opentelemetry.io/docs/concepts/signals/">OpenTelemetry signals</a>):</p>
+  <table>
+    <tr><th>სიგნალი</th><th>რა არის</th><th>რა კითხვას პასუხობს</th><th>ღირებულების პროფილი</th></tr>
+    <tr><td><strong>Logs</strong></td><td>დისკრეტული მოვლენები, ნებისმიერი დეტალით</td><td>„ზუსტად რა დაემართა მოთხოვნა X-ს?"</td><td>იზრდება ტრაფიკზე × სიტყვიერებაზე — ძვირია</td></tr>
+    <tr><td><strong>Metrics</strong></td><td>წინასწარ აგრეგირებული რიცხვები დროში</td><td>„checkout ჯანმრთელია <em>ახლა</em>? საით მიდის?"</td><td>იზრდება <em>cardinality-ზე</em> (კარდინალობა — განსხვავებული label-კომბინაციები), არა ტრაფიკზე</td></tr>
+    <tr><td><strong>Traces</strong></td><td>ერთი მოთხოვნის მიზეზობრიობა სერვისებს შორის</td><td>„რომელმა hop-მა შეანელა <em>ეს</em> მოთხოვნა?"</td><td>იზრდება ტრაფიკზე — ამიტომ sampling</td></tr>
+  </table>
+  <p>Cardinality-ის ხაფანგი წინასწარ: მეტრიკის ღირებულება განსხვავებული label-კომბინაციების რაოდენობაა, რადგან თითოეული საკუთარი time series-ია. დაამატე <code>user_id</code> label და თითო მომხმარებელზე თითო series მოიჭრება — მილიონი მომხმარებელი მილიონი series-ია. წესი: label-ები <strong>შემოსაზღვრული</strong> განზომილებებისთვისაა (service, status, region); შემოუსაზღვრელი იდენტობა (user, order) logs-სა და traces-ს ეკუთვნის (<a href="https://prometheus.io/docs/practices/instrumentation/#do-not-overuse-labels">Prometheus: do not overuse labels</a>). ამ ბომბს ლაბში უსაფრთხოდ ააფეთქებ.</p>
+
+  <h2>2 · სტრუქტურირებული logging</h2>
+  <p>Log-ები ჯერ მანქანებისთვისაა, მერე ადამიანებისთვის — ანუ <strong>JSON და არა პროზა</strong>. სამი დისციპლინა (<a href="https://12factor.net/logs">12-Factor: logs</a>): <strong>correlation ID ყველგან</strong> — gateway ჭრის request ID-ს და ყველა hop მას ატარებს; ერთი grep თორმეტ სერვისში ერთი მოთხოვნის ისტორიას აღადგენს. <strong>დონეები გულახდილად</strong> — ERROR ნიშნავს „ადამიანმა უნდა ნახოს"; სადაც ყველაფერი ERROR-ია, ERROR დონე აღარ არსებობს. <strong>Sampling მოცულობისთვის</strong> — ყველა error log შეინახე, happy path დაასემპლე.</p>
+  <p><strong>ნამუშევარი არითმეტიკა.</strong> Checkout 1,000 RPS-ზე, ~2 KB log თითო მოთხოვნაზე = 2 MB/s = <strong>173 GB/დღეში ≈ 5.2 TB თვეში</strong>, დაუმუშავებელი. ინდექსი და 3× replication → ~15 TB; vendor-ის ingest ფასით (~$0.50/GB) — <strong>~$2,600/თვეში</strong>, სანამ რამეს გამოითხოვ. INFO-ს 1:10 sampling (ყველა WARN/ERROR რჩება) ქვითარს ~80%-ით ამცირებს. Logging პროდუქტის გადაწყვეტილებაა ერთეულის ფასით და არა უფასო გამონაბოლქვი.</p>
+
+  <h2>3 · მეტრიკები, რომლებსაც აზრი აქვთ: RED vs USE</h2>
+  <p>ორი checklist თითქმის ყველა dashboard-ს ფარავს: <strong>RED</strong> <em>სერვისებისთვის</em>, <strong>USE</strong> <em>რესურსებისთვის</em> (<a href="https://grafana.com/blog/2018/08/02/the-red-method-how-to-instrument-your-services/">Tom Wilkie: RED მეთოდი</a>, <a href="https://www.brendangregg.com/usemethod.html">Brendan Gregg: USE მეთოდი</a>):</p>
+  <table>
+    <tr><th></th><th>RED — თითო სერვისზე</th><th>USE — თითო რესურსზე</th></tr>
+    <tr><td><strong>ასოები</strong></td><td><strong>R</strong>ate, <strong>E</strong>rrors, <strong>D</strong>uration</td><td><strong>U</strong>tilization, <strong>S</strong>aturation, <strong>E</strong>rrors</td></tr>
+    <tr><td><strong>ეხება</strong></td><td>Gateway, orders, payments — ყველაფერს, რასაც მოთხოვნები აქვს</td><td>CPU, მეხსიერება, დისკი, connection pool-ები, რიგები, GPU-ები</td></tr>
+    <tr><td><strong>ეკითხება</strong></td><td>„მომხმარებლები სწორად და სწრაფად ემსახურებიან?"</td><td>„ეს კომპონენტი სავსეა, გადავსებული თუ მტყუნდება?"</td></tr>
+    <tr><td><strong>აუდიტორია</strong></td><td>On-call ღამის 3 საათზე — სიმპტომები</td><td>Capacity planning და დიაგნოზი — მიზეზები</td></tr>
+  </table>
+  <p><strong>პროცენტილები და არა საშუალო</strong> — 30 ms საშუალო checkout latency თავსებადია 2 წამიან p99-თან. აღრიცხე p50/p95/p99, და რაკი პროცენტილების საშუალო host-ებს შორის არ იანგარიშება, production სისტემები <strong>histogram-ებს</strong> წერენ — მთვლელები latency-ის bucket-ებად, რომლებიც სწორად აგრეგირდება (<a href="https://prometheus.io/docs/practices/histograms/">Prometheus: histograms</a>). Bucket-ის ერთი ზღვარი ზუსტად SLO-ის ზღურბლზე დადე (მაგ. 400 ms), რომ „SLO-ში ჩამჯდარი მოთხოვნების წილი" ზუსტი იყოს.</p>
+
+  <h2>4 · განაწილებული tracing</h2>
+  <p><strong>Trace</strong> ერთი მოთხოვნის ხეა: ყოველი hop წერს <strong>span-ს</strong> (სახელი, დასაწყისი, ხანგრძლივობა, მშობელი) და მთელი ხე ერთ trace ID-ს იზიარებს. კონტექსტი <code>traceparent</code> HTTP header-ით მოგზაურობს — <a href="https://www.w3.org/TR/trace-context/">W3C Trace Context</a> სტანდარტი. დიზაინი Google-ის <a href="https://research.google/pubs/dapper-a-large-scale-distributed-systems-tracing-infrastructure/">Dapper-ის ნაშრომიდან</a> მოდის; <a href="https://opentelemetry.io/docs/concepts/signals/traces/">OpenTelemetry</a> მისი ღია სტანდარტიზაციაა.</p>
+  <p>რას პოულობს მხოლოდ trace: მეტრიკები გეტყვიან, checkout-ის p99 900 ms-მდე ავიდაო; მხოლოდ trace აჩვენებს 12-სერვისიან fan-out-ში, რომ იმ მილიწამებიდან 835 payments hop-შია. <strong>Sampling:</strong> <strong>head</strong> (გადაწყვეტილება trace-ის დასაწყისში — იაფი, მაგრამ ბრმა) vs <strong>tail</strong> (გადაწყვეტილება შედეგის გაგების შემდეგ — ყველა error და ნელი trace რჩება, დანარჩენის 1%) (<a href="https://opentelemetry.io/docs/concepts/sampling/">OpenTelemetry: sampling</a>). კლასიკური ჩავარდნა: 1:1000 head sampling-მა ის ერთი trace გადააგდო, რომელიც ინციდენტზე გჭირდებოდა — ლაბის E4 ამას შეგაგრძნობინებს.</p>
+
+  <h2>5 · SLI, SLO, error budget</h2>
+  <p>SRE წიგნის ცენტრალური მექანიზმი (<a href="https://sre.google/sre-book/service-level-objectives/">Service Level Objectives</a>): <strong>SLI</strong> — ინდიკატორი, საუკეთესოდ როგორც შეფარდება: კარგი მოვლენები / ყველა მოვლენა (checkout-ის availability SLI = არა-5xx / ყველა პასუხი). <strong>SLO</strong> — სამიზნე ამ შეფარდებაზე ფანჯარაში: „მოთხოვნების 99.9% წარმატებულია 30 დღეში". <strong>Error budget</strong> (შეცდომების ბიუჯეტი) — დანამატი: 1 − SLO; საიმედოობა ხდება რესურსი, რომელსაც შეგნებულად <em>ხარჯავ</em> deploy-ებსა და რისკზე (<a href="https://sre.google/sre-book/embracing-risk/">Embracing Risk</a>).</p>
+  <p><strong>ნამუშევარი მათემატიკა.</strong> 30-დღიანი თვე 43,200 წუთია. 99.9% SLO ტოვებს 0.1%-ს → <strong>43.2 წუთი</strong> სრული წყვეტა თვეში. 99.95%-ზე ბიუჯეტი ნახევრდება (21.6 წთ); 99.99%-ზე 4.3 წუთია — ერთ ცუდ deploy-ზე ნაკლები, ამიტომ ყოველი დამატებითი ცხრიანი ღირებულებას ამრავლებს. მოთხოვნებში: 201,600 მოთხოვნა/თვეში → ~202 ცუდი მოთხოვნის ბიუჯეტი — ლაბში ნახავ, როგორ ხარჯავს ერთი 11-წუთიანი error burst ამის 72%-ს.</p>
+  <p><strong>ბიუჯეტის პოლიტიკა</strong> რიცხვს კბილებს აძლევს: სანამ ბიუჯეტი რჩება — სწრაფად ushiპ-ავ; როცა დაიხარჯა — ფიჩერების გამოშვება იყინება და გუნდი საიმედოობაზე გადადის. და ტერმინები: <strong>SLO</strong> შიდა სამიზნეა, რომელიც ინჟინრებს აღვიძებს; <strong>SLA</strong> გარე კონტრაქტია, რომელიც იურისტებს აღვიძებს — SLO SLA-ზე მკაცრი უნდა იყოს.</p>
+
+  <h2>6 · Alerting-ის ფილოსოფია: page burn rate-ზე</h2>
+  <p>წესი პირველი (<a href="https://sre.google/sre-book/monitoring-distributed-systems/">SRE წიგნი, თ. 6</a>): <strong>page სიმპტომებზე და არა მიზეზებზე</strong>. „CPU 95%-ზეა" მიზეზია — ticket ხდება. „მომხმარებლები checkout-ზე ისე სწრაფად მტყუნდებიან, რომ SLO საფრთხეშია" სიმპტომია — ის page-ს იმსახურებს. ყოველი page <em>ქმედითი</em> უნდა იყოს: თუ პასუხისმგებლის პირველი ფიქრია „მერე რა?", alert-ი ადამიანებს page-ების იგნორირებას ასწავლის.</p>
+  <p>თანამედროვე მექანიზმი <strong>burn rate-ია</strong> (წვის ტემპი): რამდენად სწრაფად ხარჯავ ბიუჯეტს, მდგრადი ტემპის ჯერადად. <strong>ნამუშევარი მაგალითი</strong> (<a href="https://sre.google/workbook/alerting-on-slos/">SRE workbook: Alerting on SLOs</a>): 99.9% SLO-ზე ერთი საათი 1.44% შეცდომების ტემპით არის 14.4× burn და ხარჯავს 14.4/720 = <strong>თვიური ბიუჯეტის 2%-ს ერთ საათში</strong> — page-ის ღირსია. რეკომენდებული ფორმაა <strong>multi-window multi-burn-rate</strong>: page, როცა burn ≥ 14.4× <em>ორივეზე</em> — 1 სთ და 5 წთ ფანჯრებზე (მოკლე ფანჯარა alert-ს სწრაფად „აქრობს"); ticket, როცა burn ≥ 6× 6 სთ + 30 წთ-ზე. შეადარე ნაივურ ალტერნატივას — „page, თუ წუთში error rate &gt; 2%" — ის თვითგანკურნებად წუთიან blip-ებზეც აღვიძებს და latency-ის ინციდენტს <em>საერთოდ ვერ ხედავს</em>, რადგან ნედლ შეცდომებს უყურებს და არა SLI-ს. ლაბი ზუსტად ამ შეჯიბრს ითვლის.</p>
+
+  <h2>7 · ინციდენტზე რეაგირება</h2>
+  <p>როცა page ვარდება, პროცესი გმირობას ჯობნის (<a href="https://sre.google/sre-book/managing-incidents/">Managing Incidents</a>). ერთი ადამიანი ხდება <strong>Incident Commander</strong> — კოორდინირებს და არ აკრეფს; ცალკე ხელები აკეთებენ <strong>Ops-ს</strong> (mitigation — შერბილება) და <strong>Comms-ს</strong> (განახლებები ფიქსირებული კადენციით, მაგ. ყოველ 30 წუთში, რომ არავინ აწყვეტინოს მუშაობა კითხვით „რამე ხდება?").</p>
+  <table>
+    <tr><th>Sev</th><th>მაგალითი (payments API)</th><th>რეაგირება</th></tr>
+    <tr><td><strong>SEV-1</strong></td><td>Checkout წევს / ფული არასწორად მოძრაობს</td><td>Page ახლავე; IC; comms-კადენცია; საჭიროებისას ყველა</td></tr>
+    <tr><td><strong>SEV-2</strong></td><td>დეგრადაცია: მომატებული უარყოფები, ერთი რეგიონი ნელა</td><td>Page on-call-ს; შეარბილე; შეიძლება ესკალაცია</td></tr>
+    <tr><td><strong>SEV-3</strong></td><td>ბიუჯეტის ნელი გაჟონვა, მომხმარებელს ჯერ არ სტკივა</td><td>Ticket; სამუშაო საათებში</td></tr>
+  </table>
+  <p><strong>MTTR-ის ანატომია:</strong> აღდგენის დრო = აღმოჩენა → დიაგნოზი → შერბილება. Observability პირველ ორს კუმშავს (burn-rate alert-ი აღმოაჩენს; RED dashboard + trace დიაგნოზს სვამს); 0015-ის პატერნები მესამეს (rollback, failover, feature flag). ჯერ შეარბილე, root cause მერე. შემდეგ — <strong>blameless postmortem</strong> (უბრალდებო ანალიზი; <a href="https://sre.google/sre-book/postmortem-culture/">Postmortem Culture</a>): ქრონოლოგია, მიზეზები როგორც სისტემის ხარვეზები და არა ადამიანების ბრალი, და — გადამწყვეტია — <strong>action item-ები მფლობელებითა და ვადებით</strong>. Postmortem action item-ების გარეშე აღსარებაა და არა გაუმჯობესება.</p>
+
+  <h2>8 · Ops-ის სიმწიფე: მოსაწყენი ზეძალები</h2>
+  <ul>
+    <li><strong>Runbook-ები.</strong> ყოველი page ბმულია დოკუმენტზე: რას ნიშნავს, პირველი სამი შემოწმება, შერბილების ნაბიჯები. იწერება მშვიდობისას, სრულდება პანიკისას.</li>
+    <li><strong>ერთი dashboard თითო სერვისზე</strong>, RED ზედა რიგში. On-call სწორ გრაფიკამდე ორი დაწკაპუნებით უნდა მივიდეს.</li>
+    <li><strong>Deploy-ის observability.</strong> ინციდენტების უმეტესობას deploy-ები იწვევენ: canary-ს RED მეტრიკები baseline-ს <em>შეადარე</em> დაწინაურებამდე; ავტომატური rollback, თუ დელტა ზღვარს გადააჭარბებს.</li>
+    <li><strong>Toil-ის ბიუჯეტი.</strong> ხელით, განმეორებადი ops-სამუშაო შეზღუდე (~50% Google-ის პრაქტიკაში) და დანარჩენი მის ინჟინერიულ მოშორებაზე დახარჯე (<a href="https://sre.google/sre-book/eliminating-toil/">Eliminating Toil</a>).</li>
+    <li><strong>Error-budget-ით მართული release gating.</strong> CI/CD ბიუჯეტს კითხულობს: ბიუჯეტი ჯანმრთელია → deploy-ები მიდის; დახარჯულია → მხოლოდ საიმედოობის fix-ები.</li>
+  </ul>
+
+  <h2>9 · Failure mode-ები, რომლებიც ინტერვიუებს წყვეტენ</h2>
+  <ul>
+    <li><strong>Alert fatigue (განგაშის დაღლილობა).</strong> კვირაში ათობით უქმედო page on-call-ს გადაფურცვლას ასწავლის — და ნამდვილი SEV-1 მათთან ერთად გადაიფურცლება. გამოსწორება: წაშალე ან ჩამოაქვეითე ყველა alert, რომელსაც ქმედება არ მოჰყოლია; ზომე page-ები ცვლაზე.</li>
+    <li><strong>Dashboard-ების გაფანტულობა.</strong> ორმოცი dashboard, რომელსაც არავინ ხსნის, უარყოფითი ღირებულებაა — ინციდენტისას არჩევანის პარალიჩი. ერთი სერვისზე, RED ზევით.</li>
+    <li><strong>შემოუსაზღვრელი cardinality.</strong> §1-ის <code>user_id</code> label-ი — ქვითარი მოდის ექვსნიშნა ინვოისად ან OOM-ად. Label-ების lint code review-ში.</li>
+    <li><strong>Tracing უსარგებლობამდე დასემპლილი.</strong> 1:1000 head sampling მთელი წელი ფულს ზოგავს, მერე ის ერთი trace, რომელიც ავარიას ხსნიდა, გადაგდებული აღმოჩნდება. გამოსწორება: tail-based sampling — ყველა error და ნელი trace რჩება.</li>
+    <li><strong>Postmortem-ები შედეგის გარეშე.</strong> ლამაზი დოკუმენტი, ნული შესრულებული action item, იგივე ავარია მომდევნო კვარტალში. Action item-ები sprint board-ზე, მფლობელებით.</li>
+    <li><strong>Monitoring-ს არავინ აკვირდება.</strong> Alert-ების მილსადენი ჩუმად კვდება და სიჩუმე ჯანმრთელობად იკითხება. გამოსწორება: <strong>dead-man's switch</strong> — alert, რომელიც განზრახ <em>მუდმივად</em> ვარდება (Alertmanager-ის Watchdog); ქვედა დინების სისტემა მაშინ აღვიძებს, როცა ის <em>შეწყდება</em> (<a href="https://prometheus.io/docs/alerting/latest/overview/">Prometheus alerting</a>).</li>
+  </ul>
+
+  <h2>10 · ერთი AI შტრიხი, და ისევ საფუძვლები</h2>
+  <p>Model serving-ი SLI-ების მენიუს ცვლის და არა მექანიზმს. Inference პლატფორმისთვის: <strong>TTFT p99</strong> (დრო პირველ token-მდე), <strong>tokens/s თითო მოთხოვნაზე</strong> და <strong>queue depth თითო tenant-ზე</strong> — RED-მხარის SLI-ებია; <strong>GPU utilization და KV-cache-ის შევსება USE-ის ტერიტორიაა</strong> — dashboard-ები და capacity, არა page-ები. ერთი დისციპლინა: <em>eval-ხარისხის მეტრიკები ops-მეტრიკები არ არის</em> — „კარგია თუ არა მოდელის პასუხები" offline eval-მილსადენებით იზომება საკუთარი კადენციით; შერევა ღამის 3 საათზე benchmark-რეგრესიაზე გაღვიძებას ნიშნავს (<a href="https://opentelemetry.io/docs/specs/semconv/gen-ai/">OpenTelemetry GenAI conventions</a>). იგივე SLO მათემატიკა, ახალი ინდიკატორების სახელები.</p>
+
+  <h2>11 · ინტერვიუს სალაპარაკო პუნქტები</h2>
+  <ol>
+    <li><strong>დაიწყე SLI-ებით, კითხვის გარეშე:</strong> „წარმატების კრიტერიუმები: availability SLI = არა-5xx/ყველა, latency SLI = 400ms-ში/ყველა, ორივე 99.9% 30 დღეზე."</li>
+    <li><strong>თქვი ბიუჯეტის რიცხვი:</strong> „99.9% თვეში 43.2 წუთის ბიუჯეტია — ეს ზღუდავს, რამდენად აგრესიულია ჩვენი deploy-ები."</li>
+    <li><strong>დაასახელე სამი სიგნალი საქმეებით</strong> (§1): მეტრიკები აღმოჩენისთვის, trace-ები ლოკალიზაციისთვის, log-ები მოთხოვნის ისტორიისთვის — correlation ID-ით შეერთებული.</li>
+    <li><strong>RED სერვისზე, USE რესურსზე</strong> (§3), histogram-ები და არა საშუალოები.</li>
+    <li><strong>Page burn rate-ზე და არა ზღურბლებზე</strong> (§6): „14.4× 1სთ+5წთ-ზე — page; 6× 6სთ-ზე — ticket; CPU-ის alert-ები ticket-ებია, არასდროს page-ები."</li>
+    <li><strong>დახატე ინციდენტის გზა</strong> (§7): page → IC → შერბილება → blameless postmortem მფლობელიანი action item-ებით.</li>
+    <li><strong>თავად შესთავაზე failure mode</strong> (§9): „ჩემი დიზაინის რისკი cardinality-ია — label-ებს code review-ში გავალინტავ." პირველად წამოწევა strong-hire სიგნალია.</li>
+  </ol>
+
+  <h2>12 · ლაბი — გამოიძახე საკუთარი თავი, სწორად</h2>
+  <div class="callout"><span class="label">პრაქტიკა (ქვიზამდე გააკეთე)</span>
+    ყველაფერი ზემოთქმული ახლა შემოწმებადია: <code>labs/lab-0016-observability-lab/</code>-ში
+    <code>python3 observability_lab.py</code> უშვებს შეკუმშულ „თვეს" gateway → orders → payments
+    ჯაჭვში ორი ჩადგმული fault-ით და სამ ექსპერიმენტს — RED ცხრილები, რომლებიც ორივე fault-ს
+    რიცხვებში ამხელენ; SLO მათემატიკა, სადაც ერთი 6-წუთიანი ფანჯარა თვიური latency-ბიუჯეტის
+    ~78%-ს ჭამს; და burn-rate paging, რომელიც ნაივურ ზღურბლს ცრუ page-ებსა და დაფარვაში ჯობნის —
+    პლუს span-ხის რეკონსტრუქცია, რომელიც დამნაშავე hop-ს ასახელებს. შემდეგ README-ს E1–E4:
+    <em>იწინასწარმეტყველე, შეცვალე კონფიგი, გაუშვი თავიდან, შეადარე.</em> მცდარი პროგნოზები დავალების შედეგია.
+  </div>
+
+  <h2>13 · პროექტის ნაბიჯი</h2>
+  <p>გადაწყვეტილების დროა <strong>LLM inference gateway</strong>-სთვის: განსაზღვრე მისი სამი SLI + SLO და ერთი burn-rate page, და ორი წინადადებით დაიცავი. დასაცავი მაგალითი: <em>availability (არა-5xx/ყველა, 99.9%/30დ), TTFT p99 &lt; 1.5 წმ (როგორც კარგი მოვლენების შეფარდება, 99%/30დ) და per-tenant queue depth როგორც saturation-სიგნალი dashboard-ზე — ერთი page-ით: burn ≥ 14.4× 1სთ+5წთ-ზე availability SLI-ზე, დანარჩენი ticket-ია. ორი წინადადება: მომხმარებლები მტყუნებებსა და პირველი token-ის დაგვიანებას გრძნობენ, ამიტომ ეს ორი აღვიძებს; queue depth მათ წინასწარმეტყველებს, მაგრამ არასრულყოფილად, ამიტომ capacity-ს აწვდის ინფორმაციას და არავის აღვიძებს.</em> დაწერე შენი სამი SLI + ერთი page და მოიტანე შემდეგ სესიაზე გასარჩევად.</p>
+
+  <h2>შეამოწმე შენი თავი</h2>
+  <div class="quiz" id="quiz"></div>
+
+  <h2>ძირითადი წყარო</h2>
+  <p>წაიკითხე <strong>Google-ის SRE წიგნის</strong> მე-4 და მე-6 თავები — <a href="https://sre.google/sre-book/service-level-objectives/">Service Level Objectives</a> და <a href="https://sre.google/sre-book/monitoring-distributed-systems/">Monitoring Distributed Systems</a> — შემდეგ <strong>SRE workbook-ის</strong> <a href="https://sre.google/workbook/alerting-on-slos/">Alerting on SLOs</a> თავი multi-window multi-burn-rate-ის სრული გამოყვანისთვის. ყველა უფასოა sre.google-ზე და ერთად ზუსტად ის ლექსიკაა, რომლითაც ინტერვიუერები აფასებენ. Tracing-ის სიღრმისთვის — <a href="https://research.google/pubs/dapper-a-large-scale-distributed-systems-tracing-infrastructure/">Dapper-ის ნაშრომი</a>.</p>
+
+  <footer class="lesson-footer">
+    <p><strong>გაიჭედე ან გაინტერესებს?</strong> ჰკითხე მასწავლებელს (აგენტს) ნებისმიერი რამ — „რატომ სჭირდება burn-rate page-ს ორი ფანჯარა ერთის ნაცვლად?" შესანიშნავი დამატებითი კითხვაა.</p>
+    <nav class="lesson-nav">
+      <span><a href="0015-reliability-patterns.ka.html">◀ წინა: 0015 · საიმედოობის პატერნები</a></span>
+      <span><a href="0017-security-and-multitenancy.ka.html">შემდეგი: 0017 · უსაფრთხოება და Multi-Tenancy ▶</a></span>
+    </nav>
+  </footer>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+renderQuiz(document.getElementById('quiz'), {
+  title: 'შეამოწმე შენი თავი',
+  questions: [
+    {
+      q: 'Checkout-ისას 12-სერვისიან fan-out-ში ერთი მოთხოვნა ნელია და უნდა იპოვო, რომელი hop-ია დამნაშავე. რომელი სიგნალი პასუხობს ამას პირდაპირ?',
+      options: [
+        'Metrics, რადგან აგრეგატები ყოველი სერვისის latency-ს აჩვენებენ',
+        'Traces, რადგან span-ები თითო hop-ის მიზეზობრიობას აჩვენებენ',
+        'Logs, რადგან ჩანაწერები ყოველ მოვლენას სადღაც ინახავენ',
+      ],
+      answer: 1,
+      explain: 'Trace ზუსტად ეს არის: ერთი მოთხოვნის span-ხე თითო hop-ის ხანგრძლივობებით — დამნაშავე hop ერთი შეხედვით ჩანს. მეტრიკები ინდივიდუალურ მოთხოვნას აგრეგაციაში კარგავენ; log-ებში ფაქტები დევს, მაგრამ თორმეტი სერვისის ჩანაწერების correlation ID-ით შეერთება შენ გიწევს.',
+    },
+    {
+      q: 'გუნდმა checkout-ის მოთხოვნების მთვლელს user_id label დაამატა. რა არის ოპერაციული შედეგი?',
+      options: [
+        'Metric series-ები cardinality-ით ფეთქდებიან; შენახვის ხარჯები იბერება',
+        'მეტრიკები უფრო ზუსტი ხდება და dashboard-ები უმჯობესდება',
+        'არაფერი იცვლება, რადგან label-ები Prometheus-ში უფასოა',
+      ],
+      answer: 0,
+      explain: 'ყოველი განსხვავებული label-კომბინაცია საკუთარი time series-ია, ამიტომ შემოუსაზღვრელი label, როგორიც user_id-ია, თითო მომხმარებელზე თითო series-ს ჭრის — cardinality-ის აფეთქება. მეტრიკების ფასი cardinality-ზე იზრდება და არა ტრაფიკზე. იდენტობის დონის დეტალი logs-სა და traces-ს ეკუთვნის.',
+    },
+    {
+      q: 'Payments API 99.9% თვიურ availability SLO-ს ჰპირდება. რამდენ downtime-ს უშვებს მისი error budget?',
+      options: [
+        'დაახლოებით 4.32 წუთი სრული წყვეტა თვეში',
+        'დაახლოებით 432.0 წუთი სრული წყვეტა თვეში',
+        'დაახლოებით 43.2 წუთი სრული წყვეტა თვეში',
+      ],
+      answer: 2,
+      explain: '30-დღიანი თვე 43,200 წუთია; ბიუჯეტი 1 − 0.999 = ამის 0.1%-ია, ანუ 43.2 წუთი. ყოველი დამატებითი ცხრიანი ბიუჯეტს ათზე ყოფს — 99.99% მხოლოდ 4.3 წუთს ტოვებს, ამიტომაც ყოველი ცხრიანი ინჟინერიის ღირებულებას ამრავლებს.',
+    },
+    {
+      q: 'SLO-ის burn-rate alert-ი 14.4×-ზე ვარდება ერთ საათზე. რატომ არის ეს ჯერადი სტანდარტული სწრაფი page-ის ზღურბლი?',
+      options: [
+        'ეს ტემპი ყოველთვის ნიშნავს, რომ მთელი ბიუჯეტი გათავდა',
+        'ეს ტემპი თვიური ბიუჯეტის ორ პროცენტს საათში ხარჯავს',
+        'ეს ტემპი სერვისების დაშვებულ მაქსიმალურ შეცდომების პროცენტს ემთხვევა',
+      ],
+      answer: 1,
+      explain: 'ერთი საათი 30-დღიანი ფანჯრის 1/720-ია, ამიტომ 14.4×-ზე წვა ერთ საათში თვიური ბიუჯეტის 14.4/720 = 2%-ს ხარჯავს — საკმარისად სწრაფი, რომ ადამიანი ახლავე ჩაერიოს, რაც ზუსტად page-ის მნიშვნელობაა (SRE workbook, Alerting on SLOs).',
+    },
+    {
+      q: 'Orders-ის host-ზე CPU 95%-ზეა, მაგრამ მომხმარებლები ნორმალურ checkout latency-ს ხედავენ და შეცდომები არ არის. უნდა გააღვიძოს ამან ადამიანი ღამის 3 საათზე?',
+      options: [
+        'კი, saturation მიზეზია, რომელიც ადამიანის გაღვიძებად ღირს',
+        'კი, ზღურბლის ყოველი გადაჭარბება დაუყოვნებელ page-ს იმსახურებს',
+        'არა, page სიმპტომებზე; capacity-ის კვლევა ticket-ია',
+      ],
+      answer: 2,
+      explain: 'Page სიმპტომებზე (SLO-ს მუქარა მომხმარებლის ტკივილით) და არა მიზეზებზე. მაღალი CPU ჯანმრთელი SLI-ებით capacity-ის კითხვაა სამუშაო საათებისთვის — ticket. მიზეზებზე page-ები alert fatigue-ს ბადებს, დაღლილი on-call კი საბოლოოდ იმ page-საც უგულებელყოფს, რომელიც მართლა მნიშვნელოვანია.',
+    },
+    {
+      q: 'Checkout-ის ავარიის შემდეგ რა ხდის postmortem-ს რეალურად ღირებულს Google-ის SRE პრაქტიკით?',
+      options: [
+        'უბრალდებო ანალიზი პლუს მიდევნებული action item-ები მფლობელებით',
+        'იმ ინჟინრის დადგენა, ვინც ავარია ამ კვარტალში გამოიწვია',
+        'დეტალური ქრონოლოგიის დოკუმენტი, შესაბამისობისთვის თაროზე შემოდებული',
+      ],
+      answer: 0,
+      explain: 'უბრალდებობა დეტალების ნაკადს ინარჩუნებს — ვისაც სასჯელის ეშინია, ფაქტებს მალავს — ხოლო მფლობელიანი, ვადიანი action item-ები ინციდენტს სისტემის გაუმჯობესებად აქცევენ. ქრონოლოგია შედეგის გარეშე აღსარებაა, ბრალდება კი გარანტიაა, რომ შემდეგი postmortem გამონაგონი იქნება.',
+    },
+  ],
+});
+</script>
+</body>
+</html>

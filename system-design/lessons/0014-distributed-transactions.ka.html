@@ -1,0 +1,197 @@
+<!DOCTYPE html>
+<html lang="ka">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>გაკვეთილი 14 · განაწილებული ტრანზაქციები და კოორდინაცია</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<div class="lesson">
+  <header class="lesson-header">
+    <p class="kicker">გაკვეთილი 0014 · ფაზა 2 — პროგრამული არქიტექტურა და საიმედოობა · <a href="0014-distributed-transactions.html">English version</a></p>
+    <h1>განაწილებული ტრანზაქციები და კოორდინაცია</h1>
+    <p class="dek">ფული სერვისებს შორის გლობალური ტრანზაქციის გარეშე მოძრაობს — saga-ები, outbox და რატომ წააგო 2PC-მ; პლუს consensus, leader election და fencing token, რომელიც გიხსნის.</p>
+  </header>
+
+  <div class="mission-tie">
+    <strong>მისიასთან კავშირი.</strong> Anthropic-ის დიზაინის ამოცანებს უყვართ ნაკადები, სადაც ერთი მოქმედება რამდენიმე სერვისს ეხება — <em>„დააპროექტე checkout"</em> — რადგან დამატებითი კითხვა სკალპელია: <em>„გადახდა შესრულდა, მაგრამ inventory-ის დაჯავშნა ჩავარდა; ახლა რა?"</em> ვინც ამბობს „ტრანზაქციაში გავახვიოთ", ჩერდება; ვინც ასახელებს saga-ს, სვამს outbox-ს და ხსნის, რატომ სჭირდება lock-ს fencing token, აგრძელებს. საფუძველი: DDIA, თავები 8–9 (<a href="https://dataintensive.net/">Kleppmann, <em>Designing Data-Intensive Applications</em></a>; <a href="https://www.tryexponent.com/blog/anthropic-system-design-interview">Exponent-ის Anthropic გზამკვლევი</a>).
+  </div>
+
+  <h2>1 · პრობლემა: ერთი მოქმედება, N სერვისი, საერთო ACID არ არსებობს</h2>
+  <p>Checkout ოთხ სერვისს ეხება: <strong>order</strong>, <strong>payment</strong>, <strong>inventory</strong>, <strong>shipping</strong>. თითოეულს თავისი database აქვს ლოკალური ACID ტრანზაქციებით — და არცერთი ტრანზაქცია მათ არ აერთიანებს. ბიზნეს-მოქმედება მომხმარებლის თავში ატომურია („ვიყიდე"), ფიზიკურად კი ოთხი დამოუკიდებელი commit-ია, რომელთაგან თითოეული ცალკე შეიძლება ჩავარდეს.</p>
+  <p>DDIA-ს მე-8 თავი partial failure-ის (ნაწილობრივი ჩავარდნის) ტაქსონომიას იძლევა: დაშორებული გამოძახება შეიძლება ჩავარდეს სამუშაოს შესრულებამდე, შესრულების <em>შემდეგ</em> პასუხამდე, ან ქსელი უბრალოდ ნელია — და გამომძახებლისთვის ეს სამი <strong>განურჩეველია</strong>. Timeout არ ნიშნავს „არ მოხდა". განაწილებულ სისტემებში კითხვაზე „გავიდა ჩემი გადახდა?" ნაგულისხმევი პასუხია <strong>„იქნებ"</strong> — ამ გაკვეთილის ყველა pattern მანქანაა, რომელიც „იქნებ"-ს ქმედით მდგომარეობად აქცევს.</p>
+  <p><strong>ნამუშევარი მაგალითი — არითმეტიკა, რომელიც ინტერვიუერს სურს.</strong> ოთხი თანმიმდევრული გამოძახება, თითო 99.9% წარმატებით: 0.999<sup>4</sup> ≈ 99.6%. ანუ checkout-ების ~0.4% <em>შუა გზაზე</em> ჩერდება. დღეში 200,000 შეკვეთაზე ეს <strong>~800 ნახევრად დასრულებული შეკვეთაა დღეში</strong> — გადახდილი-მაგრამ-დაუჯავშნავი. კითხვა არასდროსაა „მოხდება თუ არა" — კითხვაა „ვინ ალაგებს და რამდენად სწრაფად".</p>
+
+  <h2>2 · Two-phase commit — და რატომ წააგო</h2>
+  <p>კლასიკური პასუხია <strong>2PC</strong> (DDIA, თავი 9). <strong>Coordinator</strong> ორ რაუნდს ატარებს: <em>prepare</em> — ყველა მონაწილე მყარად ჰპირდება „შემიძლია commit და lock-ებს გადაწყვეტილებამდე ვიჭერ"; შემდეგ <em>commit/abort</em> — coordinator-ი გადაწყვეტილებას საკუთარ ლოგში წერს და ყველას ატყობინებს.</p>
+  <p>და სწორედ ეს წერტილია ნაკლი: თუ coordinator-ი prepare-ის <em>შემდეგ</em> და ვერდიქტამდე მოკვდა, ყველა მონაწილე <strong>in doubt</strong> (გაურკვევლობაში) რჩება — commit-ს ვერ აკეთებს და abort-საც ვერ, ამიტომ ზის და <strong>row lock-ებს იჭერს</strong>, ბლოკავს ყველას, სანამ coordinator-ი დაბრუნდება. 2PC <em>მბლოკავი</em> პროტოკოლია: ერთი კვანძის ჩავარდნას ყველას მიუწვდომლობად აქცევს — ზუსტად ის coupling-ი (შეჭიდულობა), რომლის თავიდან ასაცილებლადაც microservice-ები არსებობს. ის ცოცხლობს სისტემების <em>შიგნით</em>: <a href="https://en.wikipedia.org/wiki/X/Open_XA">XA</a> ძველ Java სამყაროში და databases-ის შიდა cross-partition commit-ებში.</p>
+
+  <h2>3 · Saga: ტრანზაქცია, აწყობილი ლოკალური ნაჭრებისგან</h2>
+  <p>ჩამნაცვლებელია <strong>saga</strong> (<a href="https://www.cs.cornell.edu/andru/cs711/2002fa/reading/sagas.pdf">Garcia-Molina &amp; Salem, 1987</a>; <a href="https://microservices.io/patterns/data/saga.html">microservices.io</a>): <em>ლოკალური</em> ტრანზაქციების მიმდევრობა T1…Tn, სადაც თითოეულ Ti-ს აქვს <strong>compensating action</strong> (მაკომპენსირებელი მოქმედება) Ci, რომელიც მას სემანტიკურად აუქმებს. თუ T3 ჩავარდა — გაუშვი C2, C1 უკუმიმდევრობით.</p>
+  <p><strong>Checkout როგორც saga:</strong> შეკვეთის შექმნა → გადახდა → inventory-ის დაჯავშნა → shipment. თუ დაჯავშნა გადახდის შემდეგ ჩავარდა: <em>refund</em> (თანხის დაბრუნება), <em>შეკვეთის გაუქმება</em>. ყურადღება სიტყვაზე <em>სემანტიკური</em>: refund rollback-ი არაა — გადახდა მოხდა, ამონაწერზე ორივე ხაზი ჩანს. ზოგ ნაბიჯს undo საერთოდ არ აქვს: დადასტურების email-ს <strong>ვერ გააუგზავნინებ უკან</strong> — შესწორებას აგზავნი. Compensation-ები სრულფასოვანი ბიზნეს-ოპერაციებია და არა database-ის მაგია.</p>
+  <table>
+    <tr><th></th><th>Choreography (ქორეოგრაფია)</th><th>Orchestration (ორკესტრაცია)</th></tr>
+    <tr><td>ვინ წყვეტს შემდეგ ნაბიჯს</td><td>არავინ — სერვისები წინა სერვისის event-ებზე რეაგირებენ</td><td>ცენტრალური orchestrator აგზავნის ბრძანებებს</td></tr>
+    <tr><td>Coupling</td><td>დაბალი — სერვისებმა მხოლოდ event-ების სახელები იციან</td><td>Orchestrator-მა მთელი ნაკადი იცის</td></tr>
+    <tr><td>ნაკადის ხილვადობა</td><td>N subscription-ზეა გაფანტული — trace-ებიდან აღადგენ</td><td>ერთი წაკითხვადი state machine</td></tr>
+    <tr><td>ჩავარდნის დამუშავება</td><td>ყველა სერვისმა ყველა ჩავარდნას თავად უნდა უსმინოს</td><td>Orchestrator-ი compensation-ებს რიგით უშვებს</td></tr>
+    <tr><td>საუკეთესო ადგილი</td><td>2–3 ნაბიჯი, მარტივი ნაკადები</td><td>4+ ნაბიჯი, ფულთან დაკავშირებული — <em>checkout აქ ეკუთვნის</em></td></tr>
+  </table>
+
+  <h2>4 · Outbox pattern: dual write-ის მოკვლა</h2>
+  <p>Saga-ები მალავენ ხაფანგს: სერვისმა უნდა <em>ჩაწეროს DB-ში</em> და <em>გამოაქვეყნოს event-ი</em> — ორი სისტემა, საერთო ტრანზაქცია არ არსებობს. Commit-მერე-publish კარგავს event-ებს, როცა შუაში კვდები (შეკვეთა არსებობს, არავის სმენია); publish-მერე-commit იგონებს event-ებს შეკვეთებზე, რომლებიც არასდროს ჩაწერილა. ეს <strong>dual-write პრობლემაა</strong> და მკვდარ პროცესს ვერანაირი retry ვერ უშველის.</p>
+  <p>გამოსავალია <strong>transactional outbox</strong> (<a href="https://microservices.io/patterns/data/transactional-outbox.html">microservices.io</a>): ჩაწერე event-ი <code>outbox</code> ცხრილში <em>იმავე ლოკალურ ტრანზაქციაში</em>, რომელშიც შეკვეთის row — ერთი commit, ატომურად ორივე ან არცერთი. ცალკე <strong>relay</strong> აწვდის: ან ცხრილს ამოწმებს, ან, უკეთესია, DB-ის ცვლილებების ნაკადს CDC-ით უსმენს — კანონიკური იმპლემენტაციაა <a href="https://debezium.io/blog/2019/02/19/reliable-microservices-data-exchange-with-the-outbox-pattern/">Debezium-ის outbox router</a>. Relay <em>at-least-once</em>-ია (შეიძლება publish-ის შემდეგ, მონიშვნამდე მოკვდეს და თავიდან გამოაქვეყნოს) — ამიტომ consumer-ები <strong>idempotent</strong>-ები უნდა იყვნენ, event id-ზე dedup-ით. At-least-once + idempotent consumer = <strong>effectively-once</strong> — „exactly-once"-ის გულახდილი ვერსია.</p>
+  <table>
+    <tr><th>მიდგომა</th><th>დაკარგული event-ები</th><th>დუბლიკატები</th><th>ფასი</th></tr>
+    <tr><td>Dual write (commit, მერე publish)</td><td><strong>კი</strong> — crash შუალედში</td><td>შესაძლებელია</td><td>არაფერი — ეგაა ხაფანგი</td></tr>
+    <tr><td>2PC DB-სა და broker-ს შორის</td><td>არა</td><td>არა</td><td>მბლოკავი, XA broker-ია საჭირო, availability coupling</td></tr>
+    <tr><td>Outbox + relay/CDC</td><td><strong>არა</strong> — event-ი commit-ს მიჰყვება</td><td>კი — dedup consumer-თან</td><td>ზედმეტი ცხრილი, relay-ის ოპერირება, relay lag</td></tr>
+  </table>
+  <p><strong>ციფრები ლაბიდან.</strong> 2% crash-ის ალბათობამ commit-სა და publish-ს შორის 10,000 შეკვეთაზე ჩუმად დაკარგა <strong>201 event-ი</strong> — 201 გადახდილი შეკვეთა, რომელზეც downstream-ს არასდროს სმენია. Outbox-ის ვერსიამ დაკარგა <strong>0</strong> და აწარმოა 100 დუბლიკატი, რომლებიც consumer-ის dedup-მა ზუსტად 10,000 გამოყენებულ event-ად აქცია. ეს გაცვლა — დუბლიკატები, რომელთა dedup შეიძლება, დანაკარგების ნაცვლად, რომელთა შემჩნევაც კი არ შეიძლება — მთელი pattern-ია ერთ წინადადებაში.</p>
+
+  <h2>5 · დაკარგული isolation: saga-ები serializable არ არიან</h2>
+  <p>ACID-მა isolation მოგცა; saga-ები მას თმობენ. თითოეული Ti მაშინვე commit-დება, ამიტომ სხვა მოთხოვნები <strong>შუალედურ მდგომარეობებს ხედავენ</strong>: შეკვეთა არსებობს, მაგრამ გადახდილი არაა; ორი პარალელური saga ერთსა და იმავე მარაგს კითხულობს და ორივე ჯავშნის (lost update); მოგვიანებით კომპენსირებული saga ცოტა ხნით ნამდვილად ჩანდა (dirty read). კონტრზომები აპლიკაციის დონეზეა (<a href="https://microservices.io/patterns/data/saga.html">microservices.io-ს countermeasures</a>):</p>
+  <ul>
+    <li><strong>Semantic lock:</strong> მიმდინარე row-ებს მდგომარეობა მიაწერე — <code>order: PENDING_PAYMENT</code>, მარაგი: <code>RESERVED</code> და არა <code>SOLD</code> — და სხვებმა pending-ს „ხელი არ ახლონ".</li>
+    <li><strong>კომუტაციური ოპერაციები:</strong> ნაბიჯები ისე დააპროექტე, რომ რიგს მნიშვნელობა არ ჰქონდეს — <code>reserve(3)</code> და <code>reserve(2)</code> დეკრემენტებად კომუტირებენ; „set stock = 7" — არა.</li>
+    <li><strong>ხელახალი წაკითხვა / ვერსიის შემოწმება:</strong> გადამწყვეტ ნაბიჯამდე ხელახლა შეამოწმე ადრე წაკითხული დაშვება (ფასი, მარაგი).</li>
+  </ul>
+
+  <h2>6 · Consensus, სამუშაო სიმაღლიდან</h2>
+  <p>ზოგ ფაქტზე მანქანები უნდა შეთანხმდნენ, რომლებიც შეიძლება მოკვდნენ: ვინაა ლიდერი, რა არის კონფიგი, ვინ იჭერს lock-ს. ეს <strong>consensus</strong>-ია, და quorum-ები უმრავლესობებია არითმეტიკის გამო: <strong>ერთი კლასტერის ნებისმიერი ორი უმრავლესობა ერთმანეთს კვეთს</strong> მინიმუმ ერთ კვანძში, ამიტომ ორი ურთიერთსაწინააღმდეგო გადაწყვეტილება ერთად ვერ დამტკიცდება (DDIA, თავი 9).</p>
+  <p><strong>Raft ხუთ წინადადებაში</strong> (<a href="https://raft.github.io/">raft.github.io</a>, <a href="https://raft.github.io/raft.pdf">Ongaro &amp; Ousterhout</a>): დრო დანომრილ <em>term</em>-ებად იყოფა, თითოეულში მაქსიმუმ ერთი ლიდერია. კვანძი, რომელიც heartbeat-ებს ვეღარ ისმენს, კანდიდატი ხდება და არჩევნებს ხმების უმრავლესობით იგებს. ყველა ჩაწერა ლიდერზე გადის, რომელიც ლოგში ამატებს და follower-ებზე ახდენს რეპლიკაციას. ჩანაწერი <em>committed</em>-ია, როცა უმრავლესობას აქვს — ეს <em>commit index</em>-ია — და committed ჩანაწერები ლიდერის ცვლილებას გადაურჩებიან. არჩევნები ისეა შეზღუდული, რომ მხოლოდ განახლებული ლოგის მქონე კანდიდატი იგებს.</p>
+  <p><strong>რაში იყენებ რეალურად:</strong> control plane — კონფიგურაცია, membership, lock-ები, leader election — <a href="https://etcd.io/docs/">etcd</a>-თი (Raft) ან <a href="https://zookeeper.apache.org/doc/current/recipes.html">ZooKeeper</a>-ით (ZAB). შეკვეთების მონაცემებს consensus-ში <em>არ</em> ატარებ: უმრავლესობის round-trip ყოველ ჩაწერაზე data path-ისთვის არასწორი ფასია.</p>
+
+  <h2>7 · განაწილებული lock-ები და fencing token</h2>
+  <p>„ამ შეკვეთას ერთდროულად მხოლოდ ერთი worker ამუშავებს" — ამიტომ Redis-ში ან etcd-ში lock-ს <strong>TTL</strong>-ით იღებ. ახლა ცნობილი ჩავარდნა (<a href="https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html">Kleppmann, „How to do distributed locking"</a>): worker A lock-ს იღებს, მერე ჭედავს — GC pause, page fault — TTL-ზე მეტ ხანს. Lock ვადადება; worker B იღებს და წერს. მერე A იღვიძებს, <em>ჯერ კიდევ სჯერა, რომ lock უჭირავს</em>, და ისიც წერს. ორი მწერალი, გაფუჭებული რესურსი — და TTL-ის ვერანაირი აწყობა ამას ვერ უშველის, რადგან გაჩერებულმა პროცესმა ვერ იცის, რომ გაჩერებულია.</p>
+  <p>Kleppmann-ის გამოსავალი: lock-სერვისი გასცემს <strong>fencing token</strong>-ს — რიცხვს, რომელიც ყოველ გაცემაზე მონოტონურად იზრდება (A-მ მიიღო 33, B-მ 34) — და <em>რესურსი</em> იმახსოვრებს უმაღლეს ნანახ token-ს და <strong>უარყოფს ჩაწერებს უფრო მცირეთი</strong>. A-ს დაგვიანებული ჩაწერა 33 &lt; 34 → უარყოფილია. უსაფრთხოების შემოწმება კლიენტიდან (რომელიც ნებისმიერად შეიძლება დაყოვნდეს) რესურსზე გადადის. ლაბში: 10 წმ TTL და საშუალოდ 4 წმ pause-ებით ცდების ~8%-მა lease-ს გადააჭარბა — 799 გაფუჭებული ჩაწერა fencing-ის გარეშე, <strong>0 მასთან ერთად</strong>.</p>
+  <p><strong>Redlock, ერთი აბზაცი.</strong> Redis-ი მრავალკვანძიან ალგორითმს <a href="https://redis.io/docs/latest/develop/use/patterns/distributed-locks/">Redlock</a>-ს აღწერს. Kleppmann-ი ამტკიცებდა, რომ ის დროის დაშვებებზეა დამოკიდებული, რომლებსაც რეალური სისტემები არღვევენ, და fencing token-ებს არ გასცემს — ანუ ვარგისია <em>efficiency</em> lock-ებისთვის (ორმაგი სამუშაოს თავიდან აცილება), მაგრამ არა <em>correctness</em> lock-ებისთვის; <a href="http://antirez.com/news/101">antirez-ი არ დაეთანხმა</a>. ინტერვიუზე უსაფრთხო პოზიცია: თქვი, რომელი გჭირდება — თუ მოძველებულ მფლობელს მონაცემების გაფუჭება შეუძლია, fencing რესურსთან გჭირდება, lock-სერვისის მიუხედავად.</p>
+
+  <h2>8 · Leader election: lease-ები, split-brain და თავმდაბლობა</h2>
+  <p>Leader election იგივე lock-ია, განახლებადი: კანდიდატი etcd/ZooKeeper-ში <strong>lease</strong>-ს (იჯარას) იღებს და მუდმივად უნდა აახლოს; თუ მოკვდა, lease ქრება და სხვა იკავებს — ასე ირჩევენ Kubernetes-ის controller-ები (<a href="https://kubernetes.io/docs/concepts/architecture/leases/">K8s Leases</a>), Google-ის <a href="https://research.google/pubs/the-chubby-lock-service-for-loosely-coupled-distributed-systems/">Chubby</a>-ის დიზაინით. საფრთხე <strong>split-brain</strong>-ია: ძველი ლიდერის ბოლო heartbeat-სა და lease-ის ვადის გასვლას შორის ძველი ჯერ კიდევ მოქმედებს, ახალი კი უკვე იწყებს — ორი ლიდერი, ცოტა ხნით, lease-ზე დაფუძნებული ლიდერობის <em>ნორმალური</em> ჩავარდნაა.</p>
+  <p>ამიტომ გულახდილი პოზიცია: <strong>ლიდერობა ოპტიმიზაციაა და არა კორექტულობის გარანტია.</strong> ლიდერი გამოიყენე ორმაგი სამუშაოს თავიდან ასაცილებლად, მაგრამ ყოველი გარეგანი ეფექტი §7-ის წესით დაიცავი — fencing token-ები, idempotent ჩაწერები. თუ შენი დიზაინი მხოლოდ მაშინაა სწორი, როცა ზუსტად ერთი ლიდერია ყოველთვის — შენი დიზაინი არასწორია.</p>
+
+  <h2>9 · Failure mode-ები, რომლებიც ინტერვიუებს წყვეტენ</h2>
+  <ul>
+    <li><strong>Compensation, რომელიც თავად ვარდება.</strong> Refund-ის გამოძახებაც timeout-დება — saga <em>გაჭედილია</em> ნახევრად გაუქმებული. Compensation-ები idempotent-ები უნდა იყვნენ და წარმატებამდე მეორდებოდნენ; რაც მაინც არ გამოდის, <strong>ადამიანების რიგში</strong> ხვდება (ლაბში: 10%-იანმა compensation-ის ჩავარდნამ retry-ის გარეშე 10,000-დან 159 saga გაჭედა, retry-ით — 0). ეს რიგი სისტემის ნაწილია — დააპროექტე.</li>
+    <li><strong>Outbox relay-ის lag.</strong> Event-ები არ იკარგება, მაგრამ გვიან მოდის. Relay lag replication lag-ივით დააკვირდი — ეს შენი სიახლის ზღვარია.</li>
+    <li><strong>გაორმაგებული compensation-ები.</strong> At-least-once არხი იმეორებს refund-ს, რომლის ack დაიკარგა → ორმაგი refund, თუ idempotency key არ აქვს.</li>
+    <li><strong>ორი ლიდერი lease-ის ვადის გასვლისას.</strong> გაჩერებული ძველი ლიდერი იმავე batch job-ს უშვებს, რასაც ახალი; ორივე წერს. Fencing token მოძველებულს აბრუნებს (§7); მის გარეშე — ჩუმად გაორმაგებული ეფექტები.</li>
+    <li><strong>2PC coordinator-ის crash.</strong> Checkout-ში 2PC რომ გქონოდა, coordinator-ის crash მონაწილეებს in-doubt ტოვებს lock-ებით ხელში — checkout გლობალურად იყინება. ეს არის კონკრეტული ამბავი კითხვაზე „რატომ არა 2PC".</li>
+  </ul>
+
+  <h2>10 · ერთი AI შტრიხი, მერე ისევ საფუძვლები</h2>
+  <p>LLM inference პლატფორმას ზუსტად ორი ეს ხელსაწყო სჭირდება. <strong>Batch-job scheduler</strong>-ი რამდენიმე რეპლიკად eskarbis etcd-ის lease-ით ირჩევს ლიდერს — და რადგან ლიდერობა მხოლოდ ოპტიმიზაციაა (§8), job-ის მინიჭებებს fencing token-ები აქვთ, რომ გაჩერებული ექს-ლიდერის მოძველებული მინიჭება უარიყოს. ხოლო <strong>usage billing</strong> შენიღბული dual-write-ია: gateway წერს request-ის ლოგს და billing event-ი უნდა გაუშვას — outbox ცხრილი gateway-ის DB-ში, CDC relay, idempotent billing consumer, რადგან „იქნებ დავარიცხეთ" ბიზნესისთვის მდგომარეობა არაა. იგივე pattern-ები, GPU-ს ფასის ფსონები. სულ ესაა შტრიხი; ინტერვიუ §1–§9-ს აფასებს.</p>
+
+  <h2>11 · ინტერვიუს სალაპარაკო პუნქტები</h2>
+  <ol>
+    <li><strong>დაიწყე partial-failure-ის მათემატიკით:</strong> „ოთხი სერვისი თითო 99.9%-ით ნიშნავს, რომ checkout-ების ~0.4% ნახევრდება — ასობით დღეში — ამიტომ საკითხავია ვინ ალაგებს და არა მოხდება თუ არა."</li>
+    <li><strong>2PC სწორი მიზეზით უარყავი:</strong> არა „ნელია", არამედ „ბლოკავს — ჩავარდნილი coordinator-ი მონაწილეებს in-doubt ტოვებს lock-ებით ხელში."</li>
+    <li><strong>დაასახელე saga და მისი სტილი:</strong> „ორკესტრირებული saga, compensation-ები უკუმიმდევრობით; orchestration, რადგან ნაკადი ფულს ეხება და ერთი queryable state machine მინდა."</li>
+    <li><strong>Outbox შეუკითხავად დასვი:</strong> „ყოველი ნაბიჯის event ლოკალურ commit-ს outbox-ით მიჰყვება; relay at-least-once-ია, consumer-ები event id-ზე dedup-ენ — effectively-once."</li>
+    <li><strong>Isolation-ის დათმობა აღიარე:</strong> „შეკვეთები PENDING_PAYMENT-ში სხედან, სანამ saga მუშაობს; downstream pending-ს გაყიდულად არ თვლის."</li>
+    <li><strong>Lock-ებზე fencing-ი მათზე ადრე თქვი:</strong> „TTL lock-ები pause-ებზე ვარდებიან, ამიტომ საცავი მონოტონურ fencing token-ს ამოწმებს — რესურსი და არა კლიენტია დაცვის ბოლო ხაზი."</li>
+    <li><strong>Consensus სწორად შემოფარგლე:</strong> „etcd leader election-ისა და კონფიგისთვის — მხოლოდ control plane; consensus შეკვეთების data path-ზე არასდროს ზის."</li>
+  </ol>
+
+  <h2>12 · ლაბი — დაკარგე ფული, მერე შეწყვიტე კარგვა</h2>
+  <div class="callout"><span class="label">პრაქტიკა (ქვიზამდე გააკეთე)</span>
+    ყველაფერი ზემოთქმული ახლა შემოწმებადია: <code>labs/lab-0014-sagas-and-fencing/</code>-ში
+    <code>python3 saga_lab.py</code> უშვებს სამ ექსპერიმენტს — გულუბრყვილო dual write კარგავს
+    10,000-დან 201 გადახდილ შეკვეთას, outbox კი ნულს (dedup დუბლიკატებს effectively-once-ად
+    აქცევს); checkout saga crash-ის ინექციით ყოველ ნაბიჯზე (უყურე, როგორ ჩნდება გაჭედილი
+    saga-ების რიგი, როცა compensation-ებიც ვარდებიან, და როგორ ქრება retry-ით); და TTL lock,
+    რომელსაც GC pause-ები აფუჭებენ, სანამ fencing token არ გააჩერებს. შემდეგ README-ს E1–E4:
+    <em>იწინასწარმეტყველე, შეცვალე კონფიგი, გაუშვი თავიდან, შეადარე.</em> მცდარი პროგნოზები
+    დავალების შედეგია — მოიტანე შემდეგ სესიაზე.
+  </div>
+
+  <h2>13 · პროექტის ნაბიჯი</h2>
+  <p>დააპროექტე <strong>„provision fine-tune job"</strong> ნაკადი LLM პლატფორმისთვის, როგორც checkout-ის ფორმის saga: ჩამოწერე ნაბიჯები, თითოეულის compensation და სად ზის outbox — და ორი წინადადებით დაიცავი. დასაცავი მაგალითი: <em>ორკესტრირებული saga — job-ის ჩანაწერის შექმნა → GPU კვოტის დაჯავშნა → billing hold-ის დარიცხვა → scheduler-ის რიგში ჩაყენება, უკუმიმდევრობით release-quota / void-hold / mark-job-failed compensation-ებით, და ყოველი ნაბიჯის event ამ სერვისის DB-ის outbox-ში იწერება. Orchestration, რადგან ნაკადი ფულსა და კვოტას ეხება, ხოლო outbox — რადგან job, რომელიც არსებობს, მაგრამ billing-მა არ იცის, ზუსტად ის dual-write ხვრელია, რომელიც ლაბმა დააფასა.</em> დაწერე შენი ორი წინადადება და მოიტანე შემდეგ სესიაზე გასარჩევად.</p>
+
+  <h2>შეამოწმე შენი თავი</h2>
+  <div class="quiz" id="quiz"></div>
+
+  <h2>ძირითადი წყარო</h2>
+  <p>წაიკითხე <strong>DDIA, თავი 9 — „Consistency and Consensus"</strong> (<a href="https://dataintensive.net/">dataintensive.net</a>): 2PC-ის დაშლა, in-doubt ტრანზაქციები და consensus-ის გამოყვანა — ზუსტად ის სიღრმეა, რომელსაც ინტერვიუ აჯილდოებს; მე-8 თავი გასახურებელია. შემდეგ ბოლომდე წაიკითხე <a href="https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html">Kleppmann-ის „How to do distributed locking"</a> — fencing token-ის არგუმენტი განაწილებული სისტემების ყველაზე ციტირებადი ესეა. საცნობაროდ გქონდეს <a href="https://microservices.io/patterns/data/saga.html">microservices.io-ს saga</a> და <a href="https://microservices.io/patterns/data/transactional-outbox.html">transactional outbox</a> გვერდები, და გადაათვალიერე <a href="https://raft.github.io/raft.pdf">Raft-ის ნაშრომის</a> §5.</p>
+
+  <footer class="lesson-footer">
+    <p><strong>გაიჭედე ან გაინტერესებს?</strong> ჰკითხე მასწავლებელს (აგენტს) ნებისმიერი რამ — „რატომ ვერ შეამოწმებს კლიენტი უბრალოდ საათს ჩაწერამდე, fencing token-ის ნაცვლად?" შესანიშნავი დამატებითი კითხვაა.</p>
+    <nav class="lesson-nav">
+      <span><a href="0013-streams-and-events.ka.html">◀ წინა: 0013 · Streams და Events</a></span>
+      <span><a href="0015-reliability-patterns.ka.html">შემდეგი: 0015 · Reliability Patterns ▶</a></span>
+    </nav>
+  </footer>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+renderQuiz(document.getElementById('quiz'), {
+  title: 'შეამოწმე შენი თავი',
+  questions: [
+    {
+      q: 'Order სერვისი database-ის row-ს commit-ავს და OrderCreated-ის გამოქვეყნებამდე კვდება. რომელი დიზაინი შლის ამ დაკარგული event-ის ფანჯარას მთლიანად?',
+      options: [
+        'Event-ის გამოქვეყნება row-ის commit-მდე ყოველთვის წინასწარ',
+        'Event-ის ჩაწერა transactional outbox ცხრილში commit-თან ერთად',
+        'Publish-ის გამეორება, სანამ broker-ი საბოლოოდ არ დაადასტურებს',
+      ],
+      answer: 1,
+      explain: 'Outbox იმავე ლოკალურ ტრანზაქციაში წერს event-ს, რომელშიც შეკვეთის row — ერთი commit ორივეს აჩენს ან ვერცერთს, relay კი შემდეგ აქვეყნებს. ჯერ გამოქვეყნება უბრალოდ აბრუნებს ჩავარდნას (event შეკვეთაზე, რომელიც არ ჩაწერილა), მკვდარი პროცესი კი ვერაფერს იმეორებს.',
+    },
+    {
+      q: 'რატომ ერიდებიან microservice გუნდები two-phase commit-ს checkout-ისთვის, რომელიც order, payment და inventory სერვისებს მოიცავს?',
+      options: [
+        'ჩავარდნილი coordinator-ი მონაწილეებს დაბლოკილს ტოვებს lock-ებით ხელში',
+        'Prepare შეტყობინებები თანამედროვე broker-ებისთვის ზედმეტად დიდი ხდება',
+        'რელაციურ database-ებს prepare ფაზაში მონაწილეობა საერთოდ არ შეუძლიათ',
+      ],
+      answer: 0,
+      explain: '2PC მბლოკავი პროტოკოლია: prepare-გავლილი მონაწილეები coordinator-ის დაბრუნებამდე in-doubt არიან და მთელი ეს დრო lock-ებს იჭერენ — ერთი კვანძის crash ყველას მიუწვდომლობა ხდება. შეტყობინების ზომა აქ არაფერ შუაშია, რელაციური DB-ები კი XA-თი prepare-ს მშვენივრად აკეთებენ.',
+    },
+    {
+      q: 'Checkout saga-ში გადახდა წარმატებით დაირიცხა, მაგრამ inventory-ის დაჯავშნის ნაბიჯი ჩავარდა. რას აკეთებს orchestrator-ი შემდეგ?',
+      options: [
+        'იმეორებს inventory-ის დაჯავშნას უსასრულოდ წარმატებამდე ყოველთვის',
+        'შეკვეთას გადახდილად ნიშნავს და მაინც აგზავნის ამანათს',
+        'უშვებს compensation-ებს უკუმიმდევრობით, დაწყებული გადახდის refund-ით',
+      ],
+      answer: 2,
+      explain: 'Saga დასრულებულ ნაბიჯებს მაკომპენსირებელი მოქმედებებით უკუმიმდევრობით აუქმებს: refund გადახდაზე, მერე შეკვეთის გაუქმება. წინ გამეორება მხოლოდ დროებით ჩავარდნებზეა ვალიდური; ბიზნეს-უარი (მარაგი აღარაა) undo გზას ითხოვს, დაუჯავშნავი მარაგის გაგზავნა კი ინვარიანტს პირდაპირ არღვევს.',
+    },
+    {
+      q: 'Lock-ის მფლობელი lease-ის TTL-ზე მეტ ხანს ჭედავს, იღვიძებს და საზიარო საცავში წერს. რა უარყოფს ამ მოძველებულ ჩაწერას?',
+      options: [
+        'რესურსი, რომელიც მონოტონურად მზარდ fencing token-ებს ადარებს',
+        'Lock-სერვისი, რომელიც ვადაგასულ lease-ს ისევ თავიდან უხანგრძლივებს',
+        'კლიენტი, რომელიც ჩაწერამდე საკუთარ საათს ხელახლა ამოწმებს',
+      ],
+      answer: 0,
+      explain: 'Kleppmann-ის არგუმენტი: გაჩერებულმა კლიენტმა ვერ იცის, რომ გაჩერებულია, ამიტომ შემოწმება რესურსთან უნდა ცხოვრობდეს — ის უმაღლეს ნანახ token-ს იმახსოვრებს და უფრო მცირეს უარყოფს. Lease უკვე გავიდა და სხვას გადაეცა, კლიენტის საათის შემოწმებას კი თავად შეიძლება pause მოჰყვეს.',
+    },
+    {
+      q: 'Saga-ები ყოველ ლოკალურ ნაბიჯს მაშინვე commit-ავენ ერთი გლობალური ტრანზაქციის ნაცვლად. რა ანომალიას ხედავენ სხვა მოთხოვნები ნაბიჯებს შორის?',
+      options: [
+        'Serializable snapshot-ებს, რომლებიც ყველა დაუსრულებელ ნაბიჯს ფარავენ',
+        'Dirty read-ებს ნახევრად დასრულებული შუალედური saga მდგომარეობისა',
+        'Phantom lock-ებს, სამუდამოდ დაჭერილს სერვისების საზღვრებს შორის',
+      ],
+      answer: 1,
+      explain: 'ყოველი ლოკალური commit მაშინვე ხილულია, ამიტომ სხვა მოთხოვნებს შეუძლიათ წაიკითხონ მდგომარეობა, რომელსაც მოგვიანებით compensation გააუქმებს — saga-სებრი dirty read, პლუს lost update-ები პარალელურ saga-ებს შორის. კონტრზომებია semantic lock-ები (PENDING მდგომარეობები), კომუტაციური ოპერაციები და ვერსიის გადამოწმება.',
+    },
+    {
+      q: 'რატომ ითხოვს Raft-ი უმრავლესობის quorum-ს, სანამ ჩანაწერი committed-ად ჩაითვლება?',
+      options: [
+        'უმრავლესობები ლოგის ჩანაწერებს ლიდერებზე გაცილებით სწრაფად ამრავლებენ',
+        'კენტი ზომის კლასტერები საათებს დრეიფისგან საიმედოდ იცავენ',
+        'ნებისმიერი ორი უმრავლესობა იკვეთება, ამიტომ commit-ები გადარჩებიან',
+      ],
+      answer: 2,
+      explain: 'ერთი კლასტერის ორი უმრავლესობა ყოველთვის მინიმუმ ერთ კვანძს იზიარებს, ამიტომ committed ჩანაწერს ნებისმიერი მომავალი არჩევნების გამარჯვებული აუცილებლად ნახავს, ორი ურთიერთსაწინააღმდეგო გადაწყვეტილება კი ერთად ვერ დამტკიცდება. სისწრაფე აქ საქმის არსი არაა, quorum-ებს კი საათებთან კავშირი არ აქვთ.',
+    },
+  ],
+});
+</script>
+</body>
+</html>

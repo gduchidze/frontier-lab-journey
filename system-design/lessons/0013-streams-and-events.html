@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lesson 13 · Streams &amp; Events</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<div class="lesson">
+  <header class="lesson-header">
+    <p class="kicker">Lesson 0013 · Phase 2 — Software Architecture &amp; Reliability · <a href="0013-streams-and-events.ka.html">ქართული ვერსია</a></p>
+    <h1>Streams &amp; Events</h1>
+    <p class="dek">The log as system-of-record — Kafka's model, event-driven architecture, event sourcing/CQRS, and what "exactly-once" really means when a payment email must go out once and only once.</p>
+  </header>
+
+  <div class="mission-tie">
+    <strong>Mission tie.</strong> Every Anthropic-scale design prompt eventually sprouts an arrow labeled "events" — <em>"how do downstream services learn an order shipped?"</em>, <em>"how do you meter usage for billing?"</em> — and the follow-ups are always the same: <em>"what ordering do you actually get?"</em> and <em>"what happens when a consumer crashes mid-batch?"</em> Candidates who say "put it on Kafka" stall; candidates who name the partition key, the delivery semantics, and the idempotency plan keep going. The backbone here is <a href="https://dataintensive.net/">DDIA</a> chapter 11 plus Jay Kreps' <a href="https://engineering.linkedin.com/distributed-systems/log-what-every-software-engineer-should-know-about-real-time-datas-unifying">"The Log"</a> — the essay that explains why LinkedIn built Kafka at all.
+  </div>
+
+  <h2>1 · Message queue vs event log</h2>
+  <p>Classic message brokers (RabbitMQ, SQS) treat a message as a <em>task</em>: the broker hands it to one consumer, the consumer acks, the broker <strong>deletes it</strong> (<a href="https://www.rabbitmq.com/docs/confirms">RabbitMQ: acknowledgements</a>). Kafka treats a message as a <em>fact</em>: an immutable record appended to a <strong>retained log</strong>; consumers just remember how far they've read (an offset), and reading destroys nothing (<a href="https://kafka.apache.org/documentation/#design">Kafka design docs</a>).</p>
+  <p>That one difference — delete-on-ack vs retain-and-track — changes everything downstream. With a retained log you can: attach a <em>second</em> consumer (analytics) to the same order stream without touching the first (fulfillment); <strong>replay</strong> last week's events through a fixed bug; rewind a broken consumer to before its bad deploy; and bootstrap a brand-new service from history. Kreps' insight in <a href="https://engineering.linkedin.com/distributed-systems/log-what-every-software-engineer-should-know-about-real-time-datas-unifying">"The Log"</a> was that LinkedIn's dozens of point-to-point pipelines (activity events → warehouse, → search index, → recommendations…) were all secretly the same thing — log shipping — and one durable, ordered, replayable log could replace the O(N²) mess of custom integrations. <a href="https://dataintensive.net/">DDIA ch11</a> makes the same move formally: a stream is a log; consumers are just cursors.</p>
+  <p>Rule of thumb for interviews: queue when work should happen <em>once, soon, by whoever's free</em> (resize this image); log when a fact has <em>multiple audiences over time</em> (an order was placed — fulfillment, email, fraud, analytics all care, some of them next year).</p>
+
+  <h2>2 · Kafka's model, precisely</h2>
+  <p>Four nouns, and the whole system falls out of them (<a href="https://kafka.apache.org/documentation/#design">kafka.apache.org design</a>):</p>
+  <table>
+    <tr><th>Concept</th><th>What it is</th><th>What it buys you</th></tr>
+    <tr><td><strong>Topic</strong></td><td>A named category of events (<code>orders</code>, <code>clicks</code>)</td><td>Namespacing; per-topic retention and schema</td></tr>
+    <tr><td><strong>Partition</strong></td><td>An append-only, totally-ordered log; a topic is P of them</td><td><em>The</em> unit of ordering AND of parallelism</td></tr>
+    <tr><td><strong>Offset</strong></td><td>A consumer's position in one partition, stored by the consumer group</td><td>Cheap resume, rewind, replay — no per-message broker state</td></tr>
+    <tr><td><strong>Consumer group</strong></td><td>A set of consumers sharing work; each partition is owned by exactly one member</td><td>Horizontal scaling with per-partition ordering intact</td></tr>
+  </table>
+  <p>The partition is where ordering and parallelism trade off: events <em>within</em> one partition are totally ordered; events <em>across</em> partitions are not ordered at all. Consumers scale by claiming partitions — and when a consumer joins or dies, the group <strong>rebalances</strong>, reassigning partition ownership. So the maximum useful consumer count in a group equals the partition count: consumer #9 on an 8-partition topic owns nothing and does nothing (the lab shows exactly this).</p>
+  <p><strong>Worked example — the arithmetic interviewers want to hear.</strong> A checkout clickstream produces 200,000 events/s at ~1 KB each = 200 MB/s. A partition comfortably sustains ~10 MB/s of writes, so the <em>broker</em> side needs ≥ 20 partitions. But your consumers enrich each event and write to a store at ~2,500 events/s each, so the <em>consumer</em> side needs 200,000 / 2,500 = 80 consumers — and since consumers ≤ partitions, you need ≥ 80 partitions. The consumer side, not the broker side, usually sets the partition count. Provision ~96 for headroom, and say out loud that repartitioning later reshuffles which key lands where — which is why you overprovision now.</p>
+
+  <h2>3 · The partition key decides what "ordered" means</h2>
+  <p>The producer picks a partition by hashing a <strong>key</strong>: all events with the same key land in the same partition, in send order. So Kafka's real ordering guarantee is <em>per key</em>, and choosing the key is choosing your ordering contract:</p>
+  <ul>
+    <li><strong><code>order_id</code>:</strong> every event of one order (created → paid → shipped) is ordered — exactly what an order pipeline needs. Different orders interleave freely, which is fine.</li>
+    <li><strong><code>user_id</code>:</strong> one user's actions are ordered (needed for sessionization, fraud rules) — but a bot or a celebrity account becomes a <strong>hot key</strong>, and its whole partition becomes the group's slowest lane. Same celebrity problem as sharded databases and hot cache keys — third appearance in this course, same fix instincts.</li>
+    <li><strong>Random / no key:</strong> perfectly even partitions, maximum throughput, zero ordering. Fine for independent facts (page views for counting); disastrous for anything stateful.</li>
+  </ul>
+  <p>In the lab, zipf(1.1) keys make the hottest key carry <strong>15.9%</strong> of all traffic, pinning one partition to 23% of events — 1.87× its fair share — and that partition alone caps the whole consumer group's finish time. Say the key <em>and</em> the skew story together: "keyed by <code>order_id</code>; order IDs are uniform so no hot partition" is a complete sentence; "keyed by <code>user_id</code>" without a skew plan is a trap you set for yourself.</p>
+
+  <h2>4 · Delivery semantics: where duplicates actually come from</h2>
+  <table>
+    <tr><th>Guarantee</th><th>Mechanism</th><th>Failure cost</th><th>Use when</th></tr>
+    <tr><td><strong>At-most-once</strong></td><td>Commit offset <em>before</em> processing</td><td>Crash mid-batch → events silently lost</td><td>Metrics, telemetry — losing a few is fine</td></tr>
+    <tr><td><strong>At-least-once</strong></td><td>Commit offset <em>after</em> processing</td><td>Crash before commit → batch redelivered, processed twice</td><td>Default for anything that matters + idempotent consumer</td></tr>
+    <tr><td><strong>Exactly-once</strong></td><td>Idempotent producer + transactions (Kafka-internal), or at-least-once + dedup</td><td>Complexity; covers Kafka→Kafka, <em>not</em> external side effects</td><td>Stream processing pipelines (Kafka Streams)</td></tr>
+  </table>
+  <p>Duplicates enter at two doors. <strong>Producer side:</strong> a send times out, the producer retries, but the first attempt had actually landed — now the log holds the event twice. Kafka's <em>idempotent producer</em> closes this door with per-producer sequence numbers (<a href="https://kafka.apache.org/documentation/#semantics">Kafka docs §4.6, message delivery semantics</a>). <strong>Consumer side:</strong> a consumer processes events, crashes <em>before committing its offset</em>, the group rebalances, and the new owner re-reads from the last commit — everything since is redelivered. In the lab this exact scenario yields ~148 duplicate deliveries with commit-after-batch, or ~258 <em>lost</em> events with commit-before.</p>
+  <p>Now the honest version of "exactly-once": Kafka transactions make <em>read-process-write within Kafka</em> atomic — offsets and output records commit together (<a href="https://www.confluent.io/blog/exactly-once-semantics-are-possible-heres-how-apache-kafka-does-it/">Confluent: exactly-once semantics in Kafka</a>). They do <strong>not</strong> cover the email your consumer sent, the row it wrote to Postgres, or the charge it made against a card. For external effects, the real mechanism is <strong>at-least-once delivery + idempotent processing</strong>: carry a unique event ID, and make the consumer's effect a no-op on the second delivery (<code>INSERT … ON CONFLICT DO NOTHING</code> on the event ID; "have I sent email for payment 4711?" checked in the same transaction as the send-record). Exactly-once is not a delivery guarantee you receive; it is an end-to-end property you construct.</p>
+
+  <h2>5 · Retention and compaction: two shapes of memory</h2>
+  <p><strong>Time/size retention</strong> keeps everything for N days (or N GB) then deletes oldest-first — the log as a bounded history buffer. <strong>Log compaction</strong> instead keeps, forever, the <em>latest record per key</em>, deleting overwritten predecessors (<a href="https://kafka.apache.org/documentation/#compaction">Kafka docs: log compaction</a>). A compacted topic is a <strong>changelog</strong>: replay it and you reconstruct current state exactly — the lab rebuilds identical state from 1,766 compacted entries instead of 30,000 raw updates, 17× less replay.</p>
+  <p>This is what makes <strong>change data capture (CDC)</strong> work: tools like <a href="https://debezium.io/">Debezium</a> tail a database's replication log and publish every row change to a topic — your database becomes a stream, and caches, search indexes, and warehouses become mere consumers that can be rebuilt by replay. (Recognize the move: Facebook drove memcache invalidations from the MySQL commit log back in lesson 0007 — CDC generalizes it.) One preview: writing to your DB <em>and</em> publishing an event as two separate actions can half-fail; the <strong>transactional outbox</strong> fixes this by writing the event into the same DB transaction and letting CDC publish it. Full treatment next lesson.</p>
+
+  <h2>6 · Event-driven architecture: choreography vs orchestration</h2>
+  <p>With a log in the middle, services stop calling each other and start <em>reacting</em>. Two styles (<a href="https://martinfowler.com/articles/201701-event-driven.html">Fowler: What do you mean by "Event-Driven"?</a>): <strong>choreography</strong> — order-service emits <code>OrderPlaced</code>; inventory, payment, email each subscribe and act; nobody coordinates — versus <strong>orchestration</strong> — a coordinator explicitly commands each step and tracks state. Choreography maximizes autonomy and failure isolation (email being down delays emails, nothing else); its price is that <em>nobody can point at the current state of an order</em> — the truth is smeared across five consumers' offsets, and debugging becomes archaeology. Orchestration centralizes the story at the cost of coupling and a smarter, more critical coordinator. (Lesson 0014 turns this into sagas.)</p>
+  <p>Either way, <strong>events become contracts</strong>. A producer that renames a field breaks consumers it has never heard of — at runtime, mid-stream. That is why serious event systems run a <a href="https://docs.confluent.io/platform/current/schema-registry/index.html">schema registry</a> with enforced compatibility rules (Avro/Protobuf; backward-compatible changes only: add optional fields, never remove or retype). Treat an event schema like a public API, because that is exactly what it is — one with subscribers you cannot enumerate.</p>
+
+  <h2>7 · Event sourcing and CQRS</h2>
+  <p><strong>Event sourcing</strong> promotes the log to system-of-record: instead of storing current state ("balance = $90"), store the full sequence of domain events ("opened, deposited 100, withdrew 10") and derive state by folding over them (<a href="https://martinfowler.com/eaaDev/EventSourcing.html">Fowler: Event Sourcing</a>). A payments ledger is the canonical honest example — accountants have used append-only journals for five centuries precisely because an edit-in-place balance destroys the story of how it got there. You gain a perfect audit trail, time-travel debugging ("what did this account look like Tuesday?"), and the ability to compute <em>new</em> views over old history by replay.</p>
+  <p><strong>CQRS</strong> (Command Query Responsibility Segregation) is the natural companion: writes append events; reads hit <strong>projections</strong> — materialized views built by consumers folding the stream into whatever shape each reader needs (a balance table, a search index, a monthly statement) (<a href="https://martinfowler.com/bliki/CQRS.html">Fowler: CQRS</a>). Projections are disposable: bug in the fold logic? Fix it and replay from offset zero.</p>
+  <p>When is it overkill? Fowler's own warning: most CRUD does not need it. You pay eventual consistency between write and read models, schema-versioning of <em>immutable</em> history (old events never go away, so your code must read every version ever written), and unbounded replay times that force snapshotting. Use it for domains where the history <em>is</em> the value — ledgers, orders, inventory movements — not for user-profile settings.</p>
+
+  <h2>8 · Backpressure and lag: the one metric that matters</h2>
+  <p><strong>Consumer lag</strong> — newest offset produced minus newest offset committed, per partition — is the single health metric of an event pipeline. Latency looks fine (each event processes quickly!) while lag quietly grows because arrival rate exceeds processing rate; LinkedIn built <a href="https://github.com/linkedin/Burrow">Burrow</a> specifically to judge whether lag is <em>trending</em> rather than just nonzero. Alert on lag growth and on lag translated into <em>time</em> ("consumer is 40 minutes behind"), not on any instantaneous number.</p>
+  <p>Catch-up options, in escalating order: scale consumers (only works up to partition count — §2); make processing cheaper (batch DB writes, drop per-event work); skip forward and backfill later (fine for metrics, unthinkable for a ledger). And plan for the <strong>poison pill</strong>: one malformed event a consumer cannot process. Retry forever and that partition — and every key in it — blocks behind one message. The standard fix is a <strong>dead-letter queue</strong>: after N failed attempts, park the event on a DLQ topic and move on, accepting that the affected key's ordering is now broken until a human replays it (<a href="https://www.uber.com/blog/reliable-reprocessing/">Uber: reliable reprocessing &amp; DLQs</a>).</p>
+
+  <h2>9 · Failure modes that decide interviews</h2>
+  <ul>
+    <li><strong>Rebalance storms.</strong> A slow consumer misses its session heartbeat → gets kicked → rebalance pauses the whole group → the pause makes others fall behind → more kicks. A group that spends its time reassigning partitions processes nothing. Mitigations: sane <code>max.poll.interval</code>, cooperative (incremental) rebalancing, static membership so a rolling deploy isn't N full rebalances.</li>
+    <li><strong>The lag death spiral, with numbers.</strong> Capacity 220k events/s against 200k/s incoming = 20k/s spare. A one-hour consumer outage banks 720M events; at 20k/s spare, catch-up takes 720M / 20k = 36,000 s = <strong>10 hours</strong>. With 24-hour retention, one more incident during catch-up and the log starts deleting events you never read. Headroom is not a luxury; it is your recovery-time budget.</li>
+    <li><strong>Schema break mid-stream.</strong> A producer deploys a field rename; every consumer starts throwing on every event — a fleet-wide poison pill. This is why compatibility checks live in CI via the registry, not in consumers' try/except blocks.</li>
+    <li><strong>Duplicate fan-out.</strong> The §4 crash-redelivery scenario reaches a non-idempotent email consumer: customers get two payment confirmations; a non-idempotent ledger consumer double-posts a charge. Same root cause, wildly different blast radius — idempotency effort should follow blast radius.</li>
+    <li><strong>Compaction ate your history.</strong> Someone enables compaction on a topic analytics later needs full history from — every intermediate state is unrecoverable, silently, by design. Compaction keeps state, not history; pick per topic, on purpose, and write it down.</li>
+  </ul>
+
+  <h2>10 · One AI note, then back to fundamentals</h2>
+  <p>The inference platform's usage pipeline is this lesson verbatim: every request emits a usage event (tenant, model, tokens in/out, latency) onto a log; billing, eval, and abuse-detection pipelines are independent consumer groups over the same topic; partitioning by <code>tenant_id</code> gives per-tenant ordering with a hot-tenant skew risk you now know by name; and replay is the killer feature — ship a better quality-scoring model, rewind the eval consumer, re-score last month's traffic without touching serving. Billing consumers are the payments-ledger case: at-least-once plus idempotency on the event ID, because double-billing a tenant is the email-twice failure with an invoice attached. That's the note; §1–§9 are what the interview grades.</p>
+
+  <h2>11 · Interview talking points</h2>
+  <ol>
+    <li><strong>Queue or log — say why.</strong> "This fact has multiple audiences over time, so a retained log, not a task queue" beats naming a product first.</li>
+    <li><strong>Name the topic, the key, and the ordering contract in one breath.</strong> "Topic <code>orders</code>, keyed by <code>order_id</code>, so each order's lifecycle is ordered; cross-order ordering doesn't exist and we don't need it."</li>
+    <li><strong>Do the partition arithmetic</strong> (§2): producer MB/s and consumer events/s both, then "the consumer side dominates: ~96 partitions."</li>
+    <li><strong>Volunteer the skew story</strong> (§3) before the interviewer asks: who's the celebrity key and what happens to their partition.</li>
+    <li><strong>Say "at-least-once plus idempotent consumers" unprompted</strong> (§4), and define the idempotency key. Then, if pushed on exactly-once: "Kafka transactions cover Kafka-to-Kafka; external effects need dedup at the edge."</li>
+    <li><strong>Name lag as your health metric</strong> (§8) and give the catch-up math (§9) — spare capacity as recovery-time budget is a strong-hire sentence.</li>
+    <li><strong>Close with the contract:</strong> schema registry, backward-compatible evolution only, checked in CI — events are APIs with unknown subscribers.</li>
+  </ol>
+
+  <h2>12 · Lab — run a partitioned log yourself</h2>
+  <div class="callout"><span class="label">Hands-on (do this before the quiz)</span>
+    Everything above is now countable in <code>labs/lab-0013-mini-kafka/</code>:
+    <code>python3 mini_kafka_lab.py</code> runs three experiments — 50k zipf-keyed events over 8
+    partitions (zero per-key order violations, ~24k global inversions, one partition at 1.87× its
+    fair share), a consumer-group sweep where speedup stops dead at the partition count and a
+    mid-run crash yields ~148 duplicates (commit-after) vs ~258 losses (commit-before), and a
+    changelog compacted 17× that rebuilds identical state. Then do exercises E1–E4 in the lab
+    README: <em>predict, edit config, re-run, compare.</em> Wrong predictions are the deliverable.
+  </div>
+
+  <h2>13 · Project step</h2>
+  <p>Design the <strong>usage-metering event flow</strong> for the LLM inference platform: name the topic, the partition key, and the delivery-semantics choice, and defend it in two sentences. A defensible pick: <em>topic <code>usage-events</code> keyed by <code>tenant_id</code> (per-tenant ordering for billing correctness, hot-tenant skew accepted and monitored), at-least-once delivery with the billing consumer idempotent on a unique <code>request_id</code> — because a lost usage event is revenue leakage and a duplicate one is an angry customer, and idempotency is the only fix that survives both.</em> Write your own two sentences — key + semantics + why — and bring them to the next session for critique.</p>
+
+  <h2>Check yourself</h2>
+  <div class="quiz" id="quiz"></div>
+
+  <h2>Primary source</h2>
+  <p>Read <strong>DDIA chapter 11 — Stream Processing</strong> (<a href="https://dataintensive.net/">dataintensive.net</a>): messaging vs logs, change data capture, event sourcing, and the "state as a fold over events" idea, all in one chapter. Pair it with Jay Kreps' <a href="https://engineering.linkedin.com/distributed-systems/log-what-every-software-engineer-should-know-about-real-time-datas-unifying">"The Log: What every software engineer should know about real-time data's unifying abstraction"</a> — the LinkedIn essay that reframed the log as infrastructure's central abstraction and remains the best single motivation for Kafka ever written. For the mechanics, the <a href="https://kafka.apache.org/documentation/#design">Kafka design docs</a> (especially §4.6 on delivery semantics) are short and canonical.</p>
+
+  <footer class="lesson-footer">
+    <p><strong>Stuck or curious?</strong> Ask your teacher (the agent) anything — "if transactions give exactly-once inside Kafka, why do I still need idempotency keys in my database?" is an excellent follow-up question.</p>
+    <nav class="lesson-nav">
+      <span><a href="0012-storage-engine-internals.html">◀ Prev: 0012 · Storage Engine Internals</a></span>
+      <span><a href="0014-distributed-transactions.html">Next: 0014 · Distributed Transactions &amp; Coordination ▶</a></span>
+    </nav>
+  </footer>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+renderQuiz(document.getElementById('quiz'), {
+  title: 'Check yourself',
+  questions: [
+    {
+      q: "Your team replaces RabbitMQ with Kafka for the order pipeline. What new capability does the retained log itself add?",
+      options: [
+        'Messages get deleted immediately after consumer acknowledgment',
+        'Consumers can replay history from any offset',
+        'Producers never need retries because delivery guaranteed',
+      ],
+      answer: 1,
+      explain: 'Retention is the point: the log keeps events after they are read, so new consumers can bootstrap from history and broken consumers can rewind and reprocess. Delete-on-ack is the RabbitMQ model Kafka replaced; producers still retry (that is one source of duplicates).',
+    },
+    {
+      q: 'An order-events topic has 12 partitions keyed by order_id. What ordering does Kafka actually guarantee here?',
+      options: [
+        'Total ordering across all partitions of topic',
+        'No ordering anywhere unless transactions are enabled',
+        'Ordering only within each single partition individually',
+      ],
+      answer: 2,
+      explain: 'A partition is a totally-ordered log; a topic is just P of them side by side. Keying by order_id routes each order’s events to one partition, so each order’s lifecycle is ordered — but events of different orders interleave arbitrarily, and transactions have nothing to do with ordering.',
+    },
+    {
+      q: 'A consumer processes a payment event, then crashes before committing its offset. What happens after the rebalance?',
+      options: [
+        'The event is redelivered and processed again',
+        'The event is lost and never reprocessed',
+        'The broker deduplicates it using message identifiers',
+      ],
+      answer: 0,
+      explain: 'The new partition owner resumes from the last committed offset, which is before the processed-but-uncommitted event — so it is delivered again. That is at-least-once semantics, and it is exactly why consumers of anything important must be idempotent. The broker does not dedup consumer redeliveries.',
+    },
+    {
+      q: 'Events fan out to an email service. What actually prevents customers receiving duplicate payment confirmation emails?',
+      options: [
+        'Kafka transactions covering every external side effect',
+        'Consumer idempotency keyed on a unique identifier',
+        'Producer retries switched off across the pipeline',
+      ],
+      answer: 1,
+      explain: 'Kafka transactions make read-process-write atomic within Kafka only — they cannot un-send an email. The real fix is at-least-once delivery plus an idempotent consumer: check "already sent for payment 4711?" against a unique event ID before sending. Disabling producer retries just trades duplicates for losses.',
+    },
+    {
+      q: 'A new consumer must rebuild current per-key state without replaying months of history. Which topic configuration serves this?',
+      options: [
+        'Time-based retention keeping seven days of everything',
+        'Size-based retention capped at a hundred gigabytes',
+        'Log compaction keeping each key’s latest record',
+      ],
+      answer: 2,
+      explain: 'A compacted topic is a changelog: it retains the newest record per key forever and drops overwritten predecessors, so replaying it reconstructs exactly the current state — in the lab, 1,766 entries instead of 30,000. Time and size retention keep a window of raw history, which is bigger and may be incomplete.',
+    },
+    {
+      q: 'A consumer group with 8 consumers reads a 4-partition topic. What throughput do consumers five through eight add?',
+      options: [
+        'None, because four extra consumers sit idle',
+        'Double, because work rebalances across all eight',
+        'Half, because rebalancing overhead dominates the group',
+      ],
+      answer: 0,
+      explain: 'Each partition is owned by exactly one group member, so at most 4 consumers can be doing work; the other 4 own nothing (useful only as hot standbys). Partition count is the parallelism ceiling you fix at design time — which is why the worked example sized partitions from consumer throughput.',
+    },
+  ],
+});
+</script>
+</body>
+</html>

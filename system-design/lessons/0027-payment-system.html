@@ -1,0 +1,208 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lesson 27 · Payment System — Exactly-Once Money Movement</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<div class="lesson">
+  <header class="lesson-header">
+    <p class="kicker">Lesson 0027 · Phase 3 — Classic Design Reps · <a href="0027-payment-system.ka.html">ქართული ვერსია</a></p>
+    <h1>Payment System — Exactly-Once Money Movement</h1>
+    <p class="dek">Every distributed-systems failure you have studied — lost messages, duplicate deliveries, partial writes, ambiguous timeouts — reappears here, except now each one costs literal money. This is the senior-bar correctness rep.</p>
+  </header>
+
+  <div class="mission-tie">
+    <strong>Mission tie.</strong> Billing and usage metering for any API platform — including LLM APIs, where every token generated must be counted once, priced once, and charged exactly once — is this exact design wearing a different label.
+  </div>
+
+  <div class="callout"><span class="label">REP PROTOCOL</span>
+    Do a <strong>40-minute solo timed rep FIRST</strong> — out loud, whiteboard or paper, no peeking. Prompt: <em>"Design a payment system for an e-commerce platform."</em> Then read this reference, compare, and log your deltas as learning records. The deltas are the lesson.
+  </div>
+
+  <h2>1 · The prompt, and what is actually tested</h2>
+  <p><em>"Design a payment system for an e-commerce platform."</em> The hidden rubric is not architecture breadth — it is <strong>correctness under retries</strong>. At some point the interviewer <em>will</em> inject the killer scenario: <em>"the network dies right after the charge succeeded — your service never saw the response. Now what?"</em> If your design blindly retries, you double-charge; if it gives up, you lose track of real money that really moved. Everything in this lesson exists to make that question boring. Secondary signals: knowing you build <em>on top of</em> a payment service provider (PSP), an append-only ledger instead of mutable balances, and reconciliation as the final safety net. Latency talk is a junior tell here — this rep is graded on the money never lying.</p>
+
+  <h2>2 · Clarify (5–8 min): buy the right problem</h2>
+  <table>
+    <tr><th>Requirement</th><th>Decision</th></tr>
+    <tr><td><strong>Pay-in flow</strong></td><td>Customer pays via a PSP (Stripe/Adyen). We do <em>not</em> touch card networks ourselves: storing or transmitting raw card data pulls us into full <strong>PCI DSS</strong> compliance scope — audits, certified infrastructure, liability. The PSP tokenizes the card; we only ever see a token.</td></tr>
+    <tr><td><strong>Pay-out flow</strong></td><td>Move sellers' earnings to their bank accounts (batched, e.g. daily).</td></tr>
+    <tr><td><strong>Refunds</strong></td><td>Full and partial, as new money movements — never edits to old ones.</td></tr>
+    <tr><td><strong>Reconciliation</strong></td><td>Nightly diff of PSP settlement files against our internal ledger.</td></tr>
+  </table>
+  <p>Non-functional requirements, stated as absolutes: <strong>no double charge, ever; no lost money, ever; auditability &gt; latency</strong>. And say this explicitly: for the money path we rank <strong>consistency over availability</strong> — if we cannot be certain a charge is recorded, we would rather reject the payment and show an error than guess. A payment page that is briefly down costs a sale; a wrong ledger costs trust, audits, and lawsuits.</p>
+
+  <h2>3 · Estimate (~5 min): small numbers, high stakes</h2>
+  <pre><code>1M payments/day ÷ ~100k s/day ≈ 10 TPS average, ×5 peak ≈ 50 TPS
+Ledger: ~5 entries/payment × ~200 B ≈ 1 KB/payment
+  → ~1 GB/day ≈ 365 GB/year;  retention 7+ years → ~2.5 TB total</code></pre>
+  <p>Say this out loud: <strong>payments are LOW-QPS, high-stakes — the exact opposite trade-off of the feed rep.</strong> The feed tolerated staleness and lost updates to win throughput; here 50 peak TPS fits comfortably on one well-run PostgreSQL primary, so throughput buys you nothing and correctness is the entire game. Now <em>spend</em> the numbers: 50 TPS means single-primary ACID transactions are affordable — no exotic sharding needed, so don't propose it. 2.5 TB over a 7-year legal retention window means the ledger is partitioned by time and archived to cold object storage, but <em>never</em> deleted or rewritten. And 1M payments/day means even a 0.01% bug rate is 100 wrong charges daily — which is why section 8's reconciliation exists no matter how good the code is.</p>
+
+  <h2>4 · High-level design (~10 min): boxes with failure semantics</h2>
+  <pre><code>client → payment service → payment executor → PSP adapter → PSP (Stripe)
+              │                    │
+              ▼                    ▼
+         wallet service        ledger service</code></pre>
+  <ul>
+    <li><strong>Payment service</strong> — accepts payment requests, owns the payment state machine, enforces idempotency. Arrow from client: <em>at-least-once</em> (clients retry) → must dedupe.</li>
+    <li><strong>Payment executor</strong> — drives one payment order through the PSP. Arrow to PSP adapter: <em>ambiguous on timeout</em> (charge may have happened) → never blind-retry without a key.</li>
+    <li><strong>PSP adapter</strong> — one thin client per provider; translates our model to their API. Inbound webhook arrows: <em>at-least-once, unordered</em> → verify, dedupe, reorder.</li>
+    <li><strong>Wallet service</strong> — merchant balances, derived from the ledger. <strong>Ledger service</strong> — the append-only source of truth (section 6).</li>
+  </ul>
+  <p>The payment state machine, drawn explicitly:</p>
+  <pre><code>INITIATED → PENDING → SUCCEEDED   (terminal, immutable)
+                    ↘ FAILED      (terminal, immutable)</code></pre>
+  <p>Terminal states are immutable: a SUCCEEDED payment is never edited — a refund is a <em>new</em> movement referencing it. Every transition is a database write, so a crashed executor can resume any payment from its persisted state.</p>
+
+  <h2>5 · Deep dive: idempotency end-to-end</h2>
+  <p>The retry problem, solved layer by layer. The <strong>client generates an idempotency key</strong> — a UUID, created when the user lands on checkout, sent as a header (<code>Idempotency-Key: 8e03…</code>) on every attempt of that one logical payment. The payment service inserts it into a table with a <strong>unique constraint</strong>. First request: insert succeeds, payment proceeds, and the final response is stored against the key. Retry: insert violates the constraint → look up and <strong>return the stored response</strong> — same status code, same body, no re-execution. If the first attempt is still in flight, the retry gets 409/wait, not a second execution.</p>
+  <p>Then the same trick again one layer down: the executor sends its <em>own</em> idempotency key with the PSP call — <strong>this is exactly Stripe's mechanism</strong>: pass <code>Idempotency-Key</code>, and a retried charge returns the recorded result of the first attempt instead of charging again. Now the ambiguous-timeout answer writes itself: <em>the charge may have happened, so retry with the SAME key — safe either way.</em></p>
+  <p>Be precise about the theory: exactly-once <em>delivery</em> is impossible over an unreliable network. The honest formulation is <strong>at-least-once delivery + idempotent processing = effectively exactly-once <em>effect</em></strong>. Say it in those words; interviewers listen for whether you know the difference.</p>
+
+  <h2>6 · Deep dive: the double-entry ledger</h2>
+  <p>Rule, unchanged since Venetian bookkeeping: <strong>every movement of money is a balanced set of debit and credit entries</strong> — money is never created or destroyed, only moved between accounts. Entries are <strong>append-only and immutable</strong>: no UPDATE, no DELETE, ever. The system invariant, checkable at any moment: <strong>sum(debits) = sum(credits), always</strong>. One $10 payment with a 59¢ processing fee:</p>
+  <table>
+    <tr><th>Account</th><th>Debit</th><th>Credit</th></tr>
+    <tr><td>psp_clearing (money captured by PSP)</td><td class="num">1000¢</td><td class="num">—</td></tr>
+    <tr><td>merchant_payable (owed to the seller)</td><td class="num">—</td><td class="num">941¢</td></tr>
+    <tr><td>fee_revenue (our cut)</td><td class="num">—</td><td class="num">59¢</td></tr>
+    <tr><td><strong>Totals</strong></td><td class="num"><strong>1000¢</strong></td><td class="num"><strong>1000¢</strong></td></tr>
+  </table>
+  <p>Balances are <em>derived</em> by summing an account's entries — never stored as the primary truth. And corrections: posted 941¢ to the wrong merchant? You do not edit the row. You append a <strong>reversing entry</strong> (credit back 941¢) plus a correct new entry. The mistake stays visible forever — that <em>is</em> the audit trail, and it is why auditors and regulators require this structure.</p>
+
+  <h2>7 · Deep dive: staying consistent with the PSP</h2>
+  <p>Your database and Stripe's database are two systems with no shared transaction — the dual-write problem from lesson 0014, now with money. Three tools close the gap:</p>
+  <p><strong>The outbox pattern.</strong> Never write "payment SUCCEEDED" to your DB and then separately publish an event — a crash between the two loses the event. Instead, one local transaction writes both the state change <em>and</em> an event row into an <code>outbox</code> table; a relay process reads the outbox and publishes (at-least-once — consumers dedupe by event id). Atomic, crash-proof.</p>
+  <p><strong>Webhook handling.</strong> PSPs push results (<code>payment_succeeded</code>, <code>payment_failed</code>) as webhooks. Treat them as hostile input: <strong>verify</strong> the signature (anyone can POST to your endpoint), <strong>dedupe</strong> by event id (PSPs deliver at-least-once), and tolerate <strong>out-of-order</strong> arrival — a <code>refund_succeeded</code> can land before the <code>payment_succeeded</code> it depends on. The state machine rejects illegal transitions; hold early events and re-apply.</p>
+  <p><strong>The pending-timeout sweeper.</strong> Webhooks get lost too. A background job finds payments stuck in PENDING beyond a threshold and <em>queries the PSP directly</em> for the true status — reconciliation at the single-payment scale, closing the last gap.</p>
+
+  <h2>8 · Deep dive: reconciliation — the ultimate safety net</h2>
+  <p>Every night the PSP produces a <strong>settlement file</strong>: every charge, refund, and fee they processed for you, with amounts. A nightly job diffs it against the internal ledger, transaction by transaction. Three mismatch classes:</p>
+  <table>
+    <tr><th>Mismatch</th><th>Typical cause</th><th>Action</th></tr>
+    <tr><td><strong>In theirs, missing in ours</strong></td><td>Crash after PSP success, before our ledger write; lost webhook</td><td>Backfill ledger entry; investigate the crash path</td></tr>
+    <tr><td><strong>In ours, missing in theirs</strong></td><td>We recorded optimistically; PSP call actually failed</td><td>Reverse our entry; alert — customer thinks they paid</td></tr>
+    <tr><td><strong>Amount drift</strong></td><td>Fee/rounding computed differently; currency conversion mismatch</td><td>Adjusting entry; fix the fee formula</td></tr>
+  </table>
+  <p>Why bother if sections 5–7 are implemented perfectly? Because "perfectly" is not a property real systems have: deploys have bugs, PSPs have incidents, operators run manual fixes. Reconciliation is the mechanism that <strong>bounds how long any error can survive</strong> — with a nightly run, no discrepancy lives past 24 hours. Interviewers score it as the mark of someone who has operated a money system, not just drawn one.</p>
+
+  <h2>9 · Failure modes &amp; monitoring</h2>
+  <ul>
+    <li><strong>PSP timeout ambiguity.</strong> The charge MAY have happened. Never blind-retry without an idempotency key; never mark FAILED without querying the PSP. This is the interviewer's injected scenario — answer it before they ask.</li>
+    <li><strong>Partial refund races.</strong> Two concurrent $6 refunds on a $10 payment must not both pass the "≤ remaining" check. Serialize per payment: row lock or version check (optimistic concurrency).</li>
+    <li><strong>Currency and rounding.</strong> Store minor units as integers — 1000 cents, <strong>NEVER floats</strong>: binary floats cannot represent 0.1, and tiny errors compound over millions of entries until sum(debits) ≠ sum(credits). The lab makes you watch this happen.</li>
+  </ul>
+  <p>Metrics that page a human: <strong>payment success rate</strong> (drop = PSP incident or our bug — this pages before Twitter knows), <strong>reconciliation break count</strong> (nonzero = money is lying somewhere), <strong>stuck-PENDING age</strong> (growing = webhooks or sweeper failing). CPU and latency dashboards are secondary here.</p>
+
+  <h2>10 · Variants &amp; twists</h2>
+  <ul>
+    <li><strong>Payouts / marketplace splits.</strong> One pay-in fans out to seller + platform fee + tax — more legs in the same balanced ledger entry; payouts batched daily through the PSP's transfer API, same idempotency discipline.</li>
+    <li><strong>Multi-currency.</strong> One account per (owner, currency); never mix currencies in one account. Record the FX rate <em>used</em> in the entry itself, so history is reproducible.</li>
+    <li><strong>Chargebacks.</strong> The card network forcibly reverses a charge — arrives weeks later as a webhook, modeled as a new money movement plus a dispute-evidence workflow, never as an edit.</li>
+  </ul>
+  <p><strong>AI angle — usage metering for API billing.</strong> Billing an LLM API is this design with tokens as the currency: meter usage events (at-least-once delivery → dedupe by event id), aggregate into an append-only usage ledger, price idempotently per invoice line, and reconcile metered totals against invoiced totals nightly. Same skeleton, same failure modes.</p>
+
+  <h2>11 · Interview talking points</h2>
+  <ul>
+    <li><em>Scoping:</em> "We integrate a PSP rather than touching card networks — raw card data would put us in PCI DSS scope, which is a compliance project, not a systems one."</li>
+    <li><em>Ranking:</em> "For the money path I'm choosing consistency over availability — I'd rather fail a checkout than record it wrong."</li>
+    <li><em>The killer question, pre-empted:</em> "If the PSP times out, the charge may have happened — so every call carries an idempotency key, and retrying with the same key is safe either way."</li>
+    <li><em>Honesty about exactly-once:</em> "Exactly-once delivery is impossible; at-least-once plus idempotent processing gives exactly-once <em>effect</em> — that's the real guarantee."</li>
+    <li><em>Ledger:</em> "Append-only double-entry with sum(debits) = sum(credits) as a checkable invariant; corrections are reversing entries, never UPDATEs."</li>
+    <li><em>Closing:</em> "Even with all that, I'd run nightly reconciliation against PSP settlement files — it bounds any error's lifetime to 24 hours."</li>
+  </ul>
+
+  <h2>12 · Lab &amp; project step</h2>
+  <div class="callout"><span class="label">Hands-on (do this before the quiz)</span>
+    In <code>labs/lab-0027-ledger/</code>, <code>python3 ledger_lab.py</code> builds a real double-entry ledger with an invariant checker, then charges it through a flaky PSP that times out <em>after</em> succeeding: Scenario A (naive retries) double-charges customers in front of you, Scenario B (idempotency keys) drives doubles to zero, Scenario C (crash before ledger write) lets a reconciliation job find and repair the breaks. Plus a float demo that corrupts money before your eyes. Predict → run → compare, per the README.
+  </div>
+  <p><strong>Project step.</strong> Take your 40-minute rep drawing from the top of this lesson and mark your deltas against sections 4–8 in another color: every arrow missing failure semantics, every place you had UPDATE where the reference has append-only, whether reconciliation appeared at all. Log the deltas as learning records — then write the ledger schema (accounts, entries, unique constraints) for the spine project's usage-metering ledger: tokens in, dollars out, exactly once.</p>
+
+  <h2>Check yourself</h2>
+  <div class="quiz" id="quiz"></div>
+
+  <h2>Primary source</h2>
+  <p>Read <strong>Stripe's <a href="https://stripe.com/blog/idempotency">"Designing robust and predictable APIs with idempotency"</a></strong> — the canonical statement of the key mechanism this lesson is built on. Companions: <strong>"Ledger: Stripe's system for tracking and validating money movement"</strong> (Stripe engineering blog — search by title) for a production double-entry ledger at scale, and AWS's <a href="https://aws.amazon.com/builders-library/making-retries-safe-with-idempotent-APIs/">"Making retries safe with idempotent APIs"</a> from the Builders' Library for the retry-safety framing.</p>
+
+  <footer class="lesson-footer">
+    <p><strong>Stuck or curious?</strong> Ask your teacher (the agent) anything — "how would this design change for instant peer-to-peer transfers, where there is no PSP in the middle?" is an excellent follow-up question.</p>
+    <nav class="lesson-nav">
+      <span>◀ <a href="0026-distributed-search.html">0026 · Distributed Search</a></span>
+      <span><a href="0028-scale-to-millions.html">0028 · Scaling to Millions on AWS</a> ▶</span>
+    </nav>
+  </footer>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+renderQuiz(document.getElementById('quiz'), {
+  title: 'Check yourself',
+  questions: [
+    {
+      q: 'Your PSP call times out, but the charge may have succeeded on their side. What is the correct move?',
+      options: [
+        'Retry the charge using the same idempotency key',
+        'Retry the charge using a fresh idempotency key',
+        'Mark the payment FAILED and notify the customer',
+      ],
+      answer: 0,
+      explain: 'The timeout is ambiguous — the charge may exist. Retrying with the SAME key is safe either way: the PSP returns the recorded result instead of charging again. A fresh key is the double-charge; marking FAILED without querying the PSP loses track of real money.',
+    },
+    {
+      q: 'Which invariant must a correct double-entry ledger satisfy at every single moment?',
+      options: [
+        'Every account keeps its balance strictly above zero',
+        'Sum of debits always equals sum of credits',
+        'Each entry touches exactly one account balance row',
+      ],
+      answer: 1,
+      explain: 'Money is never created or destroyed, only moved — so total debits always equal total credits. Accounts can legitimately go negative (e.g. clearing accounts mid-flight), and one balanced entry can span three or more accounts (payment + fee split).',
+    },
+    {
+      q: 'Why must monetary amounts be stored as integer minor units instead of floats?',
+      options: [
+        'Integers compress far better in databases than floats',
+        'Currency symbols attach only cleanly to integer columns',
+        'Binary floats cannot represent most decimal fractions exactly',
+      ],
+      answer: 2,
+      explain: '0.1 has no exact binary representation, so float arithmetic accumulates tiny errors that compound over millions of entries until the ledger invariant breaks. Integers in minor units (cents) are exact. Compression and formatting are irrelevant to correctness.',
+    },
+    {
+      q: 'You discover a ledger entry posted 941 cents to the wrong merchant. How do you fix it?',
+      options: [
+        'Append a reversing entry plus a corrected entry',
+        'Update the wrong row with the correct merchant',
+        'Delete the wrong pair and insert corrected rows',
+      ],
+      answer: 0,
+      explain: 'The ledger is append-only and immutable: corrections are new reversing entries followed by correct ones, leaving the mistake permanently visible. That visible history IS the audit trail — UPDATE and DELETE destroy it and are forbidden.',
+    },
+    {
+      q: 'What specific problem does the outbox pattern exist to solve in this design?',
+      options: [
+        'Slow consumers overwhelming a fast event producer service',
+        'Webhooks from the PSP arriving out of order',
+        'Atomically pairing a database write with event publishing',
+      ],
+      answer: 2,
+      explain: 'Writing state and publishing an event are two systems with no shared transaction — a crash between them loses the event. The outbox writes both in ONE local transaction; a relay publishes later. Backpressure and webhook ordering are different problems with different tools.',
+    },
+    {
+      q: 'Sections 5–7 are implemented flawlessly. Why does the design still run nightly reconciliation?',
+      options: [
+        'It replaces the idempotency keys once volume grows larger',
+        'It speeds up settlement by batching the PSP calls',
+        'It bounds how long any money error can survive',
+      ],
+      answer: 2,
+      explain: '"Flawless" is not a property real systems keep: deploys ship bugs, PSPs have incidents, operators run manual fixes. Reconciliation against settlement files guarantees no discrepancy outlives 24 hours. It complements idempotency — it never replaces it — and has nothing to do with speed.',
+    },
+  ],
+});
+</script>
+</body>
+</html>

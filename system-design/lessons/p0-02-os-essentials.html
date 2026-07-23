@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lesson p0-02 · OS Essentials — Processes, Virtual Memory, Scheduling</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<div class="lesson">
+  <header class="lesson-header">
+    <p class="kicker">Lesson p0-02 · Phase 0 Track A — Programming/CS · <a href="p0-02-os-essentials.ka.html">ქართული ვერსია</a></p>
+    <h1>OS Essentials — Processes, Virtual Memory, Scheduling</h1>
+    <p class="dek">Your server is a guest of the operating system. Here is the rent it pays — and the paging trick that vLLM later steals wholesale.</p>
+  </header>
+
+  <div class="mission-tie">
+    <strong>Mission tie.</strong> Anthropic's design rounds assume you can reason about what a "worker" costs, why memory limits kill pods, and why a box at 98% RAM is one request from death. Better: <strong>PagedAttention — the core idea of vLLM — is OS demand paging transplanted into the KV cache</strong>, so this lesson is a direct prerequisite for the flagship inference-batching prompt. Canon here is <a href="https://pages.cs.wisc.edu/~remzi/OSTEP/">OSTEP (Operating Systems: Three Easy Pieces)</a>; the payoff is <a href="https://blog.vllm.ai/2025/09/05/anatomy-of-vllm.html">Inside vLLM</a>.
+  </div>
+
+  <div class="callout"><span class="label">Lab first (ADHD-friendly order)</span>
+    Run the lab <em>before</em> reading: <code>cd labs/lab-p0-02-processes-and-memory &amp;&amp; python3 os_lab.py</code>. Thirty seconds of output gives every claim below a number you have already seen. Read the lesson with the output on screen.
+  </div>
+
+  <h2>1 · What an OS actually does: two illusions</h2>
+  <p>An OS sells two illusions. <strong>CPU virtualization:</strong> every process believes it has the CPU to itself; the scheduler time-slices reality behind its back. <strong>Memory virtualization:</strong> every process believes it owns a huge private address space starting at zero; page tables map that fiction onto whatever physical RAM is free. (<a href="https://pages.cs.wisc.edu/~remzi/OSTEP/cpu-intro.pdf">OSTEP: The Abstraction — The Process</a>)</p>
+  <p>System design cares because both illusions <em>leak under load</em> — as scheduling delay and page faults — and the leaks land precisely on your p99.</p>
+
+  <h2>2 · Processes vs threads: the ledger</h2>
+  <p>A <strong>process</strong> = address space + page table + file descriptors + at least one thread. A <strong>thread</strong> = a stack and registers <em>inside</em> a process, sharing everything else. (<a href="https://pages.cs.wisc.edu/~remzi/OSTEP/threads-intro.pdf">OSTEP: Concurrency intro</a>)</p>
+  <table>
+    <tr><th></th><th>Thread</th><th>Process</th></tr>
+    <tr><td>Address space</td><td>Shared with siblings</td><td>Private (isolated)</td></tr>
+    <tr><td>Creation cost (lab-measured)</td><td class="num">~50–100 µs</td><td class="num">~0.5 ms fork · ~10 ms spawn</td></tr>
+    <tr><td>Communication</td><td>Shared memory (races possible)</td><td>Pipes/sockets (copy, but safe)</td></tr>
+    <tr><td>One crashes / leaks</td><td>Takes the whole process down</td><td>Blast radius contained</td></tr>
+    <tr><td>Typical serving use</td><td>I/O concurrency in a worker</td><td>Workers, isolation, multi-GPU ranks</td></tr>
+  </table>
+  <p>The design rule falls out of the ledger: <strong>processes for isolation, threads for sharing</strong> — and because creation is never free, real servers <em>pre-fork and pool</em> instead of creating either per request. (Compare gunicorn workers, nginx worker processes, vLLM's one-process-per-GPU ranks.)</p>
+
+  <h2>3 · Virtual memory: pages, frames, TLB</h2>
+  <p>Virtual address spaces are cut into <strong>pages</strong> (typically 4 KiB); physical RAM into same-sized <strong>frames</strong>. The <strong>page table</strong> maps page → frame; the <strong>TLB</strong> caches recent translations so the mapping doesn't cost a memory walk on every access. (<a href="https://pages.cs.wisc.edu/~remzi/OSTEP/vm-paging.pdf">OSTEP: Paging</a>, <a href="https://pages.cs.wisc.edu/~remzi/OSTEP/vm-tlbs.pdf">OSTEP: TLBs</a>)</p>
+  <p>The indirection buys three superpowers: processes can't touch each other's memory (isolation), physical RAM needn't be contiguous (no external fragmentation), and pages can live on disk and be faulted in on demand. Hold that third one — it becomes PagedAttention in §5.</p>
+  <div class="callout"><span class="label">Vocabulary</span>
+    <strong>Page</strong>: fixed-size chunk of virtual memory. <strong>Frame</strong>: its physical slot. <strong>Page fault</strong>: access to a page with no frame mapped — the OS pauses your thread, fixes the mapping (maybe reading from disk), resumes. <strong>Working set</strong>: the pages a process actually touches over a window of time.
+  </div>
+
+  <h2>4 · Demand paging: allocation is a promise</h2>
+  <p><code>malloc</code>/<code>bytearray</code> mostly just reserves address space. Physical frames arrive later, one <strong>page fault</strong> at a time, on first touch. A "soft" fault (frame available, just needs mapping) costs on the order of a microsecond; a "hard" fault (page must come from disk) costs whatever the disk costs — milliseconds on HDD, ~100 µs on NVMe. (<a href="https://pages.cs.wisc.edu/~remzi/OSTEP/vm-beyondphys.pdf">OSTEP: Beyond Physical Memory</a>)</p>
+  <pre><code>1 GiB buffer = 1 GiB ÷ 4 KiB = 262,144 pages
+first-touch cost  ≈ 262,144 soft faults × ~1 µs ≈ 0.3 s   (one-time, at startup… or at p99)
+
+effective access time under paging pressure (hit 100 ns, hard fault 1 ms):
+  0.1% faults:  0.999 × 100 ns + 0.001 × 1 ms ≈ 1.1 µs   → 11× slower than RAM
+  1%   faults:  ≈ 10.1 µs                                → 100× slower than RAM</code></pre>
+  <p>Read that twice: a <strong>1%</strong> fault rate makes memory <strong>100×</strong> slower. This is the same "tiny tail owns the mean" arithmetic as lesson 0001 — one level down the stack. It is why latency-critical services touch (pre-fault) their buffers at startup and pin pages (<code>mlock</code>) when they can.</p>
+
+  <h2>5 · Working sets and the thrashing cliff</h2>
+  <p>While the sum of <em>working sets</em> fits in RAM, paging is invisible. The moment it doesn't, every fault evicts a page someone needs soon, which faults again: the machine does I/O full-time and useful work collapses. That mode is <strong>thrashing</strong>, and the lab's experiment 3 shows it is a cliff, not a slope — a working set 12% past RAM ran ~1,000× slower. Practical consequences: serving boxes disable swap, and the kernel's <strong>OOM killer</strong> exists because a fast kill beats a thrashing host.</p>
+  <div class="callout"><span class="label">LLM connection — PagedAttention</span>
+    A KV cache grows one token at a time to an unpredictable length — exactly the workload that fragmented early LLM servers, which reserved contiguous max-length buffers (internal fragmentation, wasted VRAM). vLLM's fix is literally this lesson: cut the KV cache into fixed-size <em>blocks</em> (pages), keep a block table (page table) per request, allocate on demand, and even share blocks across requests like copy-on-write forks. Result: near-zero waste and much bigger batches. (<a href="https://blog.vllm.ai/2025/09/05/anatomy-of-vllm.html">Inside vLLM</a>)
+  </div>
+
+  <h2>6 · Scheduling and the price of a context switch</h2>
+  <p>More runnable threads than cores means the scheduler multiplexes: each thread runs a <strong>timeslice</strong>, then is preempted. A <strong>context switch</strong> saves registers, switches page tables, and — the expensive part — hands the next thread a cold cache and cold TLB. Direct cost is ~1–10 µs; the cache-refill shadow can be much larger. (<a href="https://pages.cs.wisc.edu/~remzi/OSTEP/cpu-sched.pdf">OSTEP: Scheduling</a>)</p>
+  <p>Two design-relevant corollaries. <strong>Timeslice trade-off:</strong> short slices give responsiveness but burn throughput on switch overhead; long slices do the reverse — the same latency/throughput axis from lesson 0001. <strong>Run-queue delay:</strong> when CPU saturates, requests wait to be <em>scheduled</em> before they wait for anything else; a saturated run queue is the invisible term in many p99 mysteries.</p>
+
+  <h2>7 · cgroups and containers: a process wearing fences</h2>
+  <p>A container is <strong>not</strong> a VM. It is an ordinary Linux process wearing two fences: <strong>namespaces</strong> limit what it can <em>see</em> (its own PIDs, network, filesystem — <a href="https://man7.org/linux/man-pages/man7/namespaces.7.html">namespaces(7)</a>), and <strong>cgroups</strong> limit what it can <em>use</em> (CPU quota, memory ceiling, I/O — <a href="https://man7.org/linux/man-pages/man7/cgroups.7.html">cgroups(7)</a>).</p>
+  <p>So Kubernetes limits are just cgroup knobs: a CPU limit is a quota per period — exceed it and your threads are <strong>throttled</strong> (paused mid-request, a classic tail-latency source); a memory limit is a ceiling — exceed it and the OOM killer terminates the container (<code>OOMKilled</code>, exit 137). Everything in §§2–6 applies unchanged inside a pod.</p>
+
+  <h2>8 · Sharp edges: how the OS kills your p99</h2>
+  <ul>
+    <li><strong>Swap on a serving box.</strong> One cold page in the request path adds milliseconds; §4's math says 1% faulting = 100× slowdown. Disable swap; size for the working set.</li>
+    <li><strong>OOM killer roulette.</strong> Under memory pressure the kernel kills by heuristic score — often your biggest process, i.e. the model server itself. Set limits so the <em>right</em> thing dies predictably.</li>
+    <li><strong>CPU-limit throttling.</strong> A pod with limit 1.0 CPU that bursts to 4 threads gets frozen ~75% of each quota period. Looks exactly like random 100 ms stalls in traces.</li>
+    <li><strong>Lazy allocation surprise.</strong> "Preallocated" buffers still fault on first touch; overcommit means the allocation that "succeeded" can still OOM later, on a write.</li>
+    <li><strong>fork() in a threaded process.</strong> The child inherits only the calling thread; any lock held by another thread stays locked forever in the child. (This ambushes Python multiprocessing users; more in p0-03.)</li>
+  </ul>
+
+  <h2>9 · Lab — fork, fault, thrash</h2>
+  <div class="callout"><span class="label">Hands-on (do this before the quiz)</span>
+    In <code>labs/lab-p0-02-processes-and-memory/</code>: <code>python3 os_lab.py</code> runs four experiments — thread vs fork vs spawn creation cost, allocation vs first-touch faulting, the LRU thrashing cliff, and context-switch ping-pong. Then do README exercises E1–E4: <em>predict, edit CONFIG, re-run, compare.</em> Wrong predictions are the deliverable — bring them to the next session.
+  </div>
+
+  <h2>10 · Project step</h2>
+  <p>For the spine project (LLM inference platform), write a one-page <strong>process &amp; memory plan</strong> for a single serving node: how many processes (gateway, scheduler, one worker per GPU?) and why processes rather than threads; what lives in each address space; what you pre-fault at startup (weights, KV block pool, arenas); the pod's cgroup memory limit and your target headroom over the measured working set; and swap policy (expected answer: off — defend it using §4's numbers). This sheet becomes the resource section of every later design rep, and its GPU version (KV-block math) arrives in lessons 22–26.</p>
+
+  <h2>Interview talking points</h2>
+  <ul>
+    <li>"Processes buy isolation, threads buy cheap sharing — so I pre-fork workers for blast-radius control and use threads or async inside each for I/O."</li>
+    <li>"Allocation is lazy: first touch pays a page fault. For latency-critical paths I pre-fault and pin memory at startup."</li>
+    <li>"A 1% page-fault rate makes memory effectively ~100× slower — which is why I run serving nodes with swap off and size RAM to the working set."</li>
+    <li>"Thrashing is a cliff, not a slope: the moment working sets exceed RAM, the machine does I/O instead of work. The OOM killer is the kernel choosing a fast death over that."</li>
+    <li>"Containers are processes wearing namespaces and cgroups — so CPU limits mean quota throttling in the tail, and memory limits mean OOMKilled, not graceful degradation."</li>
+    <li>"vLLM's PagedAttention is OS paging applied to the KV cache: fixed-size blocks, a per-request block table, on-demand allocation, copy-on-write sharing."</li>
+  </ul>
+
+  <h2>Check yourself</h2>
+  <div class="quiz" id="quiz"></div>
+
+  <h2>Primary source</h2>
+  <p>Read <strong>OSTEP's virtualization chapters</strong> — at minimum <a href="https://pages.cs.wisc.edu/~remzi/OSTEP/cpu-intro.pdf">Processes</a>, <a href="https://pages.cs.wisc.edu/~remzi/OSTEP/vm-paging.pdf">Paging</a>, and <a href="https://pages.cs.wisc.edu/~remzi/OSTEP/vm-beyondphys.pdf">Beyond Physical Memory</a> (the whole book is free at <a href="https://pages.cs.wisc.edu/~remzi/OSTEP/">pages.cs.wisc.edu/~remzi/OSTEP</a>). Free alternative with a guided path: the <a href="https://teachyourselfcs.com/#operating-systems">Teach Yourself CS operating-systems track</a>, which pairs OSTEP with Berkeley's CS 162 lectures.</p>
+
+  <footer class="lesson-footer">
+    <p><strong>Stuck or curious?</strong> Ask your teacher (the agent) anything — "why is a hard fault a good mental model for a KV-cache block recompute?" is an excellent follow-up question.</p>
+    <nav class="lesson-nav">
+      <span>◀ Prev: p0-01 · Data Structures for Systems</span>
+      <span>Next: p0-03 · Concurrency ▶</span>
+    </nav>
+  </footer>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+renderQuiz(document.getElementById('quiz'), {
+  title: 'Check yourself',
+  questions: [
+    {
+      q: 'A process differs from a thread mainly because a process has…',
+      options: [
+        'its own dedicated stack and registers',
+        'its own private virtual address space',
+        'its own scheduling priority per core',
+      ],
+      answer: 1,
+      explain: 'Threads also get their own stack and registers, and both are scheduled. The defining extra of a process is an isolated address space (own page table).',
+    },
+    {
+      q: 'Your service allocates a 2 GB buffer instantly, but the first pass writing through it is slow. Why?',
+      options: [
+        'First writes trigger page faults mapping physical frames',
+        'First writes must flush processor caches every time',
+        'First writes bypass the TLB on every access',
+      ],
+      answer: 0,
+      explain: 'Allocation only reserves virtual address space. On first touch of each page the OS takes a fault and maps a physical frame — the lab measured this directly.',
+    },
+    {
+      q: 'A host spends nearly all CPU time swapping pages in and out while useful work collapses. This state is called…',
+      options: [
+        'livelock caused by lock contention',
+        'starvation caused by priority inversion',
+        'thrashing caused by memory overcommit',
+      ],
+      answer: 2,
+      explain: 'When combined working sets exceed RAM, every fault evicts a soon-needed page, which faults again — thrashing. It is a cliff, which is why swap is disabled on serving boxes.',
+    },
+    {
+      q: 'Why do very short scheduler timeslices hurt throughput?',
+      options: [
+        'Shorter timeslices make each cache access slower',
+        'Context switch overhead consumes a larger fraction',
+        'Shorter timeslices raise every page fault cost',
+      ],
+      answer: 1,
+      explain: 'Each switch costs microseconds directly plus cold-cache refill. The shorter the slice, the larger the fraction of CPU time spent switching instead of working.',
+    },
+    {
+      q: "In Kubernetes, a container's CPU limit is enforced by…",
+      options: [
+        'cgroup quotas that throttle the process group',
+        'kernel namespaces that isolate the process group',
+        'hypervisor scheduling that preempts the process group',
+      ],
+      answer: 0,
+      explain: 'Namespaces control what a container can see; cgroups control what it can use. A CPU limit is a cgroup quota per period — exceeding it pauses (throttles) your threads.',
+    },
+  ],
+});
+</script>
+</body>
+</html>

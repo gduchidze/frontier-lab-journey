@@ -1,0 +1,225 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lesson 21 · Chat System — WhatsApp-scale Messaging</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<div class="lesson">
+  <header class="lesson-header">
+    <p class="kicker">Lesson 0021 · Phase 3 — Classic Design Reps · <a href="0021-chat-system.ka.html">ქართული ვერსია</a></p>
+    <h1>Chat System — WhatsApp-scale Messaging</h1>
+    <p class="dek">Every design so far was stateless behind a load balancer. Chat breaks that: millions of long-lived sockets, each one pinned to a specific box, and messages that must arrive once, in order, even to phones that are off.</p>
+  </header>
+
+  <div class="mission-tie">
+    <strong>Mission tie.</strong> The stateful connection-gateway tier you build here — long-lived sockets, a routing table answering "which box holds user X" — is exactly the pattern lesson 37 reuses to stream tokens from an inference cluster to 100k concurrent clients.
+  </div>
+
+  <div class="callout"><span class="label">Rep protocol</span>
+    This is a rep, not a read. FIRST: 40 minutes, alone, out loud — run the full lesson-0009 framework on the prompt in section 1 with no peeking. THEN read this reference solution and log every delta (missed requirement, unspent number, unnamed failure mode) as a learning record.
+  </div>
+
+  <h2>1 · The prompt, and what it actually tests</h2>
+  <p><em>"Design a messaging app like WhatsApp: 1:1 and group chats, delivery receipts, presence, works when the recipient is offline."</em></p>
+  <p>The twist that separates this rep from every previous one: <strong>statefulness</strong>. A feed or a URL shortener is request/response — any server can answer any request, so scaling is "add replicas behind the LB." Chat inverts that. A message to you must find <em>the specific machine currently holding your socket</em>, within a second, among hundreds of gateways. The interviewer is testing whether you notice that inversion and design for it explicitly: a connection-holding tier, a routing table, and a story for what happens when a socket-holding box dies.</p>
+  <p>Secondary tests hiding in the prompt: message <strong>ordering</strong> (why timestamps betray you), <strong>delivery guarantees</strong> (at-least-once plus dedup, not mythical exactly-once), and <strong>fanout discipline</strong> (groups and presence both explode if done naively). Each gets its own deep dive below.</p>
+
+  <h2>2 · Clarify (5–8 min)</h2>
+  <table>
+    <tr><th>Requirement</th><th>Decision to write down</th></tr>
+    <tr><td>1:1 chat</td><td>Core. Text messages, ~1 KB max.</td></tr>
+    <tr><td>Group chat</td><td>Yes, capped at ~500 members (WhatsApp itself capped groups at 256 for years, later 1024 — a cap is a <em>design decision</em>, it bounds fanout).</td></tr>
+    <tr><td>Delivery receipts</td><td>Sent / delivered / read — the three-state machine of section 6.</td></tr>
+    <tr><td>Presence</td><td>Online + last_seen for contacts.</td></tr>
+    <tr><td>Offline delivery</td><td>Required. Messages wait for the device, then drain in order.</td></tr>
+    <tr><td>Multi-device sync</td><td>Yes — phone + laptop see the same history.</td></tr>
+    <tr><td>Media</td><td><strong>Offer to scope out</strong>: "blob storage + CDN, message carries a URL" — one sentence, then back to messaging.</td></tr>
+  </table>
+  <p>Non-functional contract: delivery latency p95 &lt; ~500 ms when both parties are online; no message loss, no visible duplicates, per-conversation order preserved; 99.99% availability. Consistency note worth saying aloud: chat needs <em>per-conversation</em> ordering only — nobody can observe whether two different conversations interleave "correctly," and that relaxation is what makes the system shardable.</p>
+
+  <h2>3 · Estimate (~5 min) — and spend every number</h2>
+  <pre><code>Messages:  500M DAU × 40 msgs/day = 20B msgs/day
+           ÷ ~100k s/day ≈ 200k msg/s average, ×3 peak ≈ 600k msg/s inbound
+           each has ≥1 recipient → gateway egress ≥ 1.2M msg/s peak (groups push it higher)
+
+Sockets:   idle apps keep sockets open; assume ~20% of DAU concurrent → ~100M connections
+           WhatsApp-era folklore: 1–2M conns per tuned Erlang/FreeBSD box
+           (order-of-magnitude only — engineering lore, not a spec) → ~100 boxes;
+           a conservative 100k conns/box → ~1,000 boxes. Either way: a TIER, not a server.
+
+Storage:   20B msgs × ~100 B ≈ 2 TB/day ≈ 730 TB/year, text only, before media.</code></pre>
+  <p>Now spend them: <strong>600k msg/s</strong> → services talk through a partitioned queue, not RPC fan-in. <strong>100M sockets</strong> → the gateway tier is sized by memory and file descriptors, not CPU — and it must be a separate tier so the stateless chat logic can deploy independently of a million held connections. <strong>2 TB/day</strong> → a wide-column store partitioned by conversation (section 8), because no single Postgres eats 730 TB/year.</p>
+
+  <h2>4 · High-level design (~15 min)</h2>
+  <p><strong>Transport.</strong> WebSocket, not long polling: chat is bidirectional (server pushes messages <em>and</em> receipts <em>and</em> presence), and one persistent socket costs far less than reconnecting poll loops at 100M-client scale. Long polling is the fallback for networks that break WebSockets.</p>
+  <p><strong>The stateful part.</strong> A <strong>chat gateway</strong> tier terminates sockets. Gateways hold connections and do almost nothing else. When user X connects to gateway 42, the gateway writes <code>X → gw42</code> into a <strong>session/routing table</strong> (Redis: hot, small values, TTL-friendly). That table is the answer to the whole statefulness twist: "which box holds user X" becomes one lookup.</p>
+  <p><strong>Message flow</strong> — narrate it end to end:</p>
+  <pre><code>sender ──ws──▶ gateway A ──▶ chat service ──▶ message store (persist)
+                                   │              + assign seq (§5)
+                                   ▼
+                            queue (partitioned by conversation)
+                                   ▼
+                     routing lookup: recipient → gateway B?
+                       online  → push via gateway B ──ws──▶ recipient
+                       offline → per-device offline queue (§6)</code></pre>
+  <p><strong>The stateless part.</strong> History, search, contacts, login: plain HTTP APIs (<code>GET /conversations/{id}/messages?before_seq=N</code>) over the same message store — cacheable, replicable, boring on purpose. Splitting the boring HTTP plane from the socket plane is the design's main structural move.</p>
+
+  <h2>5 · Deep dive: message ordering</h2>
+  <p><strong>Why timestamps fail.</strong> Client clocks skew — NTP keeps well-behaved devices within tens of milliseconds, but phones drift by seconds. If Bob's clock runs 150 ms behind and he replies to Alice within 100 ms, sorting by client timestamp shows the <em>answer before the question</em>. Server receive-timestamps are better but still race across a multi-node service. Your lab manufactures exactly this bug.</p>
+  <p><strong>The fix: a single writer per conversation.</strong> Route every message in conversation C to one partition (hash <code>conversation_id</code>), where one writer assigns a monotonically increasing <strong>sequence number</strong>. Order is now defined by arrival at that single writer — no clock involved. This is the happens-before insight in practice: physical time cannot order concurrent events on different machines; a designated sequencer can. Clients render by <code>seq</code>, and gaps double as loss detection ("I have 41 and 43 — refetch 42").</p>
+  <p><strong>Dedup rides along</strong> (the lesson-0011 idempotency callback): the client attaches a UUID to each message before sending. Retries reuse the ID; server and recipients drop anything they've seen. Sequence numbers give order, client message IDs give exactly-once <em>effect</em> — you need both.</p>
+
+  <h2>6 · Deep dive: delivery guarantees</h2>
+  <p>The receipt ticks are a state machine, each transition driven by an ack:</p>
+  <table>
+    <tr><th>State</th><th>Transition trigger</th></tr>
+    <tr><td><strong>sent</strong> (one tick)</td><td>Chat service persisted the message and acked the sender.</td></tr>
+    <tr><td><strong>delivered</strong> (two ticks)</td><td>Recipient's <em>device</em> acked receipt back through its gateway.</td></tr>
+    <tr><td><strong>read</strong> (blue)</td><td>Recipient's client reported the conversation opened.</td></tr>
+  </table>
+  <p><strong>The guarantee is at-least-once + dedup.</strong> Networks lose packets and lose acks; the only honest policy is: retry until acked, and make redelivery harmless via message-ID dedup (§5). Exactly-once <em>delivery</em> is impossible over a lossy network; exactly-once <em>appearance</em> is what you engineer.</p>
+  <p><strong>Offline path.</strong> If the routing lookup finds no live socket, the message lands in a per-device <strong>offline queue</strong>, ordered by seq. On reconnect the device sends its last-seen cursor and the queue drains in order. The ack protocol is cumulative — "I have everything through seq 47" — so one lost ack costs a cheap redelivery, not a lost message. Mobile wrinkle worth one sentence: the OS push notification (APNs/FCM) is only a <em>wake-up signal</em>; the actual messages come from your queue when the socket returns.</p>
+
+  <h2>7 · Deep dive: presence</h2>
+  <p>Presence is a heartbeat protocol: the client pings over its socket every ~10 s; miss a few and the server marks the user offline, recording <code>last_seen</code>. Disconnect events (gateway noticed the socket die) do the same immediately.</p>
+  <p><strong>Why naive fanout explodes.</strong> Every online↔offline transition, pushed to every contact, is fanout applied to your <em>flakiest</em> event source. A subway ride can flap a phone dozens of times an hour; multiply by ~200 contacts and by hundreds of millions of users, and presence traffic dwarfs message traffic — for updates nobody is looking at.</p>
+  <p>Three standard dampers:</p>
+  <ul>
+    <li><strong>Debounce.</strong> Publish a transition only after it has been stable for tens of seconds; a flap that heals in 5 s never leaves the server.</li>
+    <li><strong>Pull on open.</strong> When the app opens, <em>fetch</em> presence for the chat list. No standing subscription for people you aren't looking at.</li>
+    <li><strong>Subscribe narrowly.</strong> Live updates only for the conversation currently on screen; unsubscribe on close.</li>
+  </ul>
+  <p>The senior sentence: "presence is best-effort, eventually-consistent data — I'll happily show a 30-second-stale last_seen to avoid melting the fanout tier." A wrong receipt is a bug; a slightly stale presence dot is Tuesday.</p>
+
+  <h2>8 · Deep dive: group chat, storage, multi-device</h2>
+  <p><strong>Group fanout.</strong> One message to a 500-member group = 1 write + up to 500 deliveries: one routing lookup and push per online member, offline-queue append per offline device. This is why the member cap from Clarify matters — it bounds worst-case fanout to 500×, unlike the feed lesson's unbounded celebrity problem. The chat service fans out <em>after</em> the single persist + seq assignment, so the group still has one writer and one order everyone agrees on.</p>
+  <p><strong>Message store.</strong> Write-heavy, append-only, read-by-conversation — a wide-column fit. Discord's messages-store writeup describes exactly this shape in Cassandra: partition by channel (plus a time bucket so hot channels don't grow unbounded partitions), cluster by time-ordered message ID descending. Our schema:</p>
+  <pre><code>messages(
+  PARTITION KEY (conversation_id, bucket),   -- bucket ≈ 10 days, caps partition size
+  CLUSTERING KEY seq DESC,                   -- newest first, already sorted on disk
+  sender_id, msg_id, body, sent_at)</code></pre>
+  <p>"Load this conversation" = one partition, pre-sorted — the read pattern <em>is</em> the schema.</p>
+  <p><strong>Multi-device sync</strong> is per-device cursors: each device tracks the last seq it has per conversation and catches up independently through the same offline-queue path. The server prunes a message's queue entry once every registered device's cursor passes it (or a TTL expires).</p>
+
+  <h2>9 · Failure modes + monitoring</h2>
+  <table>
+    <tr><th>Failure</th><th>Blast radius</th><th>Mitigation</th></tr>
+    <tr><td>Gateway dies (1M sockets)</td><td>1M clients reconnect at once — a thundering herd of TLS handshakes, auth checks, and routing-table writes against the surviving tier</td><td>Client reconnect with jittered exponential backoff; spare capacity (N+2); nothing durable lives on a gateway, so death loses zero messages — only sockets</td></tr>
+    <tr><td>Queue lag</td><td>Messages arrive late; both users online yet "delivered" crawls</td><td>Page on end-to-end delivery latency p99 and per-partition consumer lag — this is the metric that <em>is</em> the product</td></tr>
+    <tr><td>Routing-table split brain</td><td>Stale entry says X is on gw42; gw42 is dead → pushes vanish into a black hole</td><td>TTL on entries, refreshed by gateway heartbeat; push failure → treat recipient as offline and fall back to the offline queue (the queue is the safety net for <em>every</em> delivery doubt)</td></tr>
+    <tr><td>Offline queue backlog</td><td>Returning device faces 10k queued messages</td><td>Paginated drain, newest-conversation first; cap retention with TTL, older history via the HTTP path</td></tr>
+  </table>
+  <p>Dashboard: delivery latency p50/p99, connected-socket count per gateway, reconnect rate (herd detector), queue lag per partition, receipt-transition rates.</p>
+
+  <h2>10 · Variants and twists</h2>
+  <ul>
+    <li><strong>E2E encryption.</strong> With Signal-protocol E2EE (WhatsApp's actual deployment) the server relays ciphertext it cannot read: server-side search, spam scanning, and abuse review of content disappear; delivery, ordering, receipts, and presence all survive because they're metadata. Be ready to say which features die.</li>
+    <li><strong>Read-receipt privacy.</strong> Receipts leak behavior; the classic policy is reciprocity — disable sending yours and you stop seeing others'. A product constraint implemented as one server-side check.</li>
+    <li><strong>Federation.</strong> Matrix/XMPP-style server-to-server chat replaces your routing table with inter-domain routing and trust — name the trade: reach and openness versus losing single-operator control of ordering and abuse handling.</li>
+  </ul>
+  <p><strong>AI twist (one paragraph, on request only).</strong> An LLM assistant in a chat is just another conversation member whose replies stream token-by-token — the gateway pushes partial-message frames over the same socket, and per-conversation seq still orders the final message. Same tier, new producer; lesson 37 builds this out.</p>
+
+  <h2>11 · Interview talking points</h2>
+  <ul>
+    <li><em>Naming the twist:</em> "Everything before the gateway is stateless; the gateway tier is deliberately the only stateful part, and the Redis routing table is how the stateless world finds it."</li>
+    <li><em>Spending a number:</em> "100M concurrent sockets is why the gateway is its own tier — it scales on memory and descriptors while chat logic scales on CPU."</li>
+    <li><em>Ordering:</em> "I won't order by timestamps — clock skew reorders fast replies. One writer per conversation partition assigns seq; clocks never vote."</li>
+    <li><em>Delivery:</em> "At-least-once plus client-message-ID dedup. Exactly-once delivery is impossible; exactly-once appearance is engineerable."</li>
+    <li><em>Unprompted failure mode:</em> "A dying gateway drops a million sockets — the danger isn't lost messages (gateways hold none), it's the reconnect storm. Jittered backoff, and the offline queue catches anything in flight."</li>
+    <li><em>Presence discipline:</em> "Presence is best-effort by design — debounce flaps, pull on open, subscribe only to the visible chat."</li>
+  </ul>
+
+  <h2>12 · Lab + project step</h2>
+  <div class="callout"><span class="label">Hands-on (do this before the quiz)</span>
+    In <code>labs/lab-0021-chat-ordering/</code>, <code>python3 chat_lab.py</code> manufactures all four §5–§6 bugs on your machine: clock-skewed timestamps scrambling a conversation, server seq fixing it, retry duplicates appearing and dying to message-ID dedup, and an offline queue draining in order. Predict each transcript before you run — the README's E1–E4 walk you through it.
+  </div>
+  <p><strong>Project step.</strong> One page in your project notes: your inference platform's streaming layer as a chat system — clients hold sockets to a gateway tier, "which gateway holds session X" lives in the same routing table, and generated tokens are messages with per-request seq. Note the one asymmetry (tokens flow one way; there are no receipts) — this page becomes the skeleton of lesson 37.</p>
+
+  <h2>Check yourself</h2>
+  <div class="quiz" id="quiz"></div>
+
+  <h2>Primary source</h2>
+  <p>Read <strong>Discord — <a href="https://blog.discord.com/how-discord-stores-billions-of-messages-7fa6ec7ee4c7">How Discord Stores Billions of Messages</a></strong> for the conversation-partitioned message store running in production, and <strong>High Scalability — <a href="http://highscalability.com/blog/2014/2/26/the-whatsapp-architecture-facebook-bought-for-19-billion.html">The WhatsApp Architecture</a></strong> for where the millions-of-connections-per-box lore actually comes from (and what it took: Erlang, FreeBSD, and obsessive tuning).</p>
+
+  <footer class="lesson-footer">
+    <p><strong>Stuck or curious?</strong> Ask your teacher (the agent) anything — "how would I add typing indicators without recreating the presence explosion?" is an excellent follow-up question.</p>
+    <nav class="lesson-nav">
+      <span>◀ <a href="0020-news-feed.html">0020 · News Feed</a></span>
+      <span><a href="0022-file-sync.html">0022 · File Sync</a> ▶</span>
+    </nav>
+  </footer>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+renderQuiz(document.getElementById('quiz'), {
+  title: 'Check yourself',
+  questions: [
+    {
+      q: 'Why do sender-side timestamps fail to order messages within a conversation?',
+      options: [
+        'Timestamps use too many bytes for efficient storage at scale',
+        'Client clocks skew, so timestamps disagree with real send order',
+        'Servers cannot parse timestamps fast enough during heavy traffic peaks',
+      ],
+      answer: 1,
+      explain: 'A fast reply from a clock running 150 ms behind sorts before the message it answers. Physical clocks cannot order events across machines; a per-conversation sequencer can.',
+    },
+    {
+      q: 'What makes per-conversation sequence numbers a safe ordering source?',
+      options: [
+        'A single writer per conversation assigns them monotonically, gap-free',
+        'They compress better than timestamps in the message store',
+        'Clients generate them locally without any server round trip',
+      ],
+      answer: 0,
+      explain: 'Order is defined by arrival at one designated writer (the conversation\'s partition) — no clock involved. Gaps in seq even double as loss detection for clients.',
+    },
+    {
+      q: 'At-least-once delivery plus retries produces duplicates. What removes them?',
+      options: [
+        'The network layer guarantees each packet arrives exactly once',
+        'The server slows retries until duplicates stop appearing entirely',
+        'The recipient deduplicates using the client-assigned unique message ID',
+      ],
+      answer: 2,
+      explain: 'Exactly-once delivery over a lossy network is impossible — the honest design retries until acked and makes redelivery harmless by dropping already-seen message IDs.',
+    },
+    {
+      q: 'Why does naive presence fanout explode at WhatsApp scale?',
+      options: [
+        'Every status flap notifies every contact, multiplying tiny events enormously',
+        'Presence packets are large, so bandwidth costs dominate everything else',
+        'Each heartbeat requires a disk write, locking database tables briefly',
+      ],
+      answer: 0,
+      explain: 'Flaky mobile connectivity makes online/offline transitions constant; each one × ~200 contacts × hundreds of millions of users dwarfs message traffic. Debounce, pull-on-open, and narrow subscriptions damp it.',
+    },
+    {
+      q: 'A chat gateway holding one million connections crashes. What follows?',
+      options: [
+        'Messages are lost forever since gateways persist nothing durable there',
+        'Nothing happens because WebSocket connections migrate transparently between healthy servers',
+        'Those clients all reconnect at once, hammering the remaining gateways',
+      ],
+      answer: 2,
+      explain: 'Sockets cannot migrate; every client notices and reconnects — a thundering herd of handshakes and routing-table writes. Jittered backoff spreads it, and no messages are lost precisely because gateways hold no durable state.',
+    },
+    {
+      q: 'Why partition the message store by conversation, clustered by sequence number?',
+      options: [
+        'Partitions shrink automatically whenever old conversations become completely inactive later',
+        'One partition read returns a conversation\'s messages already in order',
+        'Each replica stores every single message, making reads always local',
+      ],
+      answer: 1,
+      explain: 'The dominant read is "load this conversation, newest first" — partitioning by conversation_id with seq as the clustering key makes that a single pre-sorted partition read, the shape Discord runs in Cassandra.',
+    },
+  ],
+});
+</script>
+</body>
+</html>

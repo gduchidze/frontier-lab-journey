@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lesson 17 · Security &amp; Multi-Tenancy</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<div class="lesson">
+  <header class="lesson-header">
+    <p class="kicker">Lesson 0017 · Phase 2 — Software Architecture &amp; Reliability · <a href="0017-security-and-multitenancy.ka.html">ქართული ვერსია</a></p>
+    <h1>Security &amp; Multi-Tenancy</h1>
+    <p class="dek">Who are you, what may you do, where do the secrets live, and how do you keep tenant A out of tenant B's data <em>and</em> tenant B's latency — the defensive vocabulary that turns "add auth" into a design.</p>
+  </header>
+
+  <div class="mission-tie">
+    <strong>Mission tie.</strong> Anthropic's design prompts — <em>"design the API for a multi-tenant SaaS platform"</em> — always grow a security limb: <em>"how does one customer's traffic not affect another's? how do you know this request is allowed to read this row?"</em> Candidates who wave at "we'll use JWTs" stall; candidates who name authN vs authZ, the token's audience check, the tenant-isolation model, and the rate-limit dimension keep going. This lesson gives you those names with the classic systems — a B2B SaaS app, a banking API, a Slack-like workspace product — where each one is load-bearing. (<a href="https://www.tryexponent.com/blog/anthropic-system-design-interview">Exponent's 2026 Anthropic guide</a>)
+  </div>
+
+  <h2>1 · The perimeter is dead — zero trust</h2>
+  <p>The old model was a castle: a hard firewall around a soft interior, and once you were "inside the network" you were trusted. That model died the day a single phished laptop or one compromised service could roam the whole internal network freely. The replacement is <strong>zero trust</strong>: there is no inside. Every hop authenticates, every hop is encrypted in transit, and every identity gets the least privilege that lets it do its job (<a href="https://research.google/pubs/pub43231/">Google, BeyondCorp: A New Approach to Enterprise Security</a>).</p>
+  <p>Three principles carry the whole lesson:</p>
+  <ul>
+    <li><strong>Authenticate every hop.</strong> The browser proves identity to the gateway; the gateway proves identity to the order service; the order service proves identity to the database. "It came from inside" is not a credential.</li>
+    <li><strong>Encrypt in transit, always.</strong> TLS on the edge <em>and</em> between internal services — the network is assumed hostile, because sometimes it is.</li>
+    <li><strong>Least privilege.</strong> The reporting service that only reads gets a read-only role. A leaked credential should unlock a room, not the building.</li>
+  </ul>
+  <p>Wrapping these is <strong>defense in depth</strong>: layered controls so no single failure is catastrophic. Auth at the edge, authz at the service, row filters at the database, secrets in a vault, rate limits in front — if one layer is bypassed, the next still holds. The canonical checklist of what those layers must resist is the <a href="https://owasp.org/www-project-top-ten/">OWASP Top 10</a>; the verification-requirements companion is the <a href="https://owasp.org/www-project-application-security-verification-standard/">OWASP ASVS</a>. Everything below is one of these layers.</p>
+
+  <h2>2 · AuthN vs AuthZ — two words people fuse into one</h2>
+  <p>The single most common vocabulary slip in an interview is treating authentication and authorization as one thing. They are separate systems that fail separately.</p>
+  <table>
+    <tr><th></th><th>Authentication (authN)</th><th>Authorization (authZ)</th></tr>
+    <tr><td>Question</td><td><em>Who are you?</em></td><td><em>What may you do?</em></td></tr>
+    <tr><td>Produces</td><td>A verified identity (a user, a service)</td><td>An allow / deny decision on an action</td></tr>
+    <tr><td>Runs</td><td>Once at the edge, per session/request</td><td>At every resource, per action, per tenant</td></tr>
+    <tr><td>Classic failure</td><td>Stolen password, forged token</td><td>Valid user reads another tenant's row</td></tr>
+    <tr><td>Models</td><td>Passwords, OAuth, mTLS, passkeys</td><td>RBAC, ABAC, row-level security, scopes</td></tr>
+  </table>
+  <p>The trap the interviewer is hunting for: a request can be <em>perfectly authenticated and still unauthorized</em>. A logged-in user of tenant A presenting a flawless token still must be denied tenant B's data — and that denial is authZ's job, checked at the resource, not authN's job at the door. Say this split out loud early; it structures the rest of your answer.</p>
+  <p><strong>Where identity lives between requests.</strong> Two shapes. <strong>Session cookies</strong>: the server stores session state, the cookie holds only an opaque ID; revocation is a row delete, and the cookie is scoped to one origin with <code>HttpOnly; Secure; SameSite</code>. <strong>Tokens</strong> (bearer): the client holds a signed credential and sends it on every request, often to many services; stateless to verify, but harder to revoke. Cookies suit a single web app; tokens suit APIs and service meshes (<a href="https://cheatsheetseries.owasp.org/cheatsheets/Session_Management_Cheat_Sheet.html">OWASP Session Management Cheat Sheet</a>).</p>
+
+  <h2>3 · OAuth2 &amp; OIDC — delegated access, then identity</h2>
+  <p>OAuth2 answers one precise question: <em>how does an app act on a user's behalf without holding the user's password?</em> It is a <strong>delegated authorization</strong> framework, not a login protocol. Four roles (<a href="https://www.rfc-editor.org/rfc/rfc6749">RFC 6749</a>, and the readable index at <a href="https://oauth.net/2/">oauth.net</a>):</p>
+  <table>
+    <tr><th>Role</th><th>Who it is</th><th>Example (Slack-style app)</th></tr>
+    <tr><td>Resource owner</td><td>The user who owns the data</td><td>The employee whose messages they are</td></tr>
+    <tr><td>Client</td><td>The app wanting access</td><td>A calendar bot requesting message scope</td></tr>
+    <tr><td>Authorization server</td><td>Issues tokens after consent</td><td>The workspace's identity provider</td></tr>
+    <tr><td>Resource server</td><td>Holds the data, checks the token</td><td>The messages API</td></tr>
+  </table>
+  <p><strong>Authorization-code flow with PKCE, in words</strong> (the flow to know cold): the client redirects the user to the authorization server with a <code>code_challenge</code> (the hash of a random secret it just generated). The user logs in and consents. The auth server redirects back with a short-lived <strong>authorization code</strong>. The client then calls the token endpoint, presenting the code <em>plus</em> the original <code>code_verifier</code>; the server hashes the verifier, checks it equals the challenge it stored, and only then returns tokens. <strong>PKCE</strong> (<a href="https://www.rfc-editor.org/rfc/rfc7636">RFC 7636</a>) closes the attack where a malicious app intercepts the redirected code: a stolen code is useless without the verifier that never left the real client. PKCE is now recommended for <em>all</em> clients, not just mobile.</p>
+  <p><strong>Client-credentials flow</strong> is the other one to name: no user at all — a service authenticates <em>as itself</em> to get a token for machine-to-machine calls (a nightly batch job calling the billing API). If there is a human and a consent screen, it's authorization-code; if it's a backend acting on its own behalf, it's client-credentials.</p>
+  <p><strong>OIDC is the identity layer OAuth2 lacks.</strong> OAuth2 grants <em>access</em>; it never actually tells the client <em>who logged in</em>. OpenID Connect adds a signed <strong>ID token</strong> (a JWT with the user's identity claims) issued alongside the access token, so "Sign in with Google" can both authenticate the user and be handed an access token (<a href="https://openid.net/specs/openid-connect-core-1_0.html">OIDC Core spec</a>). One-line memory hook: <em>access token = what you may do; ID token = who you are; OIDC = OAuth2 + identity</em>.</p>
+
+  <h2>4 · JWT, honestly</h2>
+  <p>A JSON Web Token is three base64url parts joined by dots — <code>header.payload.signature</code> (<a href="https://www.rfc-editor.org/rfc/rfc7519">RFC 7519</a>). The header names the algorithm; the payload holds <strong>claims</strong> (<code>sub</code>, <code>iss</code>, <code>aud</code>, <code>exp</code>, plus your own); the signature is an HMAC or RSA/ECDSA signature over the first two parts. The win is <strong>stateless verification</strong>: any service holding the signing key (or public key) can verify the token locally — no round trip to an auth database on every request. That is why JWTs dominate service meshes and horizontally-scaled APIs.</p>
+  <p>But stateless verification is exactly the catch: <strong>you cannot un-issue a JWT</strong>. Once signed and handed out, it is valid until it expires, whatever happens to the user meanwhile. The honest mitigations:</p>
+  <ul>
+    <li><strong>Short TTL + refresh tokens.</strong> Access tokens live minutes; a long-lived refresh token (revocable, stored server-side) mints new ones. A fired employee loses access within the access-token TTL, not instantly — state the window out loud.</li>
+    <li><strong>Denylist</strong> for the "revoke now" case: a small store of blacklisted token IDs (<code>jti</code>) checked on each request. This re-introduces state, which is the whole point — you trade a lookup for real-time revocation on the tokens that matter.</li>
+  </ul>
+  <p><strong>The pitfalls interviewers probe:</strong></p>
+  <ul>
+    <li><strong><code>alg=none</code>.</strong> Early libraries honored a header claiming "no algorithm" and skipped signature verification — so an attacker strips the signature, sets <code>alg</code> to <code>none</code>, and forges any claims they like. A strict verifier must <em>pin the expected algorithm</em> and reject anything else (<a href="https://auth0.com/blog/critical-vulnerabilities-in-json-web-token-libraries/">Auth0: critical JWT vulnerabilities</a>). You will exploit this exact bug in the lab.</li>
+    <li><strong>Key confusion (RS256 → HS256).</strong> If the verifier lets the token pick the family, an attacker signs with HMAC using the <em>public</em> RSA key as the secret; a naive library "verifies" it. Pin the algorithm.</li>
+    <li><strong>Audience unchecked.</strong> A token minted for service X, if X never verifies <code>aud</code>, is happily accepted by service Y. Verifying the signature is not enough — <em>verify <code>iss</code>, <code>aud</code>, and <code>exp</code> too</em>.</li>
+    <li><strong>Secrets in claims.</strong> The payload is signed, not encrypted — it is base64, readable by anyone holding the token. Never put passwords, PII, or keys in claims.</li>
+  </ul>
+  <p><strong>The alternative: opaque tokens + introspection.</strong> Instead of a self-describing JWT, hand out a random string that means nothing on its own; the resource server calls the auth server's <strong>introspection endpoint</strong> (<a href="https://www.rfc-editor.org/rfc/rfc7662">RFC 7662</a>) to ask "is this live, and what does it grant?" Revocation is instant (delete the row), but you pay a network hop per verification.</p>
+  <table>
+    <tr><th></th><th>JWT (self-contained)</th><th>Opaque token + introspection</th></tr>
+    <tr><td>Verify</td><td>Local, offline, signature only</td><td>Network call to auth server</td></tr>
+    <tr><td>Revocation</td><td>Hard — TTL or denylist</td><td>Instant — delete the record</td></tr>
+    <tr><td>Scales to N services</td><td>Cheaply (no central bottleneck)</td><td>Auth server becomes hot path</td></tr>
+    <tr><td>Leaks on decode</td><td>All claims are readable</td><td>Nothing — it's just an ID</td></tr>
+    <tr><td>Best for</td><td>High-fanout internal APIs</td><td>Sensitive, revocation-critical access</td></tr>
+  </table>
+  <p>Interview move: default to short-TTL JWTs for scale, add a denylist for the revoke-now cases, and reach for opaque tokens when the data is sensitive enough that instant revocation beats offline verification (<a href="https://developer.okta.com/docs/guides/validate-access-tokens/main/">Okta: validating access tokens</a>).</p>
+
+  <h2>5 · Service-to-service — proving identity between machines</h2>
+  <p>Inside the mesh, "the call came from the order service" needs proof, not a hostname. Three mechanisms, weakest to strongest:</p>
+  <table>
+    <tr><th>Mechanism</th><th>How it proves identity</th><th>Weakness</th></tr>
+    <tr><td><strong>Shared API key</strong></td><td>Caller sends a secret string</td><td>One side only; leaks are silent, rotation is manual</td></tr>
+    <tr><td><strong>Signed token</strong> (JWT)</td><td>Caller presents a signed identity claim</td><td>Bearer — a stolen token is fully usable</td></tr>
+    <tr><td><strong>mTLS</strong></td><td><em>Both</em> sides present certificates; each verifies the other</td><td>Cert lifecycle is real work (that's what the mesh is for)</td></tr>
+  </table>
+  <p><strong>Mutual TLS</strong> is the zero-trust default for internal traffic: ordinary TLS proves the <em>server's</em> identity to the client; mTLS additionally makes the client present a certificate, so both ends are cryptographically identified and the channel is encrypted. The operational cost — issuing, distributing, and rotating thousands of short-lived certs — is exactly why service meshes exist. <strong>SPIFFE/SPIRE</strong> gives every workload a verifiable identity document (a SVID) and rotates it automatically (<a href="https://spiffe.io/docs/latest/spiffe-about/overview/">SPIFFE overview</a>); <strong>Istio</strong> can turn on mTLS mesh-wide and handle rotation without app changes (<a href="https://istio.io/latest/docs/concepts/security/">Istio security concepts</a>). Say "mesh-managed mTLS with short-lived certs" and you have named the whole pattern. API keys still have a place — third-party developer access at the public edge — but inside the mesh they are the weak option because they authenticate only one direction and leak without a trace.</p>
+
+  <h2>6 · Secrets management</h2>
+  <p>The first failure is upstream of any algorithm: <strong>secrets in the code, or in an <code>.env</code> file committed to git</strong>. Once a credential is in git history it is compromised forever — rotate it, don't just delete the file. The correct model is a central <strong>secrets manager</strong> (<a href="https://developer.hashicorp.com/vault/docs/what-is-vault">HashiCorp Vault</a>, AWS Secrets Manager, cloud KMS-backed stores) with four properties:</p>
+  <ul>
+    <li><strong>Central store, not scattered files.</strong> One audited system holds secrets; apps fetch at boot or on demand with their own identity.</li>
+    <li><strong>Short-lived dynamic credentials.</strong> The best database password is one Vault generates on request and revokes minutes later — a leaked credential has already expired. Static long-lived secrets are the ones that hurt.</li>
+    <li><strong>Audit log.</strong> Every read is recorded: who fetched which secret, when. After an incident you can answer "what was exposed?"</li>
+    <li><strong>Rotation as routine.</strong> Secrets rotate on a schedule and on demand, without a deploy.</li>
+  </ul>
+  <p><strong>Data at rest: envelope encryption.</strong> You don't encrypt a terabyte with the master key. Instead a <strong>KMS</strong> holds a root <em>key-encryption key</em> (KEK) that never leaves the hardware; each dataset gets its own <strong>data-encryption key</strong> (DEK) which encrypts the data, and the DEK is stored next to the data <em>encrypted by the KEK</em>. To read, you ask KMS to unwrap the DEK; to rotate the master, you re-wrap DEKs, not re-encrypt petabytes (<a href="https://docs.aws.amazon.com/kms/latest/developerguide/concepts.html#enveloping">AWS KMS: envelope encryption</a>). This is how per-tenant encryption keys become practical — a DEK per tenant, all wrapped by one KEK.</p>
+
+  <h2>7 · Rate limiting as a security control</h2>
+  <p>Rate limiting is usually filed under "capacity," but half its value is <strong>security</strong>. It is the cheapest defense against a family of abuse:</p>
+  <ul>
+    <li><strong>Brute force</strong> — guessing one account's password. A limiter of 5 attempts / minute / account turns a million-guess attack into a two-century one.</li>
+    <li><strong>Credential stuffing</strong> — replaying breached username/password pairs across your login (<a href="https://owasp.org/www-community/attacks/Credential_stuffing">OWASP: credential stuffing</a>). This one is <em>spread thin</em> across many accounts, so a per-account limit misses it — you also need per-IP and global-anomaly limits.</li>
+    <li><strong>Scraping</strong> — draining your catalog or user directory through the public API.</li>
+    <li><strong>Abuse economics.</strong> The frame that lands in interviews: your job is to make the attack <em>cost more than it yields</em>. Every 429 you return raises the attacker's cost per attempt; you don't need to block them, only to make them unprofitable.</li>
+  </ul>
+  <p><strong>The three dimensions</strong> you key the limiter on, and why you usually need more than one:</p>
+  <table>
+    <tr><th>Dimension</th><th>Catches</th><th>Blind spot</th></tr>
+    <tr><td><strong>Per-API-key</strong></td><td>One customer's runaway integration</td><td>Attacker rotating through many keys</td></tr>
+    <tr><td><strong>Per-IP</strong></td><td>A single abusive host</td><td>NAT (a whole office = one IP); botnets (many IPs)</td></tr>
+    <tr><td><strong>Per-tenant</strong></td><td>One tenant starving the platform</td><td>Cross-tenant distributed abuse</td></tr>
+  </table>
+  <p>Two design notes that separate a real answer from a textbook one. First, return <strong>429 Too Many Requests</strong> with a <code>Retry-After</code> header — a well-behaved client backs off, a bad one identifies itself. Second, <strong>protect the limiter itself</strong>: do the cheap rejection <em>before</em> the expensive work. Checking a token bucket must not require a database read or a full auth handshake, or the check becomes the DoS. Push the cheapest possible reject (IP/key bucket in memory or Redis) as early in the request path as you can, ahead of auth where the endpoint allows it. Lesson 18 takes this further into full overload and load-shedding behavior (<a href="https://sre.google/sre-book/handling-overload/">Google SRE: Handling Overload</a>) — here the point is only that the limiter is a <em>security</em> layer, and it must survive the attack it's defending against.</p>
+
+  <h2>8 · Multi-tenancy isolation models</h2>
+  <p>One platform, many customers (tenants) whose data and performance must not bleed into each other. The core decision — memorize this table, it is the spine of any SaaS design answer (<a href="https://docs.aws.amazon.com/wellarchitected/latest/saas-lens/tenant-isolation.html">AWS SaaS Lens: tenant isolation</a>):</p>
+  <table>
+    <tr><th>Model</th><th>Layout</th><th>Isolation</th><th>Cost / density</th><th>Ops burden</th></tr>
+    <tr><td><strong>Silo</strong></td><td>DB (or stack) per tenant</td><td>Strongest — physical separation</td><td>Worst — pay per tenant, idle or not</td><td>Migrations &amp; backups ×N tenants</td></tr>
+    <tr><td><strong>Bridge</strong></td><td>Shared DB, schema per tenant</td><td>Medium — logical separation</td><td>Better — one cluster, many schemas</td><td>Migrations ×N schemas, one fleet</td></tr>
+    <tr><td><strong>Pool</strong></td><td>Shared tables, <code>tenant_id</code> column</td><td>Weakest — a filter is the only wall</td><td>Best — full density, one everything</td><td>Lowest ops, highest blast radius</td></tr>
+  </table>
+  <p><strong>The arithmetic interviewers want to hear.</strong> Say 500 tenants. <em>Silo</em>: a small managed Postgres runs ~$50/mo, so 500 idle-or-not instances ≈ <code>500 × $50 = $25,000/mo</code> in database floor alone, plus 500 backup jobs and 500 migration runs per release. <em>Pool</em>: one 3-node cluster at ~$2,000/mo ≈ <code>$6,000/mo</code> shared across all 500, one migration per release. That's roughly a <strong>4× infrastructure gap</strong> and an <em>N× vs constant</em> ops gap — and it flips the moment one tenant is a bank that will pay for a silo and walk over a shared table. There is no best model; there is a best model <em>per tenant tier</em>, and mature SaaS runs a mix (pool for the long tail, silo for the whales).</p>
+  <p><strong>Hardening the pool with row-level security.</strong> The pool model's whole risk is that isolation rides on every query remembering <code>WHERE tenant_id = ?</code>. Postgres <strong>RLS</strong> moves that wall into the database: attach a policy like <code>USING (tenant_id = current_setting('app.tenant_id'))</code> and the engine appends the filter to <em>every</em> query automatically — a helper that forgets the filter still cannot see another tenant's rows (<a href="https://www.postgresql.org/docs/current/ddl-rowsecurity.html">PostgreSQL: Row Security Policies</a>). It turns "hope every developer remembers" into "the database enforces it."</p>
+  <p><strong>Noisy neighbor = performance isolation.</strong> Data isolation is only half. In the pool model tenants share workers, connections, and queues, so one tenant's batch job can starve everyone else's latency — the <em>noisy neighbor</em>. The fixes are the performance twin of RLS: <strong>per-tenant quotas</strong> (token buckets per tenant, §7), <strong>fair queuing</strong> (round-robin or weighted dequeue so no tenant monopolizes the worker pool), and <strong>bulkheads</strong> (isolate resource pools so one tenant's saturation can't sink the ship — from <em>Release It!</em>). Isolation is two invariants, not one: <em>tenant A can't read tenant B's data, and tenant A can't consume tenant B's capacity.</em> You will make both fail and then fix them in the lab.</p>
+
+  <h2>9 · The failure modes that decide interviews</h2>
+  <p>Security bugs are rarely exotic; they are one missing check. The classics interviewers reach for:</p>
+  <ul>
+    <li><strong>Missing <code>tenant_id</code> on one query.</strong> The signature SaaS bug: four of five query helpers filter by tenant, the fifth forgets, and tenant A sees tenant B's orders. It passes every test that uses one tenant. Defense: RLS or a default-scoped data layer so the filter is <em>structural</em>, never per-query discipline.</li>
+    <li><strong>JWT verified but audience unchecked.</strong> The signature is valid, <code>exp</code> is fine, so the service accepts a token that was minted for a <em>different</em> service. Always check <code>aud</code> and <code>iss</code>, not just the signature.</li>
+    <li><strong>Long-lived leaked API key, no rotation.</strong> A key committed to a public repo two years ago still works, because nothing expires and nothing rotates. Short-lived credentials would have closed the window automatically.</li>
+    <li><strong>Rate limiter keyed on IP behind NAT.</strong> A 300-person office shares one egress IP; your per-IP login limit locks out the entire company on a few fat-fingered passwords. Key sensitive limits on the <em>account</em>, and treat IP as one signal among several.</li>
+    <li><strong>One tenant's batch job starves the pool.</strong> No fair queuing, so a single tenant's bulk export fills the shared worker queue and every other tenant's p99 explodes — a data-isolated system with zero performance isolation. Per-tenant quotas plus fair dequeue restore it.</li>
+  </ul>
+
+  <h2>10 · One AI note, then back to fundamentals</h2>
+  <p>Everything above transfers unchanged to a multi-tenant inference platform. <strong>Per-tenant token quotas + fair scheduling on the GPU queue</strong> is exactly §8's noisy-neighbor problem — one tenant's flood of long-context requests must not blow up another tenant's TTFT, so the batching scheduler dequeues fairly (weighted by tier) rather than FIFO. <strong>Prompt and output logs are sensitive data</strong>: treat them like PII — encrypt at rest with per-tenant DEKs (§6), set a retention policy, and never let them into JWT claims or shared logs. And <strong>model access is an authZ scope</strong>: "may tenant A call the 70B model?" is a scope check on the access token (§4), identical to any RBAC decision. Same patterns, GPU-priced blast radius. That's the note; §1–§9 are what the interview is grading.</p>
+
+  <h2>11 · Interview talking points</h2>
+  <p>How to deploy this lesson live, in order:</p>
+  <ol>
+    <li><strong>Split authN from authZ in the first sentence.</strong> "The gateway authenticates the caller; each service authorizes the action against the tenant." This alone signals you won't conflate them (§2).</li>
+    <li><strong>Name the token shape and its revocation story.</strong> "Short-TTL JWTs for internal fan-out, a denylist for revoke-now, opaque tokens on the sensitive path" — pattern plus its weakness (§4).</li>
+    <li><strong>Say mTLS for east-west traffic</strong> and let the mesh own cert rotation (§5): "SPIFFE identities, mesh-managed mTLS, no app changes."</li>
+    <li><strong>Put secrets in a vault out loud</strong> (§6): "dynamic short-lived DB creds from Vault, envelope encryption with per-tenant DEKs — nothing sensitive in code or env."</li>
+    <li><strong>Frame rate limiting as security</strong> (§7): "per-account limit for brute force, per-IP and global for credential stuffing, cheap reject before auth so the limiter survives the attack."</li>
+    <li><strong>Pick a tenancy model and defend the mix</strong> (§8): "pool with RLS for the long tail, silo for regulated whales — here's the 4× cost math." Then name performance isolation, not just data.</li>
+    <li><strong>Raise the failure modes before the interviewer does</strong> (§9): "the risk is a query that forgets <code>tenant_id</code> — that's why isolation lives in RLS, not in code review."</li>
+  </ol>
+
+  <h2>12 · Lab — break tenant isolation yourself</h2>
+  <div class="callout"><span class="label">Hands-on (do this before the quiz)</span>
+    Everything above is now verifiable in <code>labs/lab-0017-tenant-isolation/</code>:
+    <code>python3 tenant_lab.py</code> runs three experiments — a JWT forgery drill (valid passes; tampered
+    and expired fail; an <code>alg=none</code> token that a naive verifier <em>accepts</em> and a strict verifier
+    <em>rejects</em>, with the forged-admit count going to zero), a noisy-neighbor run (tenant B floods 10×;
+    a FIFO shared queue explodes tenant A's p99, then per-tenant token buckets + round-robin fair dequeue
+    restore it and throttle B with counted 429s), and a pool-model leak drill (five query helpers, one
+    forgets its <code>tenant_id</code> filter; an invariant checker scans results and names the guilty helper).
+    Then do exercises E1–E4 in the lab README: <em>predict, edit config, re-run, compare.</em>
+    Wrong predictions are the deliverable — bring them to the next session.
+  </div>
+
+  <h2>13 · Project step</h2>
+  <p>Decision time for the <strong>LLM inference platform</strong>: choose its tenancy model <em>and</em> its authentication scheme, and defend both in two sentences. A defensible pick: <em>pool model with Postgres RLS and per-tenant token-bucket quotas plus fair GPU-queue scheduling (full density for the long tail, hard data and performance walls), fronted by short-TTL OIDC access tokens with audience checks and mesh-managed mTLS between the gateway, router, and workers.</em> Write your own two sentences — tenancy model + authN scheme, each justified — and bring them to the next session for critique.</p>
+
+  <h2>Check yourself</h2>
+  <div class="quiz" id="quiz"></div>
+
+  <h2>Primary source</h2>
+  <p>Read <strong>OAuth2 (<a href="https://www.rfc-editor.org/rfc/rfc6749">RFC 6749</a>) §1 for the roles and §4.1 for the authorization-code flow</strong>, then <strong>JWT (<a href="https://www.rfc-editor.org/rfc/rfc7519">RFC 7519</a>) §4 for registered claims</strong> — the exact vocabulary interviewers use, straight from the spec. For the tenancy half, the <strong><a href="https://docs.aws.amazon.com/wellarchitected/latest/saas-lens/tenant-isolation.html">AWS SaaS Lens tenant-isolation</a></strong> chapter is the best free treatment of silo/bridge/pool with the cost and blast-radius trade-offs spelled out. Round it out with <strong><a href="https://research.google/pubs/pub43231/">Google's BeyondCorp paper</a></strong> for the zero-trust framing and the <strong><a href="https://owasp.org/www-project-top-ten/">OWASP Top 10</a></strong> for the checklist of what your layers must resist.</p>
+
+  <footer class="lesson-footer">
+    <p><strong>Stuck or curious?</strong> Ask your teacher (the agent) anything — "why does checking a JWT's signature but not its <code>aud</code> claim still let a token cross service boundaries?" is an excellent follow-up question.</p>
+    <nav class="lesson-nav">
+      <span><a href="0016-observability-and-ops.html">◀ Prev: 0016 · Observability &amp; Ops</a></span>
+      <span><a href="../index.html">Next: Phase 3 — Classic Design Reps (coming) ▶</a></span>
+    </nav>
+  </footer>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+renderQuiz(document.getElementById('quiz'), {
+  title: 'Check yourself',
+  questions: [
+    {
+      q: "A caller presents a valid token but requests another tenant's records. Which control is responsible for blocking it?",
+      options: [
+        'Authorization decides whether an identity may act',
+        'Authentication merely proves who the caller claims',
+        'Transport encryption hides the payload from eavesdroppers',
+      ],
+      answer: 0,
+      explain: 'The token is authenticated — identity is proven — but reading another tenant’s data is an authorization decision, checked at the resource per action. A perfectly authenticated request can still be unauthorized; that is the split interviewers hunt for.',
+    },
+    {
+      q: 'A JWT verifier accepts a token whose header sets alg to none, skipping the signature check. Why is that dangerous?',
+      options: [
+        'Attackers forge tokens the server then blindly trusts',
+        'Tokens become larger and slower to parse everywhere',
+        'Refresh tokens expire before their access tokens do',
+      ],
+      answer: 0,
+      explain: 'With alg=none honored, anyone strips the signature and writes any claims they want — admin, any tenant — and the server accepts them. A strict verifier must pin the expected algorithm and reject none outright.',
+    },
+    {
+      q: 'You need the strongest data isolation for a regulated banking client willing to pay for dedicated infrastructure. Which model fits?',
+      options: [
+        'Pool model shares tables across tenants',
+        'Bridge model gives each tenant schemas',
+        'Silo model gives each tenant infrastructure',
+      ],
+      answer: 2,
+      explain: 'Silo (a database or full stack per tenant) is physical separation — the strongest isolation and the highest cost, which a regulated whale will happily pay. Pool shares tables; bridge shares a database with separate schemas; neither matches silo’s wall.',
+    },
+    {
+      q: 'In the pool model, one query helper forgets its tenant_id filter and returns another tenant’s rows. What defends best?',
+      options: [
+        'Longer TTLs on every cached query result',
+        'Database row-level security enforcing the tenant boundary',
+        'Per-query developer discipline reviewed during code review',
+      ],
+      answer: 1,
+      explain: 'Row-level security moves the tenant filter into the database, which appends it to every query automatically — a forgetful helper still cannot cross the boundary. Discipline and review miss the one helper that forgets; caching is irrelevant to a leak.',
+    },
+    {
+      q: 'A 300-person office shares one NAT IP, and your per-IP login limiter locks all of them out after a few failures. Fix?',
+      options: [
+        'Key the limiter per account rather than address',
+        'Lower the global limit until abuse fully stops',
+        'Remove the limiter from the login path entirely',
+      ],
+      answer: 0,
+      explain: 'Behind NAT one IP is a whole company, so a per-IP login limit punishes innocents. Key sensitive limits on the account and treat IP as one signal among several; lowering globally or removing the limiter makes brute force easier, not safer.',
+    },
+    {
+      q: 'Two internal services must each cryptographically prove identity to the other before they exchange any data. Which mechanism provides this?',
+      options: [
+        'A shared static API key',
+        'A signed bearer JWT alone',
+        'Mutual TLS between both services',
+      ],
+      answer: 2,
+      explain: 'mTLS makes both ends present and verify certificates, so identity is mutual and the channel is encrypted. An API key authenticates one direction only; a bearer JWT proves the caller but a stolen one is fully usable by anyone.',
+    },
+  ],
+});
+</script>
+</body>
+</html>

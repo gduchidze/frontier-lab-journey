@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lesson 26 · Distributed Search over 1B Documents</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<div class="lesson">
+  <header class="lesson-header">
+    <p class="kicker">Lesson 0026 · Phase 3 — Classic Design Reps · <a href="0026-distributed-search.ka.html">ქართული ვერსია</a></p>
+    <h1>Distributed Search over 1B Documents</h1>
+    <p class="dek">Two systems wearing one trench coat: an offline indexing pipeline and an online query plane. The candidates who fail this rep design only one of them.</p>
+  </header>
+
+  <div class="mission-tie">
+    <strong>Mission tie.</strong> This is a <strong>reported Anthropic prompt</strong> — "distributed search over 1B documents" appears verbatim in the question bank, so treat this rep as live ammunition, and note that the same retrieval infrastructure underpins RAG at production scale (Phase 6, lesson 41): swap "keyword" for "embedding" and the sharding, fanout, and tail-latency math all survive.
+  </div>
+
+  <div class="callout"><span class="label">REP PROTOCOL</span>
+    Do the <strong>40-minute solo timed rep FIRST</strong> — out loud, paper or Excalidraw, no peeking. Prompt: <em>"Design a search system over 1 billion documents."</em> Only then read this lesson, compare, and log every delta (missed component, wrong number, unnamed failure mode) as a learning record.
+  </div>
+
+  <h2>1 · The prompt, and what it actually tests</h2>
+  <p>The interviewer says one sentence: <em>"Design keyword search over a billion documents."</em> The hidden rubric: do you notice this is <strong>two systems in one</strong>? An <strong>offline indexing pipeline</strong> (a batch/streaming data system that turns raw documents into a queryable index) and an <strong>online query plane</strong> (a low-latency fanout service that answers top-k queries against that index). Candidates who design only the query plane get asked "and where does the index come from?" and stall; candidates who design only the pipeline never touch latency. Say the two-plane split in your first minute — it is the single highest-signal sentence in this rep. Secondary rubric items: index sizing math, the sharding-axis decision (section 6), and fanout tail latency (section 7) — the three places where this prompt quietly measures whether Phase 1 stuck.</p>
+
+  <h2>2 · Clarify (5 min): freshness is the unlock</h2>
+  <table>
+    <tr><th>Requirement</th><th>Target</th><th>Consequence</th></tr>
+    <tr><td>Query type</td><td>Keyword (AND of terms), ranked</td><td>Inverted index, not table scans</td></tr>
+    <tr><td>Result shape</td><td>Top-k (k = 10) with snippets</td><td>Ranking + doc store lookup</td></tr>
+    <tr><td>Latency</td><td>p99 ≈ 200 ms end-to-end</td><td>Index in RAM/SSD; fanout tail math matters</td></tr>
+    <tr><td>Corpus</td><td>1B docs × ~5 KB, growing slowly</td><td>Must shard; no single node holds it</td></tr>
+    <tr><td>QPS</td><td>~10k peak</td><td>Replicas per shard, result caching</td></tr>
+    <tr><td><strong>Index freshness</strong></td><td><strong>Minutes to hours OK</strong></td><td><strong>The key unlock — see below</strong></td></tr>
+  </table>
+  <p>Ask the freshness question explicitly and then <strong>say out loud that relaxing it is the unlock</strong>: if a new document may take minutes to become searchable, indexing can run as an offline batch job producing <em>immutable</em> index files that are shipped to serving nodes on a schedule. The two planes decouple completely — the pipeline can crash, rerun, and rebuild without ever touching query latency. If the interviewer instead demands seconds-fresh results, you've discovered a much harder problem (section 10). Out of scope: crawling politeness (lesson 0024 owns it), auth, ads.</p>
+
+  <h2>3 · Estimate (5 min): numbers you will spend</h2>
+  <pre><code>Corpus:   1B docs × 5 KB text            ≈ 5 TB raw text
+Postings: ~500 distinct terms per doc    → 1B × 500 = 5 × 10¹¹ posting entries
+Entry:    ~4 B compressed (delta docID + tf, positions amortized)
+Index:    5 × 10¹¹ × 4 B ≈ 2 TB         → index ≈ 40% of corpus (typical: 20–50%)
+Shards:   2 TB ÷ ~50 GB index per node  = 40 shards → 50 with headroom
+Fanout:   every query hits every shard  → per-shard QPS = full 10k QPS
+          10k QPS × 50 shards = 500k shard-queries/s cluster-wide
+Replicas: node handles ~2k QPS          → 5 replicas/shard ≈ 250 serving nodes</code></pre>
+  <p>Now <em>spend</em> each number. <strong>2 TB index</strong> → no single node; sharding is forced, not optional. <strong>50 shards</strong> → fanout of 50 per query, which triggers the tail-latency math of section 7. <strong>Per-shard QPS = full cluster QPS</strong> (every query visits every shard — the doc-partitioned tax) → replica count is driven by total QPS, not by a slice of it. <strong>40% index/corpus ratio</strong> → compression (section 5) is a capacity decision worth real money, not a nicety. An estimate never referenced again is the classic anti-pattern from lesson 0009 — every one of these four gets reused below.</p>
+
+  <h2>4 · High-level: draw the two planes separately</h2>
+  <pre><code>INDEXING PLANE (offline, throughput-optimized)
+  crawl/ingest → parse + tokenize → build partial indexes (per batch)
+      → merge into immutable segments → ship segments to shard replicas
+
+QUERY PLANE (online, latency-optimized)
+  client → query service (parse, cache check)
+      → fanout to all 50 shards (pick 1 replica each)
+      → each shard: top-k′ locally  → gather → merge + rank → top-10 → return</code></pre>
+  <p>Draw them as two separate diagrams — physically apart on the whiteboard. The indexing plane is a MapReduce-shaped batch system: mappers tokenize document batches and emit partial term→postings maps; reducers merge partials into sorted, compressed <strong>segment files</strong>; a distribution step ships each segment to the replicas of its shard. The query plane never writes: it loads immutable segments and serves. The only coupling between the planes is the segment handoff — a versioned, atomic "load segment set N+1, drop N" switch. That decoupling is what the relaxed freshness requirement bought you, and saying so ties Step 1 to Step 3 in front of the interviewer.</p>
+
+  <h2>5 · Deep dive: anatomy of an inverted index</h2>
+  <p>An inverted index maps <strong>term → postings list</strong>: the sorted list of docIDs containing that term, each entry carrying term frequency (tf) and optionally <strong>positions</strong> (token offsets — needed for phrase queries and snippet highlighting). Three design facts to narrate:</p>
+  <ul>
+    <li><strong>Sorted + delta-encoded + compressed.</strong> Postings are sorted by docID, so you store <em>gaps</em> (deltas) instead of raw 8-byte IDs; gaps are small and compress hard with varint/bit-packing. This is where the 40% index ratio of section 3 comes from — uncompressed it would rival the corpus.</li>
+    <li><strong>Skip pointers.</strong> An AND query intersects postings lists; skip pointers every √n entries let the intersection leap over runs of the longer list instead of scanning it, turning intersection cost from sum-of-lengths toward length-of-shortest.</li>
+    <li><strong>Immutable segments + background merge.</strong> Updates never modify a segment in place: new docs go into new small segments; deletes are tombstone bitmaps; a background process merges small segments into larger ones. Recognize the instinct — this is the <strong>LSM tree</strong> from lesson 0012 wearing search clothes: sequential writes, lock-free reads, write amplification paid in the background. Lucene, and therefore Elasticsearch, works exactly this way.</li>
+  </ul>
+
+  <h2>6 · Deep dive: document-partitioned vs term-partitioned</h2>
+  <p>The canonical fork of this prompt: shard by <strong>document</strong> (each shard = full index over a slice of docs) or by <strong>term</strong> (each shard owns entire postings lists for a slice of the vocabulary)?</p>
+  <table>
+    <tr><th>Dimension</th><th>Doc-partitioned</th><th>Term-partitioned</th></tr>
+    <tr><td>Query fanout</td><td>Every query → all 50 shards</td><td>Only shards owning the query's terms (2–3)</td></tr>
+    <tr><td>Multi-term AND</td><td>Intersection is <strong>local</strong> to each shard</td><td>Postings shipped <strong>cross-shard</strong> to intersect — GBs for common terms</td></tr>
+    <tr><td>Hot terms</td><td>Load spreads evenly by design</td><td>Shard owning "the", "http" melts — hot-term skew</td></tr>
+    <tr><td>Index build / doc add</td><td>One shard touched per doc</td><td>Every doc touches ~500 term shards</td></tr>
+    <tr><td>Shard failure</td><td>Lose a slice of recall; all queries degrade gracefully</td><td>Some terms vanish entirely from all results</td></tr>
+  </table>
+  <p>Term-partitioning looks attractive (tiny fanout!) until the multi-term row: intersecting "distributed AND search" requires shipping one term's postings — potentially millions of entries — to the other term's shard, per query. Hot-term skew finishes it off. This is why <strong>virtually everyone ships doc-partitioned</strong> — it is the Elasticsearch/Lucene model, and Google's original architecture too. Say the trade-off table out loud, choose doc-partitioned <em>because</em> local intersections and even load beat small fanout, and note the price you accepted: full fanout, which you now must pay for in section 7.</p>
+
+  <h2>7 · Deep dive: scatter-gather and the tail-latency tax</h2>
+  <p>The coordinator fans a query to all 50 shards; each returns its local top-k′; the coordinator merges the 50·k′ candidates and returns the global top-10. Two subtleties carry senior signal:</p>
+  <p><strong>Why k′ &gt; k.</strong> If every shard scored with identical global statistics, per-shard top-10 would provably contain the global top-10 (each winner lives in exactly one shard). But shards rank with <em>local</em> IDF (their own document frequencies), use early-termination approximations, and carry deletion tombstones — so a globally-strong doc can sit at local rank 12 and never reach the coordinator. Practical fix: request k′ = 2–3×k per shard (a few hundred merge candidates — cheap), or broadcast global term statistics periodically. The lab measures exactly this recall-vs-k′ curve.</p>
+  <p><strong>Fanout amplifies the tail.</strong> A query is as slow as its <em>slowest</em> shard: P(all n shards fast) = p<sup>n</sup>. With fanout 100 and shards fast 99% of the time, 0.99<sup>100</sup> ≈ 0.37 — only 37% of queries avoid every shard's slow 1%, so the per-shard p99 becomes roughly your end-to-end <em>median</em>. To keep end-to-end p99 clean at fanout 100 you need each shard fast at the 99.99th percentile: 0.9999<sup>100</sup> ≈ 0.99. Mitigations: <strong>hedged requests</strong> (if a shard hasn't answered by its p95, fire the same request at another replica and take the first answer — ~5% extra load, dramatic tail cut) and replica-aware load balancing that routes around slow or GC-ing nodes.</p>
+
+  <h2>8 · Deep dive: ranking — from TF-IDF to two phases</h2>
+  <p><strong>TF-IDF intuition:</strong> score a doc by Σ over query terms of tf (how often the term appears here) × idf = log(N/df) (how rare the term is corpus-wide). Rare terms dominate; "the" contributes nothing. <strong>BM25</strong> is TF-IDF with two fixes, and you only need the shape: tf <em>saturates</em> (the 50th occurrence adds almost nothing — tf/(tf+k₁) instead of raw tf) and scores are <em>length-normalized</em> (a term hit in a tweet outweighs one in a book — the b·dl/avgdl term). Formula shape, not derivation, is the interview bar.</p>
+  <p><strong>Two-phase ranking:</strong> running an expensive ranker over millions of matching docs blows the latency budget, so phase 1 retrieves the top few hundred candidates with cheap BM25 inside each shard, and phase 2 reranks only those few hundred with the expensive model (dozens of features, or an ML ranker) at the coordinator. Blend in <strong>static quality priors</strong> — a query-independent score like PageRank or source quality, computed at index time and stored per doc. Finally, <strong>cache query results</strong> (lesson 0007 callback): query popularity is zipfian, so a modest results cache in front of the coordinator absorbs a large slice of the 10k QPS before any fanout happens.</p>
+
+  <h2>9 · Failure modes and monitoring</h2>
+  <ul>
+    <li><strong>One slow shard poisons every query.</strong> Full fanout means one bad node (GC pause, failing disk, merge storm) drags the global p99. Mitigate: hedged requests, strict per-shard timeouts, and return partial results with a <code>degraded=true</code> flag rather than failing the query — 49/50 shards is still excellent recall.</li>
+    <li><strong>Segment-merge storms.</strong> Background merges are I/O-heavy; an unthrottled merge on a serving node competes with queries and manufactures exactly the slow shard above. Mitigate: throttle merge I/O, or do heavy merges off the serving path and ship the merged segment.</li>
+    <li><strong>Index/serving version skew.</strong> Mid-rollout, shards on segment-set N and N+1 return differently-scored results, and merged pages can duplicate or drop docs. Mitigate: version every segment set, have the coordinator pin one version per query, canary new indexes on a shard subset first.</li>
+    <li><strong>Metrics that page a human:</strong> per-shard p99 <em>and</em> end-to-end p99 (the gap between them is your fanout tax), hedge-fire rate, indexing lag (freshness SLO), and a <strong>recall canary</strong> — a fixed set of query→expected-doc pairs replayed continuously; a silent recall drop is otherwise invisible in latency dashboards.</li>
+  </ul>
+
+  <h2>10 · Variants and twists</h2>
+  <ul>
+    <li><strong>Real-time indexing.</strong> "New docs searchable in seconds" → keep a small in-memory delta index on each shard receiving fresh docs, query it alongside the big immutable segments, flush it to a segment periodically. This is precisely Lucene's near-real-time refresh — the LSM memtable instinct again.</li>
+    <li><strong>Phrase queries.</strong> "exact phrase" needs the position data from section 5: intersect postings <em>and</em> check adjacent positions; common-bigram indexes ("new york") pre-pay the worst cases.</li>
+    <li><strong>Multilingual.</strong> Tokenization is language-specific — CJK languages don't use spaces (segmentation models), German compounds split, stemming/lemmatization per language at both index and query time. Analyzer choice is an index-time commitment: changing it means reindexing.</li>
+  </ul>
+  <p><strong>AI-adjacent note.</strong> Embedding-based (vector) search replaces the term-match retrieval phase with approximate nearest-neighbor search over dense vectors, but keeps this lesson's skeleton — sharded ANN indexes, scatter-gather, per-shard top-k′, merge, rerank. Modern RAG stacks run <em>hybrid</em>: BM25 and vector retrieval in parallel, fused at rerank. Full treatment in Phase 6, lesson 41.</p>
+
+  <h2>11 · Interview talking points</h2>
+  <ul>
+    <li><em>Opening:</em> "This is two systems — an offline indexing pipeline and an online query plane — and relaxing freshness to minutes is what lets me keep them decoupled."</li>
+    <li><em>Spending an estimate:</em> "2 TB of index at 50 GB per node is 40–50 shards — and that fanout number is why I'll spend time on tail latency."</li>
+    <li><em>The sharding fork:</em> "Doc-partitioned versus term-partitioned: I'll take full fanout in exchange for local intersections and no hot-term shard — the Elasticsearch model."</li>
+    <li><em>Unprompted tail math:</em> "At fanout 50, p-all-fast is p-per-shard to the 50th power — per-shard p99 becomes my median, so I need hedged requests, not faster averages."</li>
+    <li><em>Ranking depth on offer:</em> "I can go deep on BM25-plus-rerank or on segment merging — preference?"</li>
+    <li><em>Closing:</em> "I'd page on end-to-end p99, indexing lag, and a recall canary; with more time: real-time deltas and multilingual analyzers."</li>
+  </ul>
+
+  <h2>12 · Lab + project step</h2>
+  <div class="callout"><span class="label">Hands-on (do this before the quiz)</span>
+    In <code>labs/lab-0026-inverted-index/</code>, <code>python3 search_lab.py</code> builds a 20k-doc
+    zipfian corpus, an inverted index, and TF-IDF ranking; shards it doc-partitioned; then
+    <em>measures</em> the two claims you just read — ranking recall vs per-shard k′ (k′=k loses
+    real results against global truth) and p99 amplification vs shard count, with a hedging
+    toggle. Predict before you run: README exercises E1–E4.
+  </div>
+  <p><strong>Project step.</strong> After the lab, redo the 40-minute rep from the top of this lesson <em>aloud</em> and log deltas against your first attempt. Then write one paragraph in your learning record connecting this rep to the spine project: your inference platform's RAG retrieval tier (Phase 6) will be this exact architecture with an ANN index in the shard slot — name the two components that transfer unchanged (scatter-gather with hedging, immutable segment shipping).</p>
+
+  <h2>Check yourself</h2>
+  <div class="quiz" id="quiz"></div>
+
+  <h2>Primary source</h2>
+  <p>Read the <strong>Stanford IR Book</strong> — <a href="https://nlp.stanford.edu/IR-book/information-retrieval-book.html">Introduction to Information Retrieval</a> (chapters 1–5 for the index, 6–7 for scoring, 20 for web search architecture). Companions: Google's original architecture paper, <a href="http://infolab.stanford.edu/~backrub/google.html">"The Anatomy of a Large-Scale Hypertextual Web Search Engine"</a> (Brin &amp; Page — see the barrels/sorter pipeline map onto section 4), and the Elasticsearch Definitive Guide's <a href="https://www.elastic.co/guide/en/elasticsearch/guide/current/distributed-search.html">distributed search execution</a> chapter — the production write-up of scatter-gather with per-shard <code>from + size</code>.</p>
+
+  <footer class="lesson-footer">
+    <p><strong>Stuck or curious?</strong> Ask your teacher (the agent) anything — "how would I keep the index consistent if docs could be edited every second?" is an excellent follow-up question.</p>
+    <nav class="lesson-nav">
+      <span>◀ <a href="0025-distributed-kv.html">0025 · Distributed KV Store</a></span>
+      <span><a href="0027-payment-system.html">0027 · Payment System</a> ▶</span>
+    </nav>
+  </footer>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+renderQuiz(document.getElementById('quiz'), {
+  title: 'Check yourself',
+  questions: [
+    {
+      q: 'Why is relaxing index freshness to "minutes is fine" the key unlock of this design?',
+      options: [
+        'It lets indexing run as an offline batch pipeline',
+        'It allows the query plane to skip ranking entirely',
+        'It removes any need for replicas on every shard',
+      ],
+      answer: 0,
+      explain: 'Minutes-level freshness means indexing can be a batch job producing immutable segments shipped to serving nodes — the two planes decouple, and the pipeline can crash and rerun without touching query latency.',
+    },
+    {
+      q: 'Why does virtually every production system ship document-partitioned rather than term-partitioned sharding?',
+      options: [
+        'Term partitioning always needs more storage on disk',
+        'Document partitioning avoids all fanout across the shards',
+        'Multi-term queries stay local, avoiding cross-shard posting joins',
+      ],
+      answer: 2,
+      explain: 'Doc-partitioning actually MAXIMIZES fanout — its win is that intersecting postings for "distributed AND search" happens locally inside each shard, while term-partitioning must ship huge postings lists between shards and suffers hot-term skew.',
+    },
+    {
+      q: 'With fanout 100 and each shard fast 99% of the time, what fraction of queries sees every shard respond fast?',
+      options: [
+        'Roughly 99 percent, fanout barely affects it',
+        'Roughly 37 percent, per-shard tails now dominate',
+        'Roughly 63 percent, hedging cannot help here',
+      ],
+      answer: 1,
+      explain: '0.99^100 ≈ 0.366. A query waits for its slowest shard, so at high fanout the per-shard p99 becomes roughly the end-to-end median — the reason hedged requests exist.',
+    },
+    {
+      q: 'Why must per-shard k′ exceed the final k in scatter-gather top-k?',
+      options: [
+        'Local shard statistics can misrank globally strong documents',
+        'Coordinators cannot merge more than k candidate documents',
+        'Network limits forbid returning exactly k per shard',
+      ],
+      answer: 0,
+      explain: 'Shards rank with local IDF and approximations, so a globally-top document can sit just below a shard\'s local cutoff and never reach the coordinator. Requesting k′ = 2–3×k restores recall cheaply — the lab measures this curve.',
+    },
+    {
+      q: 'Why are index segments immutable, with a background merge process, instead of updated in place?',
+      options: [
+        'Immutable files delete documents instantly without any rewriting',
+        'Sequential writes and lock-free reads; merges amortize updates',
+        'Merging guarantees every query sees fresh documents immediately',
+      ],
+      answer: 1,
+      explain: 'It is the LSM-tree instinct from lesson 0012: new docs land in new small segments, deletes are tombstones, and background merges pay the write amplification off the query path. Lucene works exactly this way.',
+    },
+    {
+      q: 'What is the purpose of two-phase ranking in the query plane?',
+      options: [
+        'Expensive scoring runs first so recall stays perfect',
+        'Both phases score every matching document twice over',
+        'Cheap retrieval narrows candidates; costly reranking polishes few',
+      ],
+      answer: 2,
+      explain: 'Running an expensive ranker over millions of matches blows the 200 ms budget. Cheap BM25 selects a few hundred candidates per query; the expensive model reranks only those — cost proportional to hundreds, not millions.',
+    },
+  ],
+});
+</script>
+</body>
+</html>

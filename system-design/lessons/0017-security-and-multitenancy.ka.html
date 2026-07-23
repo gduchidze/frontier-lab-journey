@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html lang="ka">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>გაკვეთილი 17 · უსაფრთხოება &amp; Multi-Tenancy</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<div class="lesson">
+  <header class="lesson-header">
+    <p class="kicker">გაკვეთილი 0017 · ფაზა 2 — პროგრამული არქიტექტურა &amp; საიმედოობა · <a href="0017-security-and-multitenancy.html">English version</a></p>
+    <h1>უსაფრთხოება &amp; Multi-Tenancy</h1>
+    <p class="dek">ვინ ხარ, რის უფლება გაქვს, სად ცხოვრობენ secret-ები და როგორ ატარებ tenant A-ს tenant B-ს <em>მონაცემებიდან</em> და <em>latency-დანაც</em> — თავდაცვითი ლექსიკა, რომელიც „დაამატე auth"-ს დიზაინად აქცევს.</p>
+  </header>
+
+  <div class="mission-tie">
+    <strong>მისიასთან კავშირი.</strong> Anthropic-ის დიზაინის ამოცანებს — <em>„დააპროექტე multi-tenant SaaS პლატფორმის API"</em> — ყოველთვის ამოსდის უსაფრთხოების კიდური: <em>„როგორ არ მოქმედებს ერთი კლიენტის ტრაფიკი მეორეზე? საიდან იცი, რომ ამ მოთხოვნას ამ row-ის წაკითხვის უფლება აქვს?"</em> ვინც „JWT-ებს გამოვიყენებთ"-ით ისვენებს, ჩერდება; ვინც ასახელებს authN vs authZ-ს, token-ის audience შემოწმებას, tenant-isolation მოდელს და rate-limit-ის განზომილებას, აგრძელებს. (<a href="https://www.tryexponent.com/blog/anthropic-system-design-interview">Exponent-ის 2026 Anthropic გზამკვლევი</a>)
+  </div>
+
+  <h2>1 · პერიმეტრი მკვდარია — zero trust</h2>
+  <p>ძველი მოდელი ციხე იყო: მაგარი firewall გარეთ, რბილი შიგნით — და როცა „ქსელის შიგნით" იყავი, გენდობოდნენ. ეს მოკვდა, როცა ერთმა phishing-ლეპტოპმა თუ ერთმა კომპრომეტირებულმა სერვისმა მთელი შიდა ქსელი შეძლო შემოევლო. ჩამნაცვლებელი — <strong>zero trust (ნულოვანი ნდობა)</strong>: შიგნით არაფერია. ყოველი hop თავს იმოწმებს (authenticate), ყოველი hop დაშიფრულია გზაში (encrypt in transit), ყოველი identity იღებს least privilege-ს (მინიმალურ პრივილეგიას) (<a href="https://research.google/pubs/pub43231/">Google, BeyondCorp</a>).</p>
+  <p>სამი პრინციპი: <strong>authenticate every hop</strong> („შიგნიდან მოვიდა" credential არაა); <strong>encrypt in transit</strong> ყოველთვის, edge-ზეც და შიდა სერვისებს შორისაც; <strong>least privilege</strong> — გაჟონილმა credential-მა ერთი ოთახი უნდა გააღოს და არა შენობა. მათ ერტყმის <strong>defense in depth (თავდაცვა სიღრმეში)</strong> — შრეებრივი კონტროლი, სადაც ერთი ჩავარდნა კატასტროფა არაა. სია, რასაც ეს შრეები უნდა უძლებდნენ, არის <a href="https://owasp.org/www-project-top-ten/">OWASP Top 10</a>.</p>
+
+  <h2>2 · AuthN vs AuthZ</h2>
+  <p>ინტერვიუზე ყველაზე ხშირი შეცდომა — authentication-ისა და authorization-ის ერთ რამედ აღრევა. ეს ცალკე სისტემებია, რომლებიც ცალკე ვარდებიან.</p>
+  <table>
+    <tr><th></th><th>Authentication (authN)</th><th>Authorization (authZ)</th></tr>
+    <tr><td>კითხვა</td><td><em>ვინ ხარ?</em></td><td><em>რის უფლება გაქვს?</em></td></tr>
+    <tr><td>აწარმოებს</td><td>დადასტურებულ identity-ს</td><td>allow / deny გადაწყვეტილებას</td></tr>
+    <tr><td>როდის</td><td>ერთხელ edge-ზე, სესიაზე</td><td>ყოველ resource-ზე, ყოველ ქმედებაზე</td></tr>
+    <tr><td>ტიპური ჩავარდნა</td><td>მოპარული პაროლი, გაყალბებული token</td><td>ვალიდური user კითხულობს სხვა tenant-ის row-ს</td></tr>
+    <tr><td>მოდელები</td><td>Passwords, OAuth, mTLS, passkeys</td><td>RBAC, ABAC, row-level security, scopes</td></tr>
+  </table>
+  <p>ხაფანგი: მოთხოვნა შეიძლება <em>იდეალურად authenticated იყოს და მაინც unauthorized</em>. tenant A-ს user უნაკლო token-ითაც უნდა უარეყოს tenant B-ს მონაცემი — და ეს authZ-ის საქმეა, შემოწმებული resource-ზე. <strong>Session cookie</strong> (სერვერი ინახავს state-ს, cookie მხოლოდ ID-ს; revocation = row-ის წაშლა) ერთ web-აპს უხდება; <strong>token</strong> (bearer, stateless verification) — API-ებსა და service mesh-ს (<a href="https://cheatsheetseries.owasp.org/cheatsheets/Session_Management_Cheat_Sheet.html">OWASP Session Management</a>).</p>
+
+  <h2>3 · OAuth2 &amp; OIDC</h2>
+  <p>OAuth2 ერთ კითხვას პასუხობს: <em>როგორ იმოქმედოს აპმა user-ის სახელით მისი პაროლის ფლობის გარეშე?</em> ეს <strong>delegated authorization</strong>-ის ფრეიმვორკია, არა login-პროტოკოლი. ოთხი როლი (<a href="https://www.rfc-editor.org/rfc/rfc6749">RFC 6749</a>, <a href="https://oauth.net/2/">oauth.net</a>):</p>
+  <table>
+    <tr><th>როლი</th><th>ვინაა</th></tr>
+    <tr><td>Resource owner</td><td>user, ვისი მონაცემიცაა</td></tr>
+    <tr><td>Client</td><td>აპი, რომელსაც წვდომა უნდა</td></tr>
+    <tr><td>Authorization server</td><td>token-ებს გასცემს consent-ის შემდეგ</td></tr>
+    <tr><td>Resource server</td><td>მონაცემს ინახავს, token-ს ამოწმებს</td></tr>
+  </table>
+  <p><strong>Authorization-code flow PKCE-ით</strong> (იცოდე ზეპირად): client user-ს authorization server-ზე გადაამისამართებს <code>code_challenge</code>-ით (ახლახან დაგენერირებული საიდუმლოს hash). user შედის და თანხმდება. server უკან აბრუნებს მოკლევადიან <strong>authorization code</strong>-ს. client მერე token endpoint-ს ურეკავს code-ითა <em>და</em> ორიგინალი <code>code_verifier</code>-ით; server verifier-ს hash-ავს და amოწმებს challenge-ს. <strong>PKCE</strong> (<a href="https://www.rfc-editor.org/rfc/rfc7636">RFC 7636</a>) ხურავს თავდასხმას, სადაც მავნე აპი გადამისამართებულ code-ს იპარავს — მოპარული code უსარგებლოა verifier-ის გარეშე. <strong>Client-credentials flow</strong> კი user-ის გარეშეა: სერვისი <em>თავის თავად</em> imოწმებს machine-to-machine ზარისთვის.</p>
+  <p><strong>OIDC</strong> არის identity-შრე, რომელიც OAuth2-ს აკლია: OAuth2 <em>წვდომას</em> გცემს, არასდროს გეუბნება <em>ვინ შევიდა</em>. OIDC ამატებს ხელმოწერილ <strong>ID token</strong>-ს (JWT identity claim-ებით) (<a href="https://openid.net/specs/openid-connect-core-1_0.html">OIDC Core</a>). დასამახსოვრებელი: <em>access token = რის უფლება გაქვს; ID token = ვინ ხარ; OIDC = OAuth2 + identity</em>.</p>
+
+  <h2>4 · JWT, გულახდილად</h2>
+  <p>JSON Web Token სამი base64url ნაწილია წერტილებით — <code>header.payload.signature</code> (<a href="https://www.rfc-editor.org/rfc/rfc7519">RFC 7519</a>). payload ინახავს <strong>claim-ებს</strong> (<code>sub</code>, <code>iss</code>, <code>aud</code>, <code>exp</code>). მოგება — <strong>stateless verification</strong>: ნებისმიერ სერვისს, key-ის მფლობელს, ლოკალურად შეუძლია გადამოწმება, auth-database-ზე გასვლის გარეშე. მაგრამ სწორედ ესაა ხაფანგი: <strong>JWT-ს ვერ გააუქმებ</strong>. მიტიგაცია: <strong>მოკლე TTL + refresh token-ები</strong> (access token წუთებია, revocable refresh token ახლებს ჭრის) და <strong>denylist</strong> (<code>jti</code>-ების პატარა სია „ახლავე გააუქმე"-სთვის, რაც state-ს აბრუნებს).</p>
+  <p><strong>ხაფანგები:</strong> <strong><code>alg=none</code></strong> — ძველი ბიბლიოთეკები „ალგორითმის გარეშე"-ს პატივს სცემდნენ და signature-ს ტოვებდნენ; მკაცრმა verifier-მა უნდა <em>დააფიქსიროს მოსალოდნელი ალგორითმი</em> (<a href="https://auth0.com/blog/critical-vulnerabilities-in-json-web-token-libraries/">Auth0: JWT vulnerabilities</a> — ამას ლაბში გატეხავ). <strong>Key confusion (RS256→HS256)</strong> — public key-ს HMAC secret-ად იყენებენ. <strong>Audience unchecked</strong> — X-ისთვის ჭრილი token-ს Y იღებს; შეამოწმე <code>aud</code>, <code>iss</code>, <code>exp</code>, არა მხოლოდ signature. <strong>Secret-ები claim-ებში</strong> — payload ხელმოწერილია, არა დაშიფრული; base64-ია, ყველასთვის წაკითხვადი.</p>
+  <table>
+    <tr><th></th><th>JWT (თვითაღწერადი)</th><th>Opaque token + introspection</th></tr>
+    <tr><td>Verify</td><td>ლოკალური, offline</td><td>ქსელური ზარი auth server-ზე</td></tr>
+    <tr><td>Revocation</td><td>რთული — TTL ან denylist</td><td>მყისიერი — row-ის წაშლა</td></tr>
+    <tr><td>N სერვისზე</td><td>იაფად</td><td>auth server ცხელი გზა ხდება</td></tr>
+    <tr><td>საუკეთესო</td><td>დიდი fan-out შიდა API</td><td>მგრძნობიარე, revocation-კრიტიკული</td></tr>
+  </table>
+  <p>Opaque token = შემთხვევითი სტრიქონი, რომელსაც resource server <strong>introspection endpoint</strong>-ს ეკითხება (<a href="https://www.rfc-editor.org/rfc/rfc7662">RFC 7662</a>): revocation მყისიერი, მაგრამ ქსელური hop ყოველ გადამოწმებაზე (<a href="https://developer.okta.com/docs/guides/validate-access-tokens/main/">Okta</a>).</p>
+
+  <h2>5 · Service-to-service — mTLS</h2>
+  <table>
+    <tr><th>მექანიზმი</th><th>როგორ ამტკიცებს</th><th>სისუსტე</th></tr>
+    <tr><td><strong>Shared API key</strong></td><td>ერთი მხარე secret-ს აგზავნის</td><td>ცალმხრივი; გაჟონვა უხმაუროა</td></tr>
+    <tr><td><strong>Signed token</strong></td><td>ხელმოწერილი identity claim</td><td>Bearer — მოპარული სრულად გამოსადეგია</td></tr>
+    <tr><td><strong>mTLS</strong></td><td><em>ორივე</em> მხარე certificate-ს წარადგენს</td><td>Cert-ის lifecycle რეალური სამუშაოა</td></tr>
+  </table>
+  <p><strong>Mutual TLS</strong> — zero-trust default შიდა ტრაფიკისთვის: ჩვეულებრივი TLS <em>სერვერის</em> identity-ს ამტკიცებს, mTLS კი client-საც აიძულებს certificate წარადგინოს, ორივე ბოლო კრიპტოგრაფიულად იდენტიფიცირებულია. ცერტიფიკატების გაცემა/როტაცია სწორედ იმიტომ არსებობს service mesh. <strong>SPIFFE/SPIRE</strong> ყოველ workload-ს verifiable identity-ს (SVID) აძლევს და ავტომატურად ანახლებს (<a href="https://spiffe.io/docs/latest/spiffe-about/overview/">SPIFFE</a>); <strong>Istio</strong> mesh-ს mTLS-ს ჩართავს აპის ცვლილების გარეშე (<a href="https://istio.io/latest/docs/concepts/security/">Istio security</a>).</p>
+
+  <h2>6 · Secret-ების მართვა</h2>
+  <p>პირველი ჩავარდნა ალგორითმზე მაღლაა: <strong>secret კოდში, ან <code>.env</code> git-ში</strong>. git-ის ისტორიაში მოხვედრილი credential სამუდამოდ კომპრომეტირებულია — <em>როტაცია</em>, არა უბრალოდ წაშლა. სწორი მოდელი — ცენტრალური <strong>secrets manager</strong> (<a href="https://developer.hashicorp.com/vault/docs/what-is-vault">HashiCorp Vault</a>): ცენტრალური სტორი (არა გაფანტული ფაილები); <strong>short-lived dynamic credentials</strong> (Vault-ის დაგენერირებული პაროლი, წუთებში გაუქმებული); <strong>audit log</strong> (ვინ, რა, როდის); <strong>rotation</strong> როგორც რუტინა.</p>
+  <p><strong>Envelope encryption</strong> data-at-rest-ისთვის: <strong>KMS</strong> ინახავს root <em>key-encryption key</em>-ს (KEK), რომელიც არასდროს ტოვებს hardware-ს; ყოველ dataset-ს აქვს თავისი <strong>data-encryption key</strong> (DEK), რომელიც მონაცემს შიფრავს, თვითონ კი DEK ინახება მონაცემთან, KEK-ით დაშიფრული. root-ის როტაცია = DEK-ების ხელახლა შეფუთვა, არა პეტაბაიტების ხელახლა დაშიფვრა (<a href="https://docs.aws.amazon.com/kms/latest/developerguide/concepts.html#enveloping">AWS KMS</a>). ასე ხდება per-tenant key-ები პრაქტიკული — DEK ყოველ tenant-ზე, ერთ KEK-ით შეფუთული.</p>
+
+  <h2>7 · Rate limiting როგორც უსაფრთხოების კონტროლი</h2>
+  <p>Rate limiting-ის ღირებულების ნახევარი <strong>უსაფრთხოებაა</strong>: <strong>brute force</strong> (5 მცდელობა/წუთი/account მილიონ-გამოცნობიან თავდასხმას საუკუნეებად აქცევს), <strong>credential stuffing</strong> (გატეხილი წყვილების გადათამაშება — გაფანტულია account-ებზე, per-account limit ვერ იჭერს, per-IP და global გჭირდება — <a href="https://owasp.org/www-community/attacks/Credential_stuffing">OWASP</a>), <strong>scraping</strong>, და <strong>abuse economics</strong> — შენი საქმეა თავდასხმა <em>უფრო ძვირი გახადო, ვიდრე მოგება</em>.</p>
+  <table>
+    <tr><th>განზომილება</th><th>იჭერს</th><th>ბრმა წერტილი</th></tr>
+    <tr><td><strong>Per-API-key</strong></td><td>ერთი კლიენტის გაქცეული integration</td><td>key-ების როტაცია</td></tr>
+    <tr><td><strong>Per-IP</strong></td><td>ერთი მავნე host</td><td>NAT (მთელი ოფისი = 1 IP); botnet</td></tr>
+    <tr><td><strong>Per-tenant</strong></td><td>ერთი tenant, პლატფორმის მშიერი</td><td>cross-tenant განაწილებული abuse</td></tr>
+  </table>
+  <p>ორი დიზაინის შენიშვნა: დააბრუნე <strong>429 Too Many Requests</strong> <code>Retry-After</code>-ით; და <strong>დაიცავი თვითონ limiter</strong> — იაფი უარყოფა ძვირ სამუშაომდე. token-bucket-ის შემოწმებას database-read არ უნდა სჭირდებოდეს, თორემ თვითონ check ხდება DoS. უიაფესი reject რაც შეიძლება ადრე გზაზე, სადაც endpoint უშვებს, auth-ამდე. გაკვეთილი 18 overload-სა და load-shedding-ს გააგრძელებს (<a href="https://sre.google/sre-book/handling-overload/">Google SRE: Handling Overload</a>).</p>
+
+  <h2>8 · Multi-tenancy-ის isolation მოდელები</h2>
+  <p>ერთი პლატფორმა, ბევრი tenant, ვისი მონაცემიც <em>და</em> წარმადობაც არ უნდა გადაერიოს. ცენტრალური გადაწყვეტილება (დაიმახსოვრე — SaaS პასუხის ხერხემალი, <a href="https://docs.aws.amazon.com/wellarchitected/latest/saas-lens/tenant-isolation.html">AWS SaaS Lens</a>):</p>
+  <table>
+    <tr><th>მოდელი</th><th>განლაგება</th><th>Isolation</th><th>ღირებულება</th><th>Ops</th></tr>
+    <tr><td><strong>Silo</strong></td><td>DB ყოველ tenant-ზე</td><td>ყველაზე ძლიერი — ფიზიკური</td><td>ყველაზე ცუდი — ფასი per tenant</td><td>migration/backup ×N</td></tr>
+    <tr><td><strong>Bridge</strong></td><td>საერთო DB, schema per tenant</td><td>საშუალო — ლოგიკური</td><td>უკეთესი — ერთი კლასტერი</td><td>migration ×N schema</td></tr>
+    <tr><td><strong>Pool</strong></td><td>საერთო tables, <code>tenant_id</code></td><td>სუსტი — filter ერთადერთი კედელია</td><td>საუკეთესო — სრული სიმჭიდროვე</td><td>დაბალი ops, დიდი blast radius</td></tr>
+  </table>
+  <p><strong>მათემატიკა, რასაც ინტერვიუერი ელის.</strong> 500 tenant. <em>Silo</em>: პატარა managed Postgres ~$50/თვე, ანუ <code>500 × $50 = $25,000/თვე</code> მხოლოდ database-ის იატაკზე, პლუს 500 backup და 500 migration ყოველ რელიზზე. <em>Pool</em>: ერთი 3-node კლასტერი ~$2,000/თვე ≈ <code>$6,000/თვე</code> ყველა 500-ზე, ერთი migration რელიზზე. ~<strong>4-ჯერადი</strong> ინფრასტრუქტურის სხვაობა და <em>N-ჯერ vs მუდმივი</em> ops — ეს იცვლება, როცა ერთი tenant ბანკია, silo-ში გადაიხდის და საერთო table-ს გაექცევა. საუკეთესო მოდელი არაა — საუკეთესო მოდელი <em>tenant-ის tier-ზეა</em> (pool გრძელ კუდზე, silo „ვეშაპებზე").</p>
+  <p><strong>Pool-ის გამაგრება RLS-ით.</strong> Pool-ის მთელი რისკი ისაა, რომ isolation ეყრდნობა ყოველ query-ს, დაიმახსოვროს <code>WHERE tenant_id = ?</code>. Postgres <strong>RLS</strong> ამ კედელს database-ში გადააქვს: policy <code>USING (tenant_id = current_setting('app.tenant_id'))</code> და engine ავტომატურად ამატებს filter-ს <em>ყოველ</em> query-ს — helper, რომელიც ივიწყებს, მაინც ვერ ხედავს სხვის row-ს (<a href="https://www.postgresql.org/docs/current/ddl-rowsecurity.html">PostgreSQL RLS</a>).</p>
+  <p><strong>Noisy neighbor = performance isolation.</strong> Pool-ში tenant-ები worker-ებს, connection-ებს და queue-ებს იზიარებენ, ერთი tenant-ის batch job ყველას latency-ს ახრჩობს. გამოსწორება — RLS-ის წარმადობის ტყუპი: <strong>per-tenant quotas</strong> (token bucket per tenant), <strong>fair queuing</strong> (round-robin/weighted dequeue), <strong>bulkheads</strong> (რესურს-პულების იზოლაცია, <em>Release It!</em>-იდან). Isolation ორი ინვარიანტია: <em>A ვერ კითხულობს B-ს მონაცემს, და A ვერ ჭამს B-ს სიმძლავრეს.</em></p>
+
+  <h2>9 · Failure mode-ები, რომლებიც ინტერვიუებს წყვეტენ</h2>
+  <ul>
+    <li><strong>დაკარგული <code>tenant_id</code> ერთ query-ში.</strong> ხელმოწერა-SaaS-ბაგი: ხუთი helper-იდან ოთხი filter-ავს, მეხუთე ივიწყებს — tenant A ხედავს tenant B-ს შეკვეთებს. ერთ-tenant-იან ტესტს გაივლის. დაცვა — RLS ან default-scoped data layer, filter <em>სტრუქტურული</em>, არა per-query დისციპლინა.</li>
+    <li><strong>JWT verified, audience unchecked.</strong> signature ვალიდურია, <code>exp</code> კარგია, სერვისი იღებს <em>სხვა</em> სერვისისთვის ჭრილ token-ს. ყოველთვის შეამოწმე <code>aud</code>, <code>iss</code>.</li>
+    <li><strong>დიდვადიანი გაჟონილი API key, როტაციის გარეშე.</strong> ორი წლის წინ public repo-ში ჩადებული key ისევ მუშაობს. short-lived credentials ავტომატურად დახურავდა ფანჯარას.</li>
+    <li><strong>Rate limiter IP-ზე NAT-ის უკან.</strong> 300-კაციანი ოფისი ერთ IP-ს იზიარებს; per-IP login limit მთელ კომპანიას კეტავს. Key სენსიტიური limit-ები <em>account</em>-ზე.</li>
+    <li><strong>ერთი tenant-ის batch job pool-ს ახრჩობს.</strong> fair queuing-ის გარეშე ერთი tenant-ის bulk export queue-ს ავსებს და ყველა სხვას p99 ასკდება. per-tenant quotas + fair dequeue აღადგენს.</li>
+  </ul>
+
+  <h2>10 · ერთი AI შტრიხი, მერე უკან საფუძვლებთან</h2>
+  <p>ყველაფერი ზემოთქმული უცვლელად გადადის multi-tenant inference პლატფორმაზე. <strong>Per-tenant token quotas + fair scheduling GPU queue-ზე</strong> ზუსტად §8-ის noisy-neighbor-ია — ერთი tenant-ის გრძელი-კონტექსტის ნაკადი მეორის TTFT-ს არ უნდა აფეთქებდეს, ამიტომ batching scheduler სამართლიანად (tier-ის წონით) dequeue-ს აკეთებს და არა FIFO. <strong>Prompt/output log-ები მგრძნობიარე მონაცემია</strong>: PII-ს მოეპყარი — per-tenant DEK-ით დაშიფრე (§6), retention policy დააწესე, JWT claim-ებში არასდროს ჩადო. <strong>Model access = authZ scope</strong>: „tenant A-ს 70B მოდელის ზარის უფლება აქვს?" scope-ის შემოწმებაა (§4). იგივე pattern-ები, GPU-ფასიანი blast radius.</p>
+
+  <h2>11 · ინტერვიუს სასაუბრო წერტილები</h2>
+  <ol>
+    <li><strong>authN-ი authZ-ისგან პირველივე წინადადებაში გამიჯნე.</strong> „gateway authenticate-ს კალერს; ყოველი სერვისი authorize-ს ქმედებას tenant-ის მიხედვით."</li>
+    <li><strong>დაასახელე token-ის ფორმა და revocation.</strong> „short-TTL JWT შიდა fan-out-ისთვის, denylist ახლავე-გაუქმებისთვის, opaque token სენსიტიურ გზაზე."</li>
+    <li><strong>mTLS east-west ტრაფიკზე</strong>, cert-როტაცია mesh-ს ეკუთვნის (SPIFFE identity).</li>
+    <li><strong>Secret-ები vault-ში ხმამაღლა</strong>: „dynamic short-lived DB creds Vault-იდან, envelope encryption per-tenant DEK-ით."</li>
+    <li><strong>Rate limiting უსაფრთხოებად ჩარჩოში</strong>: „per-account brute force-ისთვის, per-IP და global credential stuffing-ისთვის, იაფი reject auth-ამდე."</li>
+    <li><strong>აირჩიე tenancy მოდელი და ნაზავი დაიცავი</strong>: „pool RLS-ით გრძელ კუდზე, silo დარეგულირებულ ვეშაპებზე — აი 4× ღირებულების მათემატიკა." მერე performance isolation დაასახელე.</li>
+    <li><strong>Failure mode-ები ინტერვიუერამდე ახსენე</strong>: „რისკი query-ია, რომელიც <code>tenant_id</code>-ს ივიწყებს — ამიტომ isolation RLS-შია, არა code review-ში."</li>
+  </ol>
+
+  <h2>12 · ლაბი — გატეხე tenant isolation შენი ხელით</h2>
+  <div class="callout"><span class="label">პრაქტიკა (ქვიზამდე გააკეთე)</span>
+    <code>labs/lab-0017-tenant-isolation/</code>-ში <code>python3 tenant_lab.py</code> უშვებს სამ ექსპერიმენტს — JWT-ის გაყალბების დრილი (ვალიდური გადის; შეცვლილი და ვადაგასული ვარდება; <code>alg=none</code> token-ს გულუბრყვილო verifier <em>იღებს</em>, მკაცრი კი <em>უარყოფს</em>, forged-admit რიცხვი ნულამდე), noisy-neighbor (tenant B 10× ტბორავს; FIFO queue tenant A-ს p99-ს აფეთქებს, per-tenant token bucket + round-robin fair dequeue აღადგენს და B-ს დათვლილი 429-ებით ახრჩობს), და pool-model leak drill (ხუთი helper, ერთი <code>tenant_id</code> filter-ს ივიწყებს; invariant checker result-ებს სკანირებს და დამნაშავე helper-ს ასახელებს). მერე README-ს E1–E4: <em>იწინასწარმეტყველე, შეცვალე კონფიგი, გაუშვი, შეადარე.</em> მცდარი პროგნოზები დავალების შედეგია.
+  </div>
+
+  <h2>13 · პროექტის ნაბიჯი</h2>
+  <p>გადაწყვეტილების დროა <strong>LLM inference პლატფორმისთვის</strong>: აირჩიე tenancy მოდელი <em>და</em> authentication სქემა, ორივე ორი წინადადებით დაიცავი. დასაცავი მაგალითი: <em>pool მოდელი Postgres RLS-ითა და per-tenant token-bucket quota-ებით პლუს fair GPU-queue scheduling (სრული სიმჭიდროვე გრძელ კუდზე, მაგარი data და performance კედლები), წინ short-TTL OIDC access token-ებით audience-შემოწმებით და mesh-managed mTLS gateway-ს, router-სა და worker-ებს შორის.</em> დაწერე შენი ორი წინადადება და მოიტანე შემდეგ სესიაზე.</p>
+
+  <h2>შეამოწმე შენი თავი</h2>
+  <div class="quiz" id="quiz"></div>
+
+  <h2>ძირითადი წყარო</h2>
+  <p>წაიკითხე <strong>OAuth2 (<a href="https://www.rfc-editor.org/rfc/rfc6749">RFC 6749</a>) §1 როლებისთვის და §4.1 authorization-code flow-სთვის</strong>, მერე <strong>JWT (<a href="https://www.rfc-editor.org/rfc/rfc7519">RFC 7519</a>) §4 registered claim-ებისთვის</strong>. tenancy ნახევრისთვის — <strong><a href="https://docs.aws.amazon.com/wellarchitected/latest/saas-lens/tenant-isolation.html">AWS SaaS Lens tenant-isolation</a></strong> (silo/bridge/pool ღირებულებისა და blast-radius trade-off-ებით). დაამატე <strong><a href="https://research.google/pubs/pub43231/">Google BeyondCorp</a></strong> zero-trust ჩარჩოსთვის და <strong><a href="https://owasp.org/www-project-top-ten/">OWASP Top 10</a></strong>.</p>
+
+  <footer class="lesson-footer">
+    <p><strong>გაიჭედე ან გაინტერესებს?</strong> ჰკითხე მასწავლებელს (აგენტს) ნებისმიერი რამ — „რატომ ატარებს JWT-ის signature-ის შემოწმება <code>aud</code>-ის გარეშე token-ს სერვისებს შორის?" შესანიშნავი დამატებითი კითხვაა.</p>
+    <nav class="lesson-nav">
+      <span><a href="0016-observability-and-ops.ka.html">◀ წინა: 0016 · Observability &amp; Ops</a></span>
+      <span><a href="../index.html">შემდეგი: ფაზა 3 — Classic Design Reps (მალე) ▶</a></span>
+    </nav>
+  </footer>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+renderQuiz(document.getElementById('quiz'), {
+  title: 'შეამოწმე შენი თავი',
+  questions: [
+    {
+      q: 'კალერი წარადგენს ვალიდურ token-ს, მაგრამ ითხოვს სხვა tenant-ის ჩანაწერებს. რომელი კონტროლია პასუხისმგებელი მის დაბლოკვაზე?',
+      options: [
+        'Authorization წყვეტს, identity-ს ქმედების უფლება აქვს თუ არა',
+        'Authentication მხოლოდ ამტკიცებს, ვინ ამბობს კალერი რომაა',
+        'Transport encryption მალავს payload-ს მოსმენისგან გზაში',
+      ],
+      answer: 0,
+      explain: 'Token authenticated-ია — identity დამტკიცებულია — მაგრამ სხვა tenant-ის მონაცემის წაკითხვა authorization-ის გადაწყვეტილებაა, შემოწმებული resource-ზე. იდეალურად authenticated მოთხოვნა მაინც შეიძლება unauthorized იყოს.',
+    },
+    {
+      q: 'JWT verifier იღებს token-ს, რომლის header-ში alg none-ია, signature-ის შემოწმებას ტოვებს. რატომაა ეს საშიში?',
+      options: [
+        'თავდამსხმელი ყალბ token-ებს ჭრის, სერვერი ბრმად ენდობა',
+        'Token-ები დიდდება და ნელა იპარსება ყველგან სისტემაში',
+        'Refresh token-ები ვადადებიან access token-ებზე ადრე ხოლმე',
+      ],
+      answer: 0,
+      explain: 'alg=none-ის პატივისცემისას ნებისმიერი აშორებს signature-ს და ნებისმიერ claim-ს წერს — admin, ნებისმიერი tenant — და სერვერი იღებს. მკაცრმა verifier-მა უნდა დააფიქსიროს მოსალოდნელი ალგორითმი და none უარყოს.',
+    },
+    {
+      q: 'გჭირდება ყველაზე ძლიერი data isolation დარეგულირებული ბანკის კლიენტისთვის, რომელიც გამოყოფილ ინფრასტრუქტურაში გადაიხდის. რომელი მოდელი?',
+      options: [
+        'Pool მოდელი იზიარებს table-ებს tenant-ებს შორის',
+        'Bridge მოდელი ყოველ tenant-ს schema-ებს აძლევს',
+        'Silo მოდელი ყოველ tenant-ს ინფრასტრუქტურას აძლევს',
+      ],
+      answer: 2,
+      explain: 'Silo (DB ან სრული stack per tenant) ფიზიკური განცალკევებაა — ყველაზე ძლიერი isolation და ყველაზე მაღალი ღირებულება, რასაც დარეგულირებული „ვეშაპი" სიამოვნებით გადაიხდის. Pool table-ებს იზიარებს; bridge — DB-ს ცალკე schema-ებით.',
+    },
+    {
+      q: 'Pool მოდელში ერთი query helper ივიწყებს tenant_id filter-ს და აბრუნებს სხვა tenant-ის row-ებს. რა იცავს საუკეთესოდ?',
+      options: [
+        'უფრო გრძელი TTL-ები ყოველ დაქეშილ query შედეგზე',
+        'Database row-level security, tenant საზღვრის აღსრულებით',
+        'Per-query დეველოპერის დისციპლინა, code review-ში შემოწმებული',
+      ],
+      answer: 1,
+      explain: 'Row-level security tenant filter-ს database-ში გადააქვს, რომელიც მას ყოველ query-ს ავტომატურად ამატებს — მავიწყებელი helper მაინც ვერ გადალახავს საზღვარს. დისციპლინა და review ვერ იჭერს იმ ერთ helper-ს, ვინც ივიწყებს.',
+    },
+    {
+      q: '300-კაციანი ოფისი ერთ NAT IP-ს იზიარებს და per-IP login limiter რამდენიმე შეცდომის შემდეგ ყველას კეტავს. გამოსწორება?',
+      options: [
+        'Key limiter account-ზე და არა მისამართზე ხოლმე',
+        'დაწიე global limit, სანამ abuse სრულად შეჩერდება',
+        'ამოიღე limiter login გზიდან საერთოდ და მთლიანად',
+      ],
+      answer: 0,
+      explain: 'NAT-ის უკან ერთი IP მთელი კომპანიაა, ამიტომ per-IP login limit უდანაშაულოებს სჯის. Key სენსიტიური limit-ები account-ზე და IP ერთ სიგნალად მიიღე; global-ის დაწევა ან limiter-ის ამოღება brute force-ს აადვილებს.',
+    },
+    {
+      q: 'ორმა შიდა სერვისმა თითოეულმა კრიპტოგრაფიულად უნდა დაუმტკიცოს identity მეორეს მონაცემების გაცვლამდე. რომელი მექანიზმი იძლევა ამას?',
+      options: [
+        'საერთო სტატიკური API key ერთი',
+        'ხელმოწერილი bearer JWT მარტო',
+        'Mutual TLS ორივე სერვისს შორის',
+      ],
+      answer: 2,
+      explain: 'mTLS ორივე ბოლოს აიძულებს certificate წარადგინოს და შეამოწმოს, ამიტომ identity ორმხრივია და არხი დაშიფრული. API key მხოლოდ ერთ მიმართულებას authenticate-ს; bearer JWT კალერს ამტკიცებს, მაგრამ მოპარული ნებისმიერისთვის გამოსადეგია.',
+    },
+  ],
+});
+</script>
+</body>
+</html>

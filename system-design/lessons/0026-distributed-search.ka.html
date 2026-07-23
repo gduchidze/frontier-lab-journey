@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html lang="ka">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>გაკვეთილი 26 · განაწილებული ძებნა 1 მილიარდ დოკუმენტზე</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<div class="lesson">
+  <header class="lesson-header">
+    <p class="kicker">Lesson 0026 · Phase 3 — Classic Design Reps · <a href="0026-distributed-search.html">English version</a></p>
+    <h1>განაწილებული ძებნა 1 მილიარდ დოკუმენტზე</h1>
+    <p class="dek">ორი სისტემა ერთ ლაბადაში: offline indexing pipeline (ინდექსაციის მილსადენი) და online query plane (მოთხოვნების სიბრტყე). ამ rep-ზე ის კანდიდატები იჭრებიან, ვინც მხოლოდ ერთს აპროექტებს.</p>
+  </header>
+
+  <div class="mission-tie">
+    <strong>მისიასთან კავშირი.</strong> ეს <strong>Anthropic-ის რეპორტირებული პრომპტია</strong> — „distributed search over 1B documents" კითხვების ბანკში სიტყვასიტყვით ფიგურირებს, ამიტომ ეს rep-ი საბრძოლო მასალაა; იგივე retrieval ინფრასტრუქტურა უდევს საფუძვლად RAG-ს production მასშტაბზე (ფაზა 6, გაკვეთილი 41): „keyword" შეცვალე „embedding"-ით და sharding-ი, fanout-ი და კუდის ლატენტურობის მათემატიკა უცვლელი გადარჩება.
+  </div>
+
+  <div class="callout"><span class="label">REP PROTOCOL</span>
+    ჯერ <strong>40-წუთიანი სოლო rep-ი დროზე</strong> — ხმამაღლა, ქაღალდზე ან Excalidraw-ში, ჩაუხედავად. პრომპტი: <em>„დააპროექტე ძებნის სისტემა 1 მილიარდ დოკუმენტზე."</em> მხოლოდ ამის შემდეგ წაიკითხე გაკვეთილი, შეადარე და ყველა დელტა (გამორჩენილი კომპონენტი, მცდარი რიცხვი, დაუსახელებელი failure mode) learning record-ად ჩაწერე.
+  </div>
+
+  <h2>1 · პრომპტი და რას ამოწმებს სინამდვილეში</h2>
+  <p>ინტერვიუერი ამბობს ერთ წინადადებას: <em>„დააპროექტე keyword ძებნა მილიარდ დოკუმენტზე."</em> ფარული რუბრიკა: შეამჩნევ თუ არა, რომ ეს <strong>ორი სისტემაა ერთში</strong>? <strong>Offline indexing pipeline</strong> (batch/streaming სისტემა, რომელიც ნედლ დოკუმენტებს საძიებო ინდექსად აქცევს) და <strong>online query plane</strong> (დაბალი ლატენტურობის fanout სერვისი, რომელიც ამ ინდექსზე top-k queries-ს პასუხობს). ვინც მხოლოდ query plane-ს ხატავს, კითხვაზე „და ინდექსი საიდან მოდის?" ჩერდება; ვინც მხოლოდ pipeline-ს — ლატენტურობას ვერასდროს ეხება. ორი სიბრტყის გაყოფა პირველივე წუთში თქვი — ეს ამ rep-ის ყველაზე მაღალსიგნალიანი წინადადებაა. მეორეული რუბრიკა: ინდექსის ზომის მათემატიკა, sharding-ღერძის არჩევანი (სექცია 6) და fanout-ის კუდის ლატენტურობა (სექცია 7).</p>
+
+  <h2>2 · Clarify (5 წთ): freshness არის გასაღები</h2>
+  <table>
+    <tr><th>მოთხოვნა</th><th>სამიზნე</th><th>შედეგი</th></tr>
+    <tr><td>Query ტიპი</td><td>Keyword (ტერმინების AND), დალაგებული</td><td>Inverted index და არა table scan-ები</td></tr>
+    <tr><td>შედეგის ფორმა</td><td>Top-k (k = 10) snippet-ებით</td><td>Ranking + doc store-ის წაკითხვა</td></tr>
+    <tr><td>ლატენტურობა</td><td>p99 ≈ 200 ms ბოლოდან ბოლომდე</td><td>ინდექსი RAM/SSD-ში; fanout-ის კუდის მათემატიკა</td></tr>
+    <tr><td>კორპუსი</td><td>1B დოკ. × ~5 KB, ნელა იზრდება</td><td>Sharding აუცილებელია; ერთ კვანძს არ ეტევა</td></tr>
+    <tr><td>QPS</td><td>~10k პიკზე</td><td>Replica-ები shard-ზე, შედეგების cache</td></tr>
+    <tr><td><strong>Index freshness (სიახლე)</strong></td><td><strong>წუთები–საათები საკმარისია</strong></td><td><strong>მთავარი გასაღები — იხ. ქვემოთ</strong></td></tr>
+  </table>
+  <p>Freshness-ის კითხვა ცხადად დასვი და ხმამაღლა თქვი, რომ <strong>მისი შერბილება არის გასაღები</strong>: თუ ახალი დოკუმენტის საძიებოდ გახდომას წუთები შეიძლება დასჭირდეს, indexing-ი offline batch job-ად გაეშვება, რომელიც <em>immutable</em> (უცვლელ) ინდექსის ფაილებს აწარმოებს და გრაფიკით გზავნის serving კვანძებზე. ორი სიბრტყე სრულად იყოფა — pipeline-ი შეიძლება ჩავარდეს, თავიდან გაეშვას და გადააშენოს ისე, რომ query ლატენტურობას არ შეეხოს. თუ ინტერვიუერი წამებში სიახლეს მოითხოვს, ბევრად რთული ამოცანა აღმოაჩინე (სექცია 10). Out of scope: crawling-ის politeness (გაკვეთილი 0024), auth, რეკლამა.</p>
+
+  <h2>3 · Estimate (5 წთ): რიცხვები, რომლებსაც დახარჯავ</h2>
+  <pre><code>კორპუსი:  1B დოკ. × 5 KB ტექსტი          ≈ 5 TB ნედლი ტექსტი
+Postings: ~500 უნიკ. ტერმინი/დოკ.        → 1B × 500 = 5 × 10¹¹ posting ჩანაწერი
+ჩანაწერი: ~4 B შეკუმშული (delta docID + tf, positions ამორტიზებული)
+ინდექსი:  5 × 10¹¹ × 4 B ≈ 2 TB          → ინდექსი ≈ კორპუსის 40% (ტიპურია 20–50%)
+Shard-ები: 2 TB ÷ ~50 GB ინდექსი/კვანძი  = 40 shard → 50 მარაგით
+Fanout:   ყოველი query ყველა shard-თან   → per-shard QPS = სრული 10k QPS
+          10k QPS × 50 shard = 500k shard-query/s კლასტერზე
+Replica:  კვანძი ~2k QPS-ს უძლებს        → 5 replica/shard ≈ 250 serving კვანძი</code></pre>
+  <p>ახლა <em>დახარჯე</em> თითოეული. <strong>2 TB ინდექსი</strong> → ერთი კვანძი არ კმარა; sharding იძულებითია. <strong>50 shard-ი</strong> → fanout 50 ყოველ query-ზე — სექცია 7-ის კუდის მათემატიკა ირთვება. <strong>Per-shard QPS = კლასტერის სრული QPS</strong> (ყოველი query ყველა shard-ს სტუმრობს — doc-partitioned გადასახადი) → replica-ების რაოდენობას ჯამური QPS კარნახობს. <strong>40% ინდექსი/კორპუსი</strong> → შეკუმშვა (სექცია 5) ფულადი გადაწყვეტილებაა. გამოუყენებელი შეფასება 0009-ის კლასიკური ანტი-პატერნია — ეს ოთხივე ქვემოთ მეორდება.</p>
+
+  <h2>4 · High-level: ორი სიბრტყე ცალ-ცალკე დახატე</h2>
+  <pre><code>INDEXING PLANE (offline, throughput-ზე ოპტიმიზებული)
+  crawl/ingest → parse + tokenize → ნაწილობრივი ინდექსები (batch-ებად)
+      → merge immutable სეგმენტებად → სეგმენტების გაგზავნა shard replica-ებზე
+
+QUERY PLANE (online, ლატენტურობაზე ოპტიმიზებული)
+  client → query service (parse, cache-ის შემოწმება)
+      → fanout ყველა 50 shard-ზე (თითოზე 1 replica)
+      → თითო shard: ლოკალური top-k′ → gather → merge + rank → top-10 → პასუხი</code></pre>
+  <p>დაფაზე ორ განცალკევებულ დიაგრამად დახატე. Indexing plane MapReduce-ის ფორმის batch სისტემაა: mapper-ები დოკუმენტების batch-ებს ტოკენიზებენ და ნაწილობრივ term→postings რუკებს უშვებენ; reducer-ები მათ დალაგებულ, შეკუმშულ <strong>სეგმენტის ფაილებად</strong> წყობენ; დისტრიბუციის ნაბიჯი თითო სეგმენტს თავისი shard-ის replica-ებზე გზავნის. Query plane არასდროს წერს: immutable სეგმენტებს ტვირთავს და ემსახურება. სიბრტყეებს შორის ერთადერთი კავშირი სეგმენტების გადაცემაა — ვერსიონირებული, ატომური „ჩატვირთე ნაკრები N+1, ჩამოაგდე N". ეს განცალკევება სწორედ შერბილებულმა freshness-მა გიყიდა — თქმა Step 1-ს Step 3-ს უკავშირებს ინტერვიუერის თვალწინ.</p>
+
+  <h2>5 · Deep dive: inverted index-ის ანატომია</h2>
+  <p>Inverted index არის <strong>term → postings list</strong>: ამ ტერმინის შემცველი docID-ების დალაგებული სია, თითო ჩანაწერს ახლავს term frequency (tf) და ხშირად <strong>positions</strong> (ტოკენის ოფსეტები — phrase queries-სა და snippet-ის გამოსაყოფად). სამი ფაქტი გასახმოვანებლად:</p>
+  <ul>
+    <li><strong>დალაგებული + delta-encoded + შეკუმშული.</strong> Postings docID-ით ლაგდება, ამიტომ ინახავ <em>სხვაობებს</em> (delta) და არა ნედლ 8-ბაიტიან ID-ებს; სხვაობები პატარაა და varint/bit-packing-ით ძლიერ იკუმშება. აქედან მოდის სექცია 3-ის 40%-იანი შეფარდება — შეუკუმშავად ინდექსი კორპუსს გაუტოლდებოდა.</li>
+    <li><strong>Skip pointers.</strong> AND query postings სიებს კვეთს; skip pointer-ები ყოველ √n ჩანაწერზე კვეთას გრძელი სიის მონაკვეთების გადახტომის საშუალებას აძლევს — ღირებულება სიგრძეების ჯამიდან უმოკლესის სიგრძისკენ იწევს.</li>
+    <li><strong>Immutable სეგმენტები + background merge.</strong> განახლება სეგმენტს ადგილზე არასდროს ცვლის: ახალი დოკუმენტები ახალ პატარა სეგმენტებში მიდის; წაშლა tombstone bitmap-ია; ფონური პროცესი პატარებს დიდებად წყობს. იცანი ინსტინქტი — ეს გაკვეთილი 0012-ის <strong>LSM tree-ა</strong> ძებნის ტანსაცმელში: თანმიმდევრული writes, lock-free reads, write amplification ფონში. Lucene — და მაშასადამე Elasticsearch — ზუსტად ასე მუშაობს.</li>
+  </ul>
+
+  <h2>6 · Deep dive: document-partitioned vs term-partitioned</h2>
+  <p>ამ პრომპტის კანონიკური განშტოება: დაყო <strong>დოკუმენტით</strong> (თითო shard = სრული ინდექსი დოკუმენტების ნაჭერზე) თუ <strong>ტერმინით</strong> (თითო shard ლექსიკონის ნაჭრის მთლიან postings სიებს ფლობს)?</p>
+  <table>
+    <tr><th>განზომილება</th><th>Doc-partitioned</th><th>Term-partitioned</th></tr>
+    <tr><td>Query fanout</td><td>ყოველი query → ყველა 50 shard</td><td>მხოლოდ query-ის ტერმინების მფლობელები (2–3)</td></tr>
+    <tr><td>მრავალტერმინიანი AND</td><td>კვეთა <strong>ლოკალურია</strong> თითო shard-ში</td><td>Postings <strong>shard-ებს შორის</strong> იგზავნება — GB-ები ხშირ ტერმინებზე</td></tr>
+    <tr><td>ცხელი ტერმინები</td><td>დატვირთვა თანაბრად ნაწილდება</td><td>„the"-ს მფლობელი shard დნება — hot-term skew</td></tr>
+    <tr><td>ინდექსის აგება / დოკ. დამატება</td><td>ერთი shard ეხება თითო დოკუმენტს</td><td>ყოველი დოკუმენტი ~500 term shard-ს ეხება</td></tr>
+    <tr><td>Shard-ის ჩავარდნა</td><td>Recall-ის ნაჭერი იკარგება; ყველა query მდოვრედ დეგრადირდება</td><td>ზოგი ტერმინი ყველა შედეგიდან მთლიანად ქრება</td></tr>
+  </table>
+  <p>Term-partitioning მიმზიდველად გამოიყურება (მცირე fanout!) სანამ მრავალტერმინიან სტრიქონს არ ნახავ: „distributed AND search"-ის კვეთა ერთი ტერმინის postings-ის — შესაძლოა მილიონობით ჩანაწერის — მეორის shard-ზე გაგზავნას ითხოვს, ყოველ query-ზე. Hot-term skew საქმეს ასრულებს. ამიტომ <strong>თითქმის ყველა doc-partitioned-ს აწვდის</strong> — ეს Elasticsearch/Lucene-ის მოდელია და Google-ის თავდაპირველი არქიტექტურაც. ცხრილი ხმამაღლა თქვი, აირჩიე doc-partitioned <em>რადგან</em> ლოკალური კვეთები და თანაბარი დატვირთვა მცირე fanout-ს სჯობს, და დაასახელე ფასი: სრული fanout, რომელსაც სექცია 7-ში იხდი.</p>
+
+  <h2>7 · Deep dive: scatter-gather და კუდის ლატენტურობის გადასახადი</h2>
+  <p>Coordinator query-ს ყველა 50 shard-ზე შლის; თითო თავის ლოკალურ top-k′-ს აბრუნებს; coordinator 50·k′ კანდიდატს წყობს და გლობალურ top-10-ს აბრუნებს. ორი დახვეწილობა სენიორის სიგნალს ატარებს:</p>
+  <p><strong>რატომ k′ &gt; k.</strong> ყველა shard-ს იდენტური გლობალური სტატისტიკით რომ ეფასებინა, per-shard top-10 გლობალურ top-10-ს დამტკიცებადად შეიცავდა (თითო გამარჯვებული ზუსტად ერთ shard-ში ცხოვრობს). მაგრამ shard-ები <em>ლოკალური</em> IDF-ით (საკუთარი document frequency-ებით) აფასებენ, early-termination მიახლოებებს იყენებენ და deletion tombstone-ებს ატარებენ — ამიტომ გლობალურად ძლიერი დოკუმენტი ლოკალურ მე-12 ადგილზე შეიძლება იჯდეს და coordinator-ამდე ვერასდროს მივიდეს. პრაქტიკული გამოსავალი: მოითხოვე k′ = 2–3×k თითო shard-ზე (რამდენიმე ასეული merge-კანდიდატი — იაფია), ან პერიოდულად დააგზავნე გლობალური ტერმინ-სტატისტიკა. ლაბი სწორედ ამ recall-vs-k′ მრუდს ზომავს.</p>
+  <p><strong>Fanout კუდს აძლიერებს.</strong> Query ისეთივე ნელია, როგორც მისი <em>ყველაზე ნელი</em> shard-ი: P(ყველა n shard სწრაფია) = p<sup>n</sup>. Fanout 100-ზე და 99%-ში სწრაფ shard-ებზე 0.99<sup>100</sup> ≈ 0.37 — queries-ის მხოლოდ 37% ცდება ყველა shard-ის ნელ 1%-ს, ანუ per-shard p99 შენი ბოლოდან-ბოლომდე <em>მედიანა</em> ხდება. Fanout 100-ზე სუფთა p99-სთვის თითო shard-ი 99.99-ე პერცენტილზე უნდა იყოს სწრაფი: 0.9999<sup>100</sup> ≈ 0.99. შერბილება: <strong>hedged requests</strong> (თუ shard-მა p95-მდე არ უპასუხა, იგივე მოთხოვნა სხვა replica-ს ესროლე და პირველი პასუხი აიღე — ~5% ზედმეტი დატვირთვა, კუდის მკვეთრი მოჭრა) და replica-გათვითცნობიერებული balancing, რომელიც ნელ ან GC-ში მყოფ კვანძებს გვერდს უვლის.</p>
+
+  <h2>8 · Deep dive: ranking — TF-IDF-დან ორ ფაზამდე</h2>
+  <p><strong>TF-IDF ინტუიცია:</strong> დოკუმენტის ქულა = Σ query-ტერმინებზე tf (რამდენჯერ ჩნდება ტერმინი აქ) × idf = log(N/df) (რამდენად იშვიათია კორპუსში). იშვიათი ტერმინები დომინირებს; „the" ნულს იძლევა. <strong>BM25</strong> TF-IDF-ია ორი შესწორებით და მხოლოდ ფორმის ცოდნა გჭირდება: tf <em>ჯერდება</em> (saturation — 50-ე გამოჩენა თითქმის არაფერს ამატებს: tf/(tf+k₁) ნედლი tf-ის ნაცვლად) და ქულები <em>სიგრძით ნორმალიზდება</em> (ტერმინი tweet-ში წიგნში მოხვედრილს ჯობს — b·dl/avgdl წევრი). ფორმა და არა გამოყვანა — ეს არის ინტერვიუს ბარი.</p>
+  <p><strong>ორფაზიანი ranking:</strong> ძვირი ranker მილიონობით დამთხვეულ დოკუმენტზე ლატენტურობის ბიუჯეტს დაანგრევს, ამიტომ ფაზა 1 თითო shard-ში იაფი BM25-ით რამდენიმე ასეულ კანდიდატს არჩევს, ფაზა 2 კი მხოლოდ მათ აფასებს ძვირი მოდელით (ათობით feature ან ML ranker) coordinator-ზე. შეურიე <strong>სტატიკური ხარისხის prior-ები</strong> — query-სგან დამოუკიდებელი ქულა (PageRank, წყაროს ხარისხი), ინდექსაციისას გამოთვლილი. ბოლოს <strong>query შედეგები cache-ში</strong> (გაკვეთილი 0007): პოპულარობა zipf-ურია, ამიტომ მოკრძალებული cache coordinator-ის წინ 10k QPS-ის დიდ ნაწილს fanout-ამდე შთანთქავს.</p>
+
+  <h2>9 · Failure mode-ები და მონიტორინგი</h2>
+  <ul>
+    <li><strong>ერთი ნელი shard-ი ყველა query-ს წამლავს.</strong> სრული fanout ნიშნავს: ერთი ცუდი კვანძი (GC პაუზა, კვდომადი დისკი, merge-ქარიშხალი) გლობალურ p99-ს ათრევს. შერბილება: hedged requests, მკაცრი per-shard timeout-ები და ნაწილობრივი შედეგები <code>degraded=true</code> დროშით query-ის ჩავარდნის ნაცვლად — 49/50 shard-ი ისევ შესანიშნავი recall-ია.</li>
+    <li><strong>Segment-merge ქარიშხლები.</strong> ფონური merge I/O-მძიმეა; დაურეგულირებელი merge serving კვანძზე queries-ს ეჯიბრება და ზუსტად ზემოთხსენებულ ნელ shard-ს აწარმოებს. შერბილება: merge I/O-ს ლიმიტი, ან მძიმე merge serving გზიდან მოშორებით და მზა სეგმენტის გაგზავნა.</li>
+    <li><strong>ინდექსი/serving ვერსიების აცდენა.</strong> Rollout-ის შუაში N და N+1 ნაკრებზე მყოფი shard-ები სხვადასხვანაირად ქულავს და შერწყმულ გვერდებზე დოკუმენტები ორმაგდება ან იკარგება. შერბილება: ვერსია ყოველ სეგმენტ-ნაკრებს, coordinator-ი query-ზე ერთ ვერსიას ამაგრებს, ახალი ინდექსი ჯერ canary shard-ებზე.</li>
+    <li><strong>მეტრიკები, რომლებიც ადამიანს აღვიძებს:</strong> per-shard p99 <em>და</em> ბოლოდან-ბოლომდე p99 (მათი შუალედი შენი fanout-გადასახადია), hedge-ის სროლის სიხშირე, indexing lag (freshness SLO) და <strong>recall canary</strong> — ფიქსირებული query→მოსალოდნელი-დოკუმენტი წყვილები უწყვეტ გამეორებაზე; recall-ის ჩუმი ვარდნა ლატენტურობის დაფებზე უხილავია.</li>
+  </ul>
+
+  <h2>10 · ვარიანტები და twist-ები</h2>
+  <ul>
+    <li><strong>Real-time indexing.</strong> „ახალი დოკუმენტი წამებში საძიებო" → თითო shard-ზე პატარა in-memory delta ინდექსი, რომელიც დიდ immutable სეგმენტებთან ერთად იკითხება და პერიოდულად სეგმენტად იწერება. ეს ზუსტად Lucene-ის near-real-time refresh-ია — ისევ LSM memtable ინსტინქტი.</li>
+    <li><strong>Phrase queries.</strong> „ზუსტი ფრაზა" სექცია 5-ის position მონაცემებს ითხოვს: postings-ის კვეთა <em>და</em> მეზობელი პოზიციების შემოწმება; ხშირი ბიგრამების ინდექსები („new york") ყველაზე ცუდ შემთხვევებს წინასწარ იხდის.</li>
+    <li><strong>მრავალენოვნება.</strong> ტოკენიზაცია ენაზეა დამოკიდებული — CJK ენებში ჰარები არ არის (სეგმენტაციის მოდელები), გერმანული კომპოზიტები იშლება, stemming/lemmatization ენის მიხედვით ინდექსაციისა და query-ის დროსაც. Analyzer-ის არჩევა ინდექსაციისდროინდელი ვალდებულებაა: შეცვლა გადაინდექსაციას ნიშნავს.</li>
+  </ul>
+  <p><strong>AI შენიშვნა.</strong> Embedding-ზე დაფუძნებული (vector) ძებნა term-match retrieval ფაზას მკვრივ ვექტორებზე approximate nearest-neighbor ძებნით ცვლის, მაგრამ ამ გაკვეთილის ჩონჩხს ინარჩუნებს — sharded ANN ინდექსები, scatter-gather, per-shard top-k′, merge, rerank. თანამედროვე RAG სტეკები <em>ჰიბრიდულია</em>: BM25 და ვექტორული retrieval პარალელურად, rerank-ზე შერწყმული. სრული განხილვა ფაზა 6-ში, გაკვეთილი 41.</p>
+
+  <h2>11 · ინტერვიუს გასაღები ფრაზები</h2>
+  <ul>
+    <li><em>გახსნა:</em> „ეს ორი სისტემაა — offline indexing pipeline და online query plane — და freshness-ის წუთებამდე შერბილება მაძლევს მათი განცალკევების უფლებას."</li>
+    <li><em>შეფასების დახარჯვა:</em> „2 TB ინდექსი 50 GB-იან კვანძებზე 40–50 shard-ია — და ეს fanout რიცხვია მიზეზი, რომ დროს კუდის ლატენტურობაზე დავხარჯავ."</li>
+    <li><em>Sharding-ის განშტოება:</em> „doc-partitioned თუ term-partitioned: სრულ fanout-ს ავიღებ ლოკალური კვეთებისა და hot-term shard-ის არქონის სანაცვლოდ — Elasticsearch-ის მოდელი."</li>
+    <li><em>დაუკითხავი კუდის მათემატიკა:</em> „fanout 50-ზე P(ყველა სწრაფია) = per-shard p ხარისხად 50 — per-shard p99 ჩემი მედიანა ხდება, ამიტომ hedged requests მჭირდება და არა უკეთესი საშუალო."</li>
+    <li><em>სიღრმის შეთავაზება:</em> „შემიძლია ჩავუღრმავდე BM25-პლუს-rerank-ს ან სეგმენტების merge-ს — რომელი გირჩევნია?"</li>
+    <li><em>დახურვა:</em> „გავაღვიძებდი ბოლოდან-ბოლომდე p99-ზე, indexing lag-სა და recall canary-ზე; მეტი დროით: real-time delta-ები და მრავალენოვანი analyzer-ები."</li>
+  </ul>
+
+  <h2>12 · ლაბი + პროექტის ნაბიჯი</h2>
+  <div class="callout"><span class="label">პრაქტიკა (ქვიზამდე გააკეთე)</span>
+    <code>labs/lab-0026-inverted-index/</code>-ში <code>python3 search_lab.py</code> აშენებს 20k-დოკუმენტიან
+    zipf-ურ კორპუსს, inverted index-ს და TF-IDF ranking-ს; ყოფს doc-partitioned პრინციპით; შემდეგ
+    <em>ზომავს</em> ორ ახლახან წაკითხულ მტკიცებას — ranking recall vs per-shard k′ (k′=k რეალურ
+    შედეგებს კარგავს გლობალურ ჭეშმარიტებასთან შედარებით) და p99-ის გაძლიერება shard-ების
+    რაოდენობის მიხედვით, hedging გადამრთველით. იწინასწარმეტყველე გაშვებამდე: README სავარჯიშოები E1–E4.
+  </div>
+  <p><strong>პროექტის ნაბიჯი.</strong> ლაბის შემდეგ გაიმეორე 40-წუთიანი rep-ი <em>ხმამაღლა</em> და დელტები პირველ ცდას შეადარე. შემდეგ learning record-ში ერთი აბზაცი დაწერე, რომელიც ამ rep-ს spine პროექტს უკავშირებს: შენი inference პლატფორმის RAG retrieval შრე (ფაზა 6) ზუსტად ეს არქიტექტურა იქნება, shard-ის ადგილას ANN ინდექსით — დაასახელე ორი უცვლელად გადამავალი კომპონენტი (scatter-gather hedging-ით, immutable სეგმენტების გაგზავნა).</p>
+
+  <h2>შეამოწმე შენი თავი</h2>
+  <div class="quiz" id="quiz"></div>
+
+  <h2>ძირითადი წყარო</h2>
+  <p>წაიკითხე <strong>Stanford IR Book</strong> — <a href="https://nlp.stanford.edu/IR-book/information-retrieval-book.html">Introduction to Information Retrieval</a> (თავები 1–5 ინდექსზე, 6–7 scoring-ზე, 20 ვებ-ძებნის არქიტექტურაზე). თანამგზავრები: Google-ის თავდაპირველი არქიტექტურის ნაშრომი <a href="http://infolab.stanford.edu/~backrub/google.html">"The Anatomy of a Large-Scale Hypertextual Web Search Engine"</a> (Brin &amp; Page) და Elasticsearch Definitive Guide-ის <a href="https://www.elastic.co/guide/en/elasticsearch/guide/current/distributed-search.html">distributed search execution</a> თავი — scatter-gather-ის production აღწერა per-shard <code>from + size</code>-ით.</p>
+
+  <footer class="lesson-footer">
+    <p><strong>გაიჭედე ან გაინტერესებს?</strong> ჰკითხე მასწავლებელს (აგენტს) ნებისმიერი რამ — „როგორ შევინარჩუნო ინდექსის თანმიმდევრულობა, თუ დოკუმენტები ყოველ წამს რედაქტირდება?" შესანიშნავი დამატებითი კითხვაა.</p>
+    <nav class="lesson-nav">
+      <span>◀ <a href="0025-distributed-kv.ka.html">0025 · Distributed KV Store</a></span>
+      <span><a href="0027-payment-system.ka.html">0027 · Payment System</a> ▶</span>
+    </nav>
+  </footer>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+renderQuiz(document.getElementById('quiz'), {
+  title: 'შეამოწმე შენი თავი',
+  questions: [
+    {
+      q: 'რატომ არის index freshness-ის „წუთებიც საკმარისია"-მდე შერბილება ამ დიზაინის მთავარი გასაღები?',
+      options: [
+        'ის indexing-ს offline batch pipeline-ად გაშვების საშუალებას აძლევს',
+        'ის query plane-ს ranking-ის სრულად გამოტოვების უფლებას აძლევს',
+        'ის ყოველ shard-ზე replica-ების ყოველგვარ საჭიროებას მთლიანად სპობს',
+      ],
+      answer: 0,
+      explain: 'წუთობრივი freshness ნიშნავს, რომ indexing-ი batch job-ია, რომელიც immutable სეგმენტებს აწარმოებს და serving კვანძებზე გზავნის — ორი სიბრტყე იყოფა და pipeline-ის ჩავარდნა query ლატენტურობას არ ეხება.',
+    },
+    {
+      q: 'რატომ აწვდის თითქმის ყველა production სისტემა document-partitioned და არა term-partitioned sharding-ს?',
+      options: [
+        'term partitioning ყოველთვის მეტ disk storage-ს ითხოვს სისტემისგან',
+        'document partitioning shard-ებს შორის fanout-ს მთლიანად თავიდან იცილებს',
+        'მრავალტერმინიანი queries ლოკალური რჩება და cross-shard join-ებს გამორიცხავს',
+      ],
+      answer: 2,
+      explain: 'Doc-partitioning fanout-ს პირიქით ამაქსიმალებს — მისი მოგება ისაა, რომ „distributed AND search"-ის postings კვეთა თითო shard-ის შიგნით ლოკალურად ხდება, term-partitioning კი უზარმაზარი postings სიების გადაზიდვას ითხოვს და hot-term skew-თი იტანჯება.',
+    },
+    {
+      q: 'fanout 100-ზე, როცა თითო shard 99%-ში სწრაფია, queries-ის რა წილი ხედავს ყველა shard-ს სწრაფად?',
+      options: [
+        'დაახლოებით 99 პროცენტი, fanout მასზე თითქმის არ მოქმედებს',
+        'დაახლოებით 37 პროცენტი, per-shard კუდები ახლა უკვე დომინირებს',
+        'დაახლოებით 63 პროცენტი, hedging აქ ვერაფრით ვერ დაეხმარება',
+      ],
+      answer: 1,
+      explain: '0.99^100 ≈ 0.366. Query თავის ყველაზე ნელ shard-ს ელოდება, ამიტომ მაღალ fanout-ზე per-shard p99 დაახლოებით ბოლოდან-ბოლომდე მედიანა ხდება — სწორედ ამიტომ არსებობს hedged requests.',
+    },
+    {
+      q: 'რატომ უნდა აღემატებოდეს per-shard k′ საბოლოო k-ს scatter-gather top-k-ში?',
+      options: [
+        'ლოკალურმა shard სტატისტიკამ შეიძლება გლობალურად ძლიერი დოკუმენტები დააქვეითოს',
+        'coordinator-ს არ შეუძლია k-ზე მეტი კანდიდატი დოკუმენტის შერწყმა',
+        'ქსელის ლიმიტები კრძალავს shard-იდან ზუსტად k შედეგის დაბრუნებას',
+      ],
+      answer: 0,
+      explain: 'Shard-ები ლოკალური IDF-ითა და მიახლოებებით აფასებენ, ამიტომ გლობალურად ტოპ-დოკუმენტი shard-ის ლოკალურ ზღვარს ოდნავ ქვემოთ შეიძლება მოხვდეს და coordinator-ამდე ვერ მივიდეს. k′ = 2–3×k recall-ს იაფად აბრუნებს — ლაბი ამ მრუდს ზომავს.',
+    },
+    {
+      q: 'რატომ არის ინდექსის სეგმენტები immutable, background merge პროცესით, ადგილზე განახლების ნაცვლად?',
+      options: [
+        'immutable ფაილები დოკუმენტებს მყისიერად შლის ყოველგვარი გადაწერის გარეშე',
+        'თანმიმდევრული writes და lock-free reads; merge-ები განახლებებს ამორტიზებს',
+        'merge გარანტირებულად აჩვენებს ყოველ query-ს ახალ დოკუმენტებს მყისიერად',
+      ],
+      answer: 1,
+      explain: 'ეს გაკვეთილი 0012-ის LSM-tree ინსტინქტია: ახალი დოკუმენტები ახალ პატარა სეგმენტებში მიდის, წაშლა tombstone-ია და ფონური merge write amplification-ს query გზის მიღმა იხდის. Lucene ზუსტად ასე მუშაობს.',
+    },
+    {
+      q: 'რა არის two-phase ranking-ის მიზანი query plane-ში?',
+      options: [
+        'ძვირი scoring პირველი ეშვება, რომ recall იდეალური დარჩეს',
+        'ორივე ფაზა ყველა დამთხვეულ დოკუმენტს ორჯერ აფასებს სრულად',
+        'იაფი retrieval კანდიდატებს ავიწროებს; ძვირი reranking ცოტას აპრიალებს',
+      ],
+      answer: 2,
+      explain: 'ძვირი ranker მილიონობით დამთხვევაზე 200 ms ბიუჯეტს დაანგრევს. იაფი BM25 თითო query-ზე რამდენიმე ასეულ კანდიდატს არჩევს; ძვირი მოდელი მხოლოდ მათ აფასებს — ღირებულება ასეულების პროპორციულია და არა მილიონების.',
+    },
+  ],
+});
+</script>
+</body>
+</html>

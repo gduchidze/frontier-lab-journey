@@ -1,0 +1,245 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lesson 18 · Design Rep: API Rate Limiter</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<div class="lesson">
+  <header class="lesson-header">
+    <p class="kicker">Lesson 0018 · Phase 3 — Classic Design Reps · <a href="0018-rate-limiter.ka.html">ქართული ვერსია</a></p>
+    <h1>Design Rep: API Rate Limiter</h1>
+    <p class="dek">The classic warm-up prompt, executed as a full 4-step interview rep — five algorithms, one Redis race condition, and the accuracy-vs-latency trade-off that decides senior offers.</p>
+  </header>
+
+  <div class="mission-tie">
+    <strong>Mission tie.</strong> "Design a rate limiter" appears in the reported Anthropic question bank as a classic warm-up — often the opener before a harder prompt, which means it is graded on <em>execution speed and crispness</em>, not novelty. A senior candidate finishes the whole loop in 30–35 minutes with algorithm trade-offs quantified in bytes and a named failure policy for the backing store. This lesson is the reference rep for exactly that performance.
+  </div>
+
+  <div class="callout"><span class="label">Rep protocol (read this first)</span>
+    Phase 3 lessons are REFERENCE SOLUTIONS, not first reads. Before scrolling past this box:
+    do a <strong>40-minute solo timed design, out loud</strong>, using the 4-step framework from
+    <a href="0009-interview-os.html">lesson 0009</a> on the prompt in section 1. THEN read this
+    lesson and log every delta — a component you missed, a number you didn't spend, a failure
+    mode the reference names that you didn't. The deltas are the learning; the reading alone is not.
+  </div>
+
+  <h2>1 · The prompt, and what is actually being probed</h2>
+  <p>The prompt is one sentence: <em>"Design a rate limiter for a public API platform."</em> Everything else is yours to structure. Behind the apparent simplicity, interviewers are probing four specific things:</p>
+  <ul>
+    <li><strong>Algorithm literacy.</strong> Can you name more than one algorithm, and — the real test — quantify their trade-offs in memory, burst behavior, and accuracy instead of reciting names?</li>
+    <li><strong>Distributed-state instincts.</strong> The single-box version is trivial. The moment there are N gateway nodes, counting becomes a distributed-systems problem with races, hot keys, and a consistency dial. This is where the rep is won.</li>
+    <li><strong>Failure policy.</strong> What happens when the counter store dies? "Fail open vs fail closed" is a one-line question that separates candidates who have operated systems from candidates who have read about them.</li>
+    <li><strong>API manners.</strong> Do rejected callers get a response they can act on (429, <code>Retry-After</code>), or do you accidentally design a thundering herd?</li>
+  </ul>
+  <p>Because it is a warm-up, pace matters: budget roughly 5 minutes to clarify, 4 to estimate, 8 for the high-level design, and spend the rest deep in algorithms and distributed counting. Driving fast and out loud <em>is</em> the deliverable.</p>
+
+  <h2>2 · Step 1 — Clarify (5 min)</h2>
+  <p>Scope it as a concrete business: a public e-commerce API platform (catalog, orders, search endpoints) selling access to third-party integrators. Write the contract down:</p>
+  <table>
+    <tr><th>Type</th><th>Requirement</th></tr>
+    <tr><td><strong>Functional</strong></td><td>Limit requests per API key (e.g. 600 req/min); different limits per plan tier and per endpoint; reject with 429 + informative headers; limits reconfigurable without redeploy</td></tr>
+    <tr><td><strong>Functional</strong></td><td>Dimensions: per-user (API key) primary; per-IP for unauthenticated traffic; per-endpoint for expensive routes (search vs product-read)</td></tr>
+    <tr><td><strong>Non-functional</strong></td><td>Limiter overhead p99 &lt; 5 ms — it sits on <em>every</em> request; the guard must not become the bottleneck</td></tr>
+    <tr><td><strong>Non-functional</strong></td><td>Availability ≥ that of the API itself; limiter failure must never take the API down</td></tr>
+    <tr><td><strong>Non-functional</strong></td><td>Accuracy: small transient over-admission tolerable (~1–5%); silent under-admission (throttling paying customers below their plan) is not</td></tr>
+  </table>
+  <p><strong>Out of scope, said aloud:</strong> billing/quotas (monthly caps are a different, DB-backed system), DDoS scrubbing at L3/L4 (edge concern), and authentication itself — we consume an already-verified API key. That last accuracy line is a deliberately senior move: it declares <em>which direction of error is acceptable</em>, and every later trade-off will lean on it.</p>
+
+  <h2>3 · Step 2 — Estimate (4 min), every number spent</h2>
+  <pre><code>Platform: 10M registered API keys, ~2M active in the peak hour
+Traffic:  500M API calls/day ÷ ~100k s/day ≈ 5k QPS avg, ×4 peak ≈ 20k QPS
+  → one limiter check per request = 20k checks/s
+  → one Redis node ≈ 100k simple ops/s → fits today; 5× growth eats it → plan sharding by key
+
+Latency:  in-DC Redis RTT ≈ 0.5–1 ms; overhead budget p99 &lt; 5 ms
+  → at most ONE round trip per check → check+update must be a single atomic call (Lua)
+
+Memory, token bucket: key ~40 B + state 16 B ≈ 60 B with overhead
+  → 10M keys × 60 B ≈ 600 MB → the ENTIRE key space fits one Redis node
+
+Memory, sliding window log @ 600 req/min: worst 600 stamps × 8 B ≈ 5 KB/key
+  → 2M active keys × 5 KB ≈ 10 GB → ~16× more expensive → log rejected at this scale</code></pre>
+  <p>Each number is spent immediately: <strong>20k checks/s</strong> buys the sharding plan and rules out anything that scans state per check; <strong>one-RTT budget</strong> buys the Lua/atomic-call decision in section 6; <strong>600 MB vs 10 GB</strong> is the arithmetic that will pick the algorithm in section 5 — say that sentence out loud when you get there, and the estimate step retroactively proves it wasn't ritual.</p>
+
+  <h2>4 · Step 3 — High-level design (8 min)</h2>
+  <p><strong>Request path.</strong> Client → load balancer → API gateway → <em>rate-limit middleware</em> → backend services. The limiter consults a counter store (Redis) keyed by <code>{key_id}:{endpoint_class}:{window}</code>; allowed requests pass through, rejected ones return immediately — a rejection must cost microseconds, not a backend call.</p>
+  <p><strong>The 429 contract.</strong> Rejections carry machine-readable pacing information:</p>
+  <pre><code>HTTP/1.1 429 Too Many Requests
+Retry-After: 23
+X-RateLimit-Limit: 600
+X-RateLimit-Remaining: 0
+X-RateLimit-Reset: 1721741460</code></pre>
+  <p>Successful responses carry <code>X-RateLimit-Remaining</code> too, so well-behaved clients throttle themselves <em>before</em> hitting the wall. This one header is quiet thundering-herd prevention (section 9).</p>
+  <p><strong>Where the limiter sits — three options, signposted:</strong></p>
+  <ul>
+    <li><strong>Gateway middleware</strong> — one enforcement point, one config surface; the gateway is already on every request path. Default choice.</li>
+    <li><strong>Library in each service</strong> — no extra hop, but N languages × M services of duplicated logic and config drift. Rejected here.</li>
+    <li><strong>Sidecar</strong> — per-pod local decisions with a shared store behind; buys the local-bucket model of section 7 at the cost of fleet-wide deployment complexity.</li>
+  </ul>
+  <p>Choose gateway middleware <em>because</em> a platform product wants uniform enforcement and a single place to change rules — and note aloud that the sidecar becomes attractive exactly when the accuracy-vs-latency dial of section 7 turns.</p>
+
+  <h2>5 · Deep dive A — the five algorithms, quantified</h2>
+  <table>
+    <tr><th>Algorithm</th><th>State per key</th><th>Burst behavior</th><th>Boundary spike?</th><th>Accuracy</th></tr>
+    <tr><td><strong>Token bucket</strong></td><td class="num">~16 B (tokens, last-refill)</td><td>Allows bursts up to bucket size — a configured feature</td><td>No — but rolling-window admission can hit capacity + refill ≈ 2× rate</td><td>Exact for its own model</td></tr>
+    <tr><td><strong>Leaky bucket (meter)</strong></td><td class="num">~16 B (level, last-leak)</td><td>Smooths everything to constant outflow; bursts queue or drop</td><td>No</td><td>Exact; punishes legitimate burstiness</td></tr>
+    <tr><td><strong>Fixed window counter</strong></td><td class="num">~16 B (window id, count)</td><td>Full limit available instantly each window</td><td><strong>Yes — up to 2× limit straddling a boundary</strong></td><td>Approximate</td></tr>
+    <tr><td><strong>Sliding window log</strong></td><td class="num">8 B × limit (~5 KB @ 600/min)</td><td>Exact rolling limit, no spikes</td><td>No</td><td>Perfect — at ~300× the memory</td></tr>
+    <tr><td><strong>Sliding window counter</strong></td><td class="num">~24 B (two counters + id)</td><td>Near-smooth; small approximation error</td><td>No (smoothed away)</td><td>Approximate — assumes uniform spread in previous window</td></tr>
+  </table>
+  <p>The boundary spike deserves one concrete sentence in the interview: with a 600/min fixed window, a client can send 600 requests at 11:59:59 and 600 more at 12:00:01 — <strong>1,200 requests in ~2 seconds</strong>, double the intended rate, all "legal." The sliding window counter fixes this for 8 more bytes by weighting the previous window: <code>est = cur + prev × (1 − elapsed_fraction)</code>. Spend the section-3 arithmetic here: the log's 10 GB vs the counter's tens of MB is why real platforms (Cloudflare among them) ship the approximation and accept ~a-few-percent error.</p>
+
+  <h2>6 · Deep dive B — distributed counters in Redis</h2>
+  <p>With many gateway nodes, the counter must be shared — and the naive implementation has a race baked in:</p>
+  <pre><code>count = INCR key          # request 1 crashes here →
+IF count == 1: EXPIRE key window   # ...key now lives FOREVER
+IF count &gt; limit: reject</code></pre>
+  <p>Two distinct problems. First, <strong>INCR-then-EXPIRE is not atomic</strong>: a crash or timeout between the two commands leaves an immortal counter that throttles the key until someone notices. Second, check-then-act across two round trips lets concurrent requests all read <code>count &lt; limit</code> and all pass. The fix for both is making decision + update <strong>one atomic unit</strong>: a Lua script (Redis executes scripts atomically, nothing interleaves) that refills the bucket, checks, decrements, and sets TTL in one round trip — which also satisfies the one-RTT latency budget from section 3. Redis's own INCR documentation walks this exact rate-limiter pattern and its race.</p>
+  <p><strong>Hot keys.</strong> Sharding by API key spreads load — until one enormous integrator does 5k RPS alone and all of it lands on one shard. Mitigations, in escalating order: dedicated shard for whale keys; split one logical limit into K sub-keys with limit/K each (cheap, slightly lumpy); or per-node local buckets — which is section 7's entire topic.</p>
+
+  <h2>7 · Deep dive C — the accuracy dial: sync vs eventual</h2>
+  <p>Every distributed limiter sits somewhere on one dial:</p>
+  <ul>
+    <li><strong>Synchronous global counting</strong> — every check is a Redis round trip. Accuracy: near-exact. Cost: +1 ms on every request, and Redis is on the critical path of the whole platform.</li>
+    <li><strong>Local buckets + async sync</strong> — each gateway node admits from a local bucket and reconciles with the shared store every T ms. Checks become in-memory (microseconds). Cost: during the blind window between syncs, N nodes can each admit against a stale global count — <strong>transient over-admission bounded roughly by N × arrival-rate × T</strong>.</li>
+  </ul>
+  <p>Here is where the Step-1 accuracy requirement gets spent, by name: <em>we declared 1–5% transient over-admission acceptable and under-admission unacceptable — so local buckets with a short sync interval are not a hack, they are the requirement's direct consequence.</em> Choose T from the bound: at 4 nodes and a key bursting at 400 req/s, T = 100 ms risks ~40 extra admits on a 100-limit — ~40% worst case for that key during a burst, a number your lab measures directly. Tighten T for sensitive endpoints, loosen it for cheap ones.</p>
+  <p>Stripe's published limiter design lands the same way — Redis-backed token buckets, deliberately tolerant of small inaccuracy in exchange for staying off the critical path's worst percentiles.</p>
+
+  <h2>8 · Deep dive D — rules, config, and dimensions</h2>
+  <p>Limits are <em>policy</em>, and policy changes weekly; the enforcement path cannot require a redeploy. Standard shape: rules live in a small config store (database or config service) — <code>{plan_tier, endpoint_class} → {limit, window, burst}</code> — and gateway nodes cache them in memory with a periodic refresh (tens of seconds is fine; rule changes are not latency-critical). A rules cache miss must default to <em>some</em> rule, never to an error.</p>
+  <p><strong>Dimensions compose.</strong> A single request may be checked against several counters:</p>
+  <ul>
+    <li><strong>Per API key</strong> — the primary, plan-based limit.</li>
+    <li><strong>Per IP</strong> — for unauthenticated endpoints (login, signup) where there is no key yet; this is also the abuse-control dimension.</li>
+    <li><strong>Per endpoint class</strong> — search costs 20× a product read, so it gets its own tighter counter under the same key.</li>
+  </ul>
+  <p>Evaluate cheapest-reject-first, and count the cost honestly: three dimensions = three counter updates per request. With Lua, batch them into one script call — one round trip regardless of dimensions — or the 5 ms budget dies by a thousand cuts. Mention the layering aloud: gateway limiter for platform fairness, plus a coarse per-IP layer at the edge in front of it; two cheap layers beat one clever one.</p>
+
+  <h2>9 · Failure modes and monitoring</h2>
+  <table>
+    <tr><th>Failure</th><th>What happens</th><th>Design answer</th></tr>
+    <tr><td><strong>Redis down</strong></td><td>Every check errors — the limiter can take down the API it guards</td><td><strong>Fail open</strong> for a commerce API (dropping all customer traffic to protect a guard rail is backwards), with a local fallback limiter at a conservative rate + loud alert. Fail closed only where the limiter IS the security boundary (auth attempts). State the choice unprompted.</td></tr>
+    <tr><td><strong>Thundering herd of retries</strong></td><td>A window resets, or an outage ends — and every throttled client retries in the same second, re-creating the spike forever</td><td><code>Retry-After</code> with <em>jittered</em> values so retries spread; clients told to use exponential backoff + jitter (your lab-0008 result, now on the server side); token bucket refill smooths re-entry vs fixed window's cliff</td></tr>
+    <tr><td><strong>Clock skew</strong></td><td>Gateway nodes with drifting clocks disagree about window boundaries → limits enforced unevenly</td><td>Use the <em>store's</em> clock (Redis <code>TIME</code> inside the Lua script) as the single time authority; never trust N gateway clocks to agree</td></tr>
+  </table>
+  <p><strong>Monitoring:</strong> the page-a-human metrics are limiter-check p99 latency and store error rate; the dashboards are 429 rate per key/tier (a spike = one customer's broken retry loop) and over-admission drift (sampled comparison of admitted rate vs configured limit). Alert on 429 rate going to <em>zero</em>, too — a silently failed-open limiter looks exactly like a healthy quiet one.</p>
+
+  <h2>10 · Interviewer twists and variants</h2>
+  <ul>
+    <li><strong>"Make it a security control."</strong> The dial flips: per-IP and per-account limits on login/OTP endpoints exist to slow credential stuffing, so there you <em>fail closed</em>, keep limits low and windows long, and log rejections for the abuse team. Same machinery, opposite failure policy — saying that sentence wins the twist.</li>
+    <li><strong>"Global limiting across datacenters."</strong> A synchronous planet-wide counter would put an 80+ ms cross-region RTT on every request — unacceptable. Real answer: per-region quotas (split the global limit by observed traffic share) + async reconciliation shifting the split, accepting transient global over-admission. This is section 7's dial at planetary scale.</li>
+    <li><strong>"How much does accuracy cost?"</strong> The recap ladder: fixed window (16 B, 2× spikes) → sliding counter (24 B, ~few % error) → sliding log (5 KB, exact) → synchronous global (exact, +1 ms on everything). Accuracy is bought with memory, then with latency. Name the ladder, place the business on a rung, justify with a requirement.</li>
+  </ul>
+  <p><strong>AI flavor (one paragraph).</strong> LLM APIs meter <em>tokens per minute</em>, not just requests — one request may consume 50 or 50,000 tokens. Mechanically it is the same token bucket, refilled in token units, with one wrinkle: output cost is unknown at admission, so providers debit an estimate at request start and reconcile against actual usage at completion — the accuracy dial again, applied to cost.</p>
+
+  <h2>11 · Interview talking points</h2>
+  <ul>
+    <li><em>Opening scope:</em> "Rate limiting protects capacity and fairness in seconds-scale windows; monthly quotas and billing are a different system — scoping to the limiter."</li>
+    <li><em>Spending the memory number:</em> "A sliding log at this scale is ~10 GB versus ~600 MB for buckets — that arithmetic, not preference, is why I pick token bucket with a sliding-window-counter fallback."</li>
+    <li><em>The atomicity line:</em> "Naive INCR-then-EXPIRE has two failure modes — an immortal key on crash, and check-then-act races — so the check must be one atomic Lua call. That also keeps us at one round trip."</li>
+    <li><em>The dial:</em> "Exact global counting and low latency are in direct tension; our requirements tolerate transient over-admission, so I take local buckets synced every ~50–100 ms and I can bound the error: N × rate × interval."</li>
+    <li><em>Unprompted failure policy:</em> "Before you ask: Redis down means fail open with a conservative local fallback — for a commerce API the limiter must never be the outage. On auth endpoints I'd flip that."</li>
+    <li><em>Closing:</em> "I'd page on check latency and store errors, dashboard 429s per tier, and alert on 429s flatlining at zero — a dead limiter looks quiet. With more time: multi-region quota splitting and per-key adaptive limits."</li>
+  </ul>
+
+  <h2>12 · Lab + project step</h2>
+  <div class="callout"><span class="label">Hands-on (run this before the quiz)</span>
+    In <code>labs/lab-0018-rate-limiter/</code>, <code>python3 rate_limiter_lab.py</code> replays one
+    identical bursty trace through token bucket, fixed window, sliding window log, and sliding
+    window counter — and prints each algorithm's accepted/rejected counts, its worst
+    rolling-window admission (the boundary-spike leak, measured), and a memory proxy.
+    Then <code>python3 rate_limiter_lab.py --distributed</code> simulates N limiter nodes syncing a
+    shared counter every T ms and measures over-admission vs sync interval — section 7's bound,
+    observed. Predict before each run; the README's E1–E4 walk you through it.
+  </div>
+  <p><strong>Project step.</strong> If you skipped the rep protocol box at the top, do it now: edit <code>PROBLEM</code> in lesson 0009's <code>design_rep.py</code> to <em>"design a rate limiter for a public API platform"</em> and run the full 40-minute timed rep, out loud, before rereading this lesson. Then write your deltas into <code>rep-notes.txt</code>: which algorithm trade-offs you failed to quantify, whether your Step-2 numbers got spent, whether fail-open/fail-closed came from you unprompted. The delta list — not this lesson — is what your teacher reviews next session.</p>
+
+  <h2>Check yourself</h2>
+  <div class="quiz" id="quiz"></div>
+
+  <h2>Primary source</h2>
+  <p>Read <strong>Stripe's <a href="https://stripe.com/blog/rate-limiters">"Scaling your API with rate limiters"</a></strong> — a production token-bucket-on-Redis design with load shedders, and the canonical statement of "a limiter that fails should not take the API with it." Companions: Cloudflare's <a href="https://blog.cloudflare.com/counting-things-a-lot-of-different-things/">"Counting things, a lot of different things"</a> (the sliding-window-counter approximation at global scale, with measured error), the Redis <a href="https://redis.io/docs/latest/commands/incr/">INCR documentation</a> (the rate-limiter pattern and its race, from the source), and the System Design Primer's <a href="https://github.com/donnemartin/system-design-primer#design-an-api-rate-limiter">rate-limiter exercise</a> for the classic framing.</p>
+
+  <footer class="lesson-footer">
+    <p><strong>Stuck or curious?</strong> Ask your teacher (the agent) anything — "how would I rate-limit WebSocket connections, where there's one long request instead of many small ones?" is an excellent follow-up question.</p>
+    <nav class="lesson-nav">
+      <span>◀ <a href="0009-interview-os.html">0009 · Interview OS</a></span>
+      <span><a href="0019-tinyurl-pastebin.html">0019 · TinyURL &amp; Pastebin</a> ▶</span>
+    </nav>
+  </footer>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+renderQuiz(document.getElementById('quiz'), {
+  title: 'Check yourself',
+  questions: [
+    {
+      q: 'Which algorithm can admit roughly double its limit across a window boundary?',
+      options: [
+        'Sliding window log, because timestamp pruning permits doubled admission',
+        'Token bucket refill, because steady refill enables unlimited bursting',
+        'Fixed window counter, because boundary resets allow consecutive bursts',
+      ],
+      answer: 2,
+      explain: 'A fixed window resets its counter at each boundary, so a full limit at 11:59:59 plus a full limit at 12:00:01 is 2× the intended rate in ~2 seconds. The log is exact; the bucket bounds bursts by capacity, not unlimited.',
+    },
+    {
+      q: 'Why is INCR followed by a separate EXPIRE call a race condition?',
+      options: [
+        'Crash between commands leaves a counter without any expiry',
+        'INCR alone cannot count atomically across multiple client connections',
+        'EXPIRE resets the counter value back to zero incorrectly',
+      ],
+      answer: 0,
+      explain: 'INCR itself is atomic — the race is between the two commands: a crash or timeout after INCR but before EXPIRE creates an immortal counter that throttles the key forever. A Lua script makes check + update + TTL one atomic unit.',
+    },
+    {
+      q: 'The Redis backing your limiter dies. For a public e-commerce API, which default is right?',
+      options: [
+        'Fail closed, since accepting unmetered traffic risks total collapse',
+        'Fail open, since blocking all customer traffic hurts more',
+        'Retry forever, since clients waiting preserves every single request',
+      ],
+      answer: 1,
+      explain: 'The limiter is a guard rail; letting the guard rail take down all commerce traffic is backwards. Fail open with a conservative local fallback and a loud alert — and flip to fail closed only on security-boundary endpoints like login.',
+    },
+    {
+      q: 'What does the sliding window counter trade away for its tiny memory footprint?',
+      options: [
+        'Exact request counts, by assuming uniform spread across windows',
+        'Burst absorption, by refusing any traffic above steady rates',
+        'Low latency, by scanning every stored timestamp each request',
+      ],
+      answer: 0,
+      explain: 'It weights the previous window\'s counter by the remaining fraction — an estimate that assumes requests were spread evenly. That assumption costs a few percent accuracy and saves ~300× the memory of the exact log.',
+    },
+    {
+      q: 'Per-node local buckets with async sync to a shared store buy what, at what cost?',
+      options: [
+        'Stronger global accuracy, at the cost of slower checks',
+        'Simpler configuration management, at the cost of extra hardware',
+        'Lower latency checks, at the cost of temporary over-admission',
+      ],
+      answer: 2,
+      explain: 'Checks become in-memory (microseconds, no Redis RTT), but between syncs N nodes admit against stale counts — transient over-admission bounded roughly by N × arrival rate × sync interval. The lab\'s --distributed mode measures exactly this.',
+    },
+    {
+      q: 'Why should a 429 response carry Retry-After and X-RateLimit headers?',
+      options: [
+        'They force malicious clients to obey the stated limits',
+        'They let well-behaved clients pace retries and avoid herds',
+        'They allow proxy caches to store the rejected responses',
+      ],
+      answer: 1,
+      explain: 'Headers are advisory — attackers ignore them. Their value is letting good clients self-throttle before the wall and spread retries (especially with jittered Retry-After values), preventing the synchronized retry spike after a window reset.',
+    },
+  ],
+});
+</script>
+</body>
+</html>

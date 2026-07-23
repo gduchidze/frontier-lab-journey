@@ -1,0 +1,245 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lesson 19 · TinyURL &amp; Pastebin: IDs, Redirects, Read-Heavy Caching</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<div class="lesson">
+  <header class="lesson-header">
+    <p class="kicker">Lesson 0019 · Phase 3 — Classic Design Reps · <a href="0019-tinyurl-pastebin.ka.html">ქართული ვერსია</a></p>
+    <h1>TinyURL &amp; Pastebin: IDs, Redirects, Read-Heavy Caching</h1>
+    <p class="dek">The classic warm-up rep. Small surface, deep interior: unique ID generation at scale and a brutally read-heavy serving path — patterns you will reuse in every design that follows.</p>
+  </header>
+
+  <div class="mission-tie">
+    <strong>Mission tie.</strong> This is the canonical warm-up prompt, and its two hard problems never leave you: <em>distributed unique ID generation</em> (post IDs in the news feed, message IDs in chat, event IDs in payment ledgers) and <em>read-heavy caching</em> (every feed, catalog, and profile page you will ever design). Nail the reasoning here and lessons 0020–0028 inherit it for free.
+  </div>
+
+  <div class="callout"><span class="label">REP PROTOCOL — do this first</span>
+    Before reading a single section below: <strong>40-minute solo timed design, out loud</strong>, using the 4-step framework from <a href="0009-interview-os.html">lesson 0009</a> (clarify → estimate → high-level → deep dive). Prompt: <em>"Design a URL shortener like TinyURL; extend it to a Pastebin."</em> Only then read this reference solution and log your deltas as a learning record.
+  </div>
+
+  <h2>1 · The prompt, and what is really being tested</h2>
+  <p>"Design TinyURL" sounds like a toy: two endpoints, one table. That is the trap. The interviewer is testing whether you can find the hard problems inside a simple surface:</p>
+  <ul>
+    <li><strong>Uniqueness at scale.</strong> Billions of short codes, no duplicates, no coordination bottleneck — the distributed ID generation problem in its purest form.</li>
+    <li><strong>An extreme read/write ratio.</strong> A link is written once and read thousands of times. Your whole architecture should visibly bend around that asymmetry.</li>
+    <li><strong>One consequential HTTP detail.</strong> 301 vs 302 — a single status code that trades server load against analytics.</li>
+  </ul>
+  <p>Pastebin is the same skeleton plus one twist: the payload is no longer a 100-byte URL but a multi-kilobyte (sometimes multi-megabyte) blob — which forces the metadata-vs-blob storage split. A candidate who says "same design, bigger values" misses the point; a candidate who says "same control plane, different data plane" gets it.</p>
+
+  <h2>2 · Clarify (5–8 min): buy the right problem</h2>
+  <table>
+    <tr><th>Requirement</th><th>TinyURL</th><th>Pastebin adds</th></tr>
+    <tr><td><strong>Functional</strong></td><td>Shorten a URL; redirect on code; optional custom alias; optional expiry (TTL)</td><td>Store text content; view raw or with syntax highlighting; size limit per paste</td></tr>
+    <tr><td><strong>Non-functional</strong></td><td>Redirect p99 &lt; 50 ms; 99.9% availability; codes not guessable in bulk</td><td>Content durable for its lifetime; large pastes must not slow small ones</td></tr>
+    <tr><td><strong>Scale (agreed)</strong></td><td>100M new links/month, reads 10:1 to 100:1 — take 100:1 worst case</td><td>10M pastes/month, ~10 KB average, capped at 10 MB</td></tr>
+  </table>
+  <p><strong>Out of scope</strong> (say it, write it): user accounts and auth, abuse/malware scanning of destination URLs, full analytics dashboards — "I'll treat those as existing services I can call." One clarifying question that scores immediately: <em>"Do we need per-click analytics? That decides my redirect status code later."</em> You are planting a flag you will collect in section 4.</p>
+
+  <h2>3 · Estimate (~5 min): numbers you will spend</h2>
+  <pre><code>Writes:  100M links/month ÷ 2.6M s/month ≈ 40 links/s avg  → ×3 peak ≈ 120/s
+Reads:   100:1 ratio → 4,000 redirects/s avg → ×3 peak ≈ 12k QPS
+Storage: 100M/mo × 60 months = 6B links × 500 B/row ≈ 3 TB metadata
+Codes:   need 6B unique → base62, 62^7 ≈ 3.5 × 10^12 → 7 chars, ~600× headroom
+Cache:   reads/day ≈ 4k × 86,400 ≈ 350M; 80/20 rule → cache ~20% of
+         daily objects: 0.2 × 350M × 500 B ≈ 35 GB → one Redis box, 3 for HA
+Pastebin blobs: 10M/mo × 10 KB ≈ 100 GB/month ≈ 6 TB over 5 years</code></pre>
+  <p>Now <em>spend</em> every number:</p>
+  <ul>
+    <li><strong>120 writes/s</strong> → any single Postgres survives this. Say so: "the write path is trivial — this interview is about reads and ID uniqueness."</li>
+    <li><strong>12k redirect QPS</strong> → too hot for comfort on one DB doing random-row lookups at tight p99 → cache + read replicas.</li>
+    <li><strong>3 TB / 6B rows</strong> → fits one machine's disk, but index pressure and availability argue for sharding by code — and the code itself is a perfect shard key (uniform, immutable).</li>
+    <li><strong>35 GB cache</strong> → the entire hot set fits in memory. This is why the read path can be almost DB-free.</li>
+    <li><strong>6 TB of blobs</strong> → object storage, not the relational DB. The split is now justified by a number, not by fashion.</li>
+  </ul>
+
+  <h2>4 · High-level design: API, the 301/302 decision, data model</h2>
+  <pre><code>POST /urls          {long_url, custom_alias?, ttl?}   → {code}      201
+GET  /{code}                                          → 301/302 Location: long_url
+POST /pastes        {content, syntax?, ttl?}          → {paste_id}  201
+GET  /pastes/{id}                                     → metadata + content</code></pre>
+  <p>The canonical talking point — deliver it unprompted:</p>
+  <table>
+    <tr><th>Status</th><th>Behavior</th><th>Wins</th><th>Loses</th></tr>
+    <tr><td><strong>301 Moved Permanently</strong></td><td>Browsers and CDNs cache the mapping; repeat clicks never reach you</td><td>Massive load reduction; lower latency for the user</td><td>You go blind: no per-click analytics; hard to change/expire the target</td></tr>
+    <tr><td><strong>302 Found</strong></td><td>Every click comes back to your servers</td><td>Full analytics; expiry and target changes take effect immediately</td><td>You pay for every click at 12k QPS</td></tr>
+  </table>
+  <p>Pick based on the section-2 question: analytics required → 302 (and section 10 shows how to count cheaply); pure redirect utility → 301 and let the internet cache for you.</p>
+  <p><strong>Data model.</strong> <code>urls(code PK, long_url, user_id, created_at, expires_at)</code> — one row, ~500 B, code is both primary key and shard key. Pastebin: <code>pastes(paste_id PK, blob_url, syntax, size, created_at, expires_at)</code> — metadata in the DB, content at <code>blob_url</code> in object storage (section 8).</p>
+
+  <h2>5 · Deep dive: encoding — base62 and where codes come from</h2>
+  <p>Base62 (<code>0–9a–zA–Z</code>) is the alphabet because it is URL-safe without percent-encoding (base64's <code>+</code> and <code>/</code> are not).</p>
+  <pre><code>62^6 ≈ 5.7 × 10^10   (57B — covers 6B links with only ~10× headroom)
+62^7 ≈ 3.5 × 10^12   (3.5T — ~600× headroom → pick 7)</code></pre>
+  <p>Two families of code generation, with opposite failure modes:</p>
+  <ul>
+    <li><strong>Hash-then-truncate.</strong> MD5/SHA the long URL, keep the first 7 base62 chars. No coordination, but truncation invites <em>birthday collisions</em>: expect the first one around √(62^7) ≈ 1.9M keys — far, far before the 3.5T space "fills up." So every insert needs a uniqueness check and a retry-with-salt path. (The lab measures this curve empirically.)</li>
+    <li><strong>Counter-based.</strong> A global counter, base62-encoded: unique by construction, no collision checks. But sequential codes are <em>enumerable</em> — a competitor can walk your keyspace, scrape every "private" link, and read your growth rate off the counter. Mitigate by encrypting/permuting the counter (a bijection keeps uniqueness) or by handing counter <em>ranges</em> to app servers.</li>
+  </ul>
+  <p>Say the security sentence out loud: <em>"sequential codes leak business metrics and make private links guessable — that alone can disqualify the naive counter."</em></p>
+
+  <h2>6 · Deep dive: distributed ID generation</h2>
+  <p>The counter is now your single point of coordination. Three industrial escapes:</p>
+  <p><strong>Snowflake (Twitter).</strong> A 64-bit ID assembled locally on each node:</p>
+  <pre><code>1 bit  sign (always 0)
+41 bits timestamp, ms since custom epoch  → ~69 years
+10 bits machine ID                        → 1,024 workers
+12 bits per-ms sequence                   → 4,096 IDs/ms/worker</code></pre>
+  <p>No coordination on the hot path, and IDs are <em>time-sortable</em> — which is why feeds and chats love them. The Achilles heel is the <strong>clock</strong>: if NTP steps a node's clock backwards, the same (timestamp, sequence) pair can be minted twice. Correct behavior is to <em>refuse to issue IDs until the clock catches up</em> — availability traded for uniqueness. (The lab simulates exactly this skew.)</p>
+  <p><strong>Key Generation Service (KGS).</strong> Pre-generate random 7-char keys offline into a pool; app servers lease batches. Uniqueness is guaranteed by construction, codes stay short and unordered. Cost: the pool is a service you must replicate (section 9).</p>
+  <p><strong>Instagram's variant:</strong> shard-local Postgres sequences packed into the ID with the timestamp — Snowflake's layout without extra infrastructure (see primary sources).</p>
+  <table>
+    <tr><th>Scheme</th><th>Length</th><th>Time-sortable</th><th>Coordination</th><th>Collisions</th><th>Guessable</th></tr>
+    <tr><td>UUIDv4</td><td>128 bit / 22+ chars</td><td>No</td><td>None</td><td>Negligible</td><td>No</td></tr>
+    <tr><td>DB auto-increment</td><td>Short, grows</td><td>Yes</td><td>Central DB (SPOF)</td><td>None</td><td>Yes — enumerable</td></tr>
+    <tr><td>Snowflake</td><td>64 bit ≈ 11 base62 chars</td><td>Yes (ms)</td><td>Machine IDs + sane clocks</td><td>None if clocks behave</td><td>Partially</td></tr>
+    <tr><td>KGS</td><td>Exactly 6–7 chars</td><td>No</td><td>Key-pool service</td><td>None (pre-deduped)</td><td>No</td></tr>
+  </table>
+  <p>Senior observation: Snowflake at 11 base62 chars is <em>too long</em> for a short link — that is why TinyURL favors KGS or a permuted counter, while Snowflake wins wherever length doesn't matter but sort order does.</p>
+
+  <h2>7 · Deep dive: the read path at 12k QPS</h2>
+  <p>Redirects are the product. Three layers, cheapest first:</p>
+  <ul>
+    <li><strong>Cache-aside on hot links.</strong> <code>GET /{code}</code> → Redis lookup → on miss, read DB, populate with TTL, LRU eviction. Section 3 said the 35 GB hot set fits in memory: expect 80–95% hit rate, so the DB sees ~1–2k QPS instead of 12k.</li>
+    <li><strong>Negative caching.</strong> Random-code scanners and dead links generate misses that <em>all</em> fall through to the DB — a cache is useless against keys that don't exist. Cache the 404 itself with a short TTL (say 60 s); a Bloom filter over live codes is the heavier-duty version. Without this, an attacker's miss traffic becomes your DB's load test.</li>
+    <li><strong>CDN-edge redirects.</strong> If you chose 301, the redirect response is immutable and tiny — let the CDN serve it from the edge, keyed by code. Reads then scale like static content. Note the coupling: this is only available <em>because</em> you gave up per-click analytics; the 301/302 choice propagates all the way to the edge.</li>
+  </ul>
+  <p>Consistency footnote worth saying: a newly shortened link that takes one second to appear on every replica is fine — read-your-writes for the <em>creator</em> (route their first GET to the primary or seed the cache on write) is the only consistency anyone actually notices.</p>
+
+  <h2>8 · Deep dive: expiry, cleanup, and the Pastebin storage split</h2>
+  <p><strong>Expiry has two halves.</strong> <em>Lazy deletion</em>: on read, if <code>expires_at &lt; now</code>, return 404/410 and delete — correctness is enforced at the only moment it matters. <em>Background sweep</em>: a low-priority job scans for expired rows in batches (and deletes orphaned blobs) — reclaims space for links nobody reads again. You need both: lazy alone leaks storage forever; sweep alone serves dead links between passes.</p>
+  <p><strong>Pastebin's storage split.</strong> Metadata (id, syntax, size, expiry) is small, uniform, and queried on every view → relational DB. Content is a variable-size immutable blob written once → object storage (the S3 model from lesson 0012). Why not one store?</p>
+  <ul>
+    <li>10 MB rows wreck DB page cache locality and bloat replication streams for data that never changes.</li>
+    <li>Object storage gives eleven-nines-style durability and per-GB pricing that a relational store can't match at 6 TB and growing.</li>
+    <li>The view path becomes: DB for metadata (cacheable) → fetch blob by URL, possibly straight from CDN. Large pastes stop competing with small ones — a non-functional requirement from section 2, satisfied by an architecture choice.</li>
+  </ul>
+  <p><strong>Syntax highlighting</strong> is a render concern: highlight client-side, or cache the rendered HTML as just another derived blob. Never store <em>only</em> the rendered form — raw text is the source of truth.</p>
+
+  <h2>9 · Failure modes and monitoring</h2>
+  <table>
+    <tr><th>Failure</th><th>Blast radius</th><th>Mitigation</th></tr>
+    <tr><td>Hash collision on insert</td><td>Two URLs, one code — wrong redirects</td><td>Unique constraint on <code>code</code>; on violation, re-hash with a salt and retry; alert if retry rate climbs</td></tr>
+    <tr><td>Cache stampede on a viral link</td><td>One hot key expires → thousands of concurrent misses hammer one DB row</td><td>Request coalescing (one flight per key), stale-while-revalidate, jittered TTLs — lesson 0007's toolkit</td></tr>
+    <tr><td>Counter / KGS node dies</td><td>All new shortens fail; reads unaffected</td><td>Lease counter <em>ranges</em> (or key batches) to app servers so they survive minutes of outage; replicate the pool with failover</td></tr>
+    <tr><td>Clock skew on a Snowflake node</td><td>Duplicate IDs — silent data corruption</td><td>Refuse to mint until clock catches up; page if refusal window exceeds seconds</td></tr>
+  </table>
+  <p><strong>Dashboards that page a human:</strong> redirect p99 (the SLO), cache hit rate (a dip predicts DB overload before latency shows it), 404 rate (a spike = scanner or a bad partner integration), and keyspace/pool consumption rate (running out of pre-generated keys is a silent, fully predictable outage — the most embarrassing kind).</p>
+
+  <h2>10 · Variants and twists interviewers reach for</h2>
+  <p><strong>"Add click counts — now it's write-heavy."</strong> The wrong answer is <code>UPDATE clicks SET n = n + 1</code> per redirect: 12k row-lock contentions/s on one viral row. The right shape: emit a click <em>event</em> to a log/queue (Kafka, lesson 0013), aggregate in batches every few seconds, and serve counts from the aggregate. If approximate is acceptable, say so — sampled counting or sketches (e.g., count-min) cut the write volume by orders of magnitude. This flips the whole system from read-heavy to write-heavy, which is exactly why interviewers ask it.</p>
+  <p><strong>"Stop abuse of the shortener."</strong> Free URL shorteners are spam infrastructure by default. Rate limit <code>POST /urls</code> per user/IP (lesson 0018 drops in wholesale), cap redirects/s per code if a link is used for attack amplification, and keep a denylist of destination domains checked at shorten time — checking at redirect time too costs one cache lookup and catches later-poisoned targets.</p>
+  <p><strong>AI flavor (one paragraph, as promised).</strong> A modern twist: classify destination URLs for phishing/malware with an ML model. The design lesson is placement — inference is 10–100 ms, so it sits <em>async after</em> shorten (accept, then quarantine on a bad verdict), never inline in the redirect path. Same async-vs-inline reasoning as the payment-fraud check you will meet in lesson 0027.</p>
+
+  <h2>11 · Interview talking points</h2>
+  <ul>
+    <li><em>Framing:</em> "The write path is trivial at 120/s — the design lives in ID uniqueness and the read path. Let me spend the time there."</li>
+    <li><em>Spending a number:</em> "100:1 reads at 12k peak QPS is why a 35 GB cache, not a bigger database, is the first thing I add."</li>
+    <li><em>The 301/302 line:</em> "301 lets browsers and CDNs absorb repeat clicks; 302 keeps every click observable. This is an analytics-requirements question, not a technical one — which do we need?"</li>
+    <li><em>Encoding:</em> "62^7 is 3.5 trillion codes, but with hash-truncate the birthday bound means collisions around two million keys — so the space is huge and collisions are still a day-one problem."</li>
+    <li><em>ID generation:</em> "Snowflake gives coordination-free, time-sorted IDs but trusts the clock and yields 11 chars; KGS gives short random codes but is a service to operate. For a shortener I'd take KGS; for feed IDs, Snowflake."</li>
+    <li><em>Unprompted failure mode:</em> "The scary one is cache stampede on a viral link — here's request coalescing before you ask."</li>
+    <li><em>Closing:</em> "I'd page on redirect p99, cache hit rate, and key-pool consumption. With more time: analytics pipeline and multi-region."</li>
+  </ul>
+
+  <h2>12 · Lab &amp; project step</h2>
+  <div class="callout"><span class="label">Hands-on (do this before the quiz)</span>
+    In <code>labs/lab-0019-id-generation/</code>, <code>python3 id_gen_lab.py</code> runs four seeded experiments:
+    base62 encode/decode and keyspace math, <em>measured</em> birthday collisions for hash-truncate at
+    lengths 5/6/7, a threaded Snowflake generator with a simulated backwards clock jump
+    (guard vs naive policy — watch the naive one mint a duplicate), and a KGS key pool feeding
+    two app servers. It closes with a throughput/collisions/sortability/coordination comparison
+    table. Predict before each run — the README's E1 asks for your length-6 collision
+    prediction <em>before</em> you execute anything.
+  </div>
+  <p><strong>Project step.</strong> This lesson only counts if the rep happened: one full 40-minute timed design, out loud, <em>before</em> you read sections 1–10 (REP PROTOCOL above). Now diff your design against this reference — every miss (did you name negative caching? the clock-skew failure? the storage split?) becomes a delta in your learning record. Then do lab E1–E4 and bring both the deltas and the prediction-vs-observed notes to the next session. Two artifacts, one rep — that is the Phase-3 rhythm from here to lesson 0028.</p>
+
+  <h2>Check yourself</h2>
+  <div class="quiz" id="quiz"></div>
+
+  <h2>Primary source</h2>
+  <p>Read the <strong>System Design Primer's <a href="https://github.com/donnemartin/system-design-primer/blob/master/solutions/system_design/pastebin/README.md">Pastebin worked solution</a></strong> — the canonical step-by-step treatment of this exact prompt. Companions: <a href="https://instagram-engineering.com/sharding-ids-at-instagram-1cf5a71e5a5c">Instagram's "Sharding &amp; IDs at Instagram"</a> (the pragmatic Snowflake-without-Snowflake production story) and Twitter's original <a href="https://blog.twitter.com/engineering/en_us/a/2010/announcing-snowflake">Snowflake announcement</a> (why they abandoned sequential IDs and what "roughly time-sortable" bought them).</p>
+
+  <footer class="lesson-footer">
+    <p><strong>Stuck or curious?</strong> Ask your teacher (the agent) anything — "if I permute a counter to hide sequence, how do I prove the permutation never collides?" is an excellent follow-up question.</p>
+    <nav class="lesson-nav">
+      <span>◀ <a href="0018-rate-limiter.html">0018 · Rate Limiter</a></span>
+      <span><a href="0020-news-feed.html">0020 · News Feed</a> ▶</span>
+    </nav>
+  </footer>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+renderQuiz(document.getElementById('quiz'), {
+  title: 'Check yourself',
+  questions: [
+    {
+      q: 'Your product team wants per-click analytics on every short link. Which redirect should the service return?',
+      options: [
+        '302, so every click still reaches our servers',
+        '301, so browsers cache and skip our servers',
+        '304, so proxies revalidate content before serving redirects',
+      ],
+      answer: 0,
+      explain: 'A 301 is cached by browsers and CDNs, so repeat clicks never reach you — great for load, fatal for analytics. 302 keeps every click observable; 304 is a conditional-GET response, unrelated to redirects.',
+    },
+    {
+      q: 'Why is a 7-character base62 code sufficient for 6 billion links over five years?',
+      options: [
+        '62^7 is roughly 3.5 million possible distinct codes',
+        '62^7 is roughly 3.5 billion possible distinct codes',
+        '62^7 is roughly 3.5 trillion possible distinct codes',
+      ],
+      answer: 2,
+      explain: '62^7 ≈ 3.5 × 10^12 — about 600× headroom over 6B links. Remember the separate birthday caveat: with hash-truncate, collisions start near √space ≈ 1.9M keys, long before the space fills.',
+    },
+    {
+      q: 'A Snowflake node\'s clock jumps backwards by 30 seconds after an NTP correction. What is the safe behavior?',
+      options: [
+        'Keep issuing IDs using the last remembered good timestamp',
+        'Refuse to issue IDs until the clock catches up',
+        'Restart the node immediately so it gets fresh state',
+      ],
+      answer: 1,
+      explain: 'Minting with a reused timestamp risks duplicate (timestamp, sequence) pairs — silent corruption. The documented safe policy is to stop issuing until real time passes the last-used timestamp; restarting does not fix the machine-wide clock.',
+    },
+    {
+      q: 'What is the main advantage of a Key Generation Service over hash-then-truncate?',
+      options: [
+        'Keys stay shorter because hashing wastes output characters',
+        'Keys stay meaningful because they encode creation timestamps',
+        'Keys are guaranteed unique without any collision checking',
+      ],
+      answer: 2,
+      explain: 'KGS pre-generates and de-duplicates keys offline, so the insert path needs no uniqueness check or retry loop. Hash-truncate must handle birthday collisions on every insert; KGS keys carry no timestamp and are not inherently shorter.',
+    },
+    {
+      q: 'Attackers spray random codes at GET /{code} and every request misses. Which technique protects the database?',
+      options: [
+        'Negative caching: store the 404 result briefly too',
+        'Positive caching: store successful lookups with longer TTLs',
+        'Write-through caching: store new links synchronously on creation',
+      ],
+      answer: 0,
+      explain: 'A cache of existing links is useless against keys that do not exist — every miss falls through to the DB. Caching the 404 itself (or a Bloom filter over live codes) absorbs scanner traffic at the cache layer.',
+    },
+    {
+      q: 'The 80/20 rule sizes the redirect cache from which quantity?',
+      options: [
+        'Twenty percent of all links stored since launch',
+        'Twenty percent of each day\'s requested hot links',
+        'Eighty percent of the database\'s total disk footprint',
+      ],
+      answer: 1,
+      explain: 'Cache sizing follows traffic, not corpus: ~20% of the objects requested in a day serve ~80% of reads, so cache ≈ 0.2 × daily requested objects × object size ≈ 35 GB here — the 3 TB corpus is irrelevant to the cache.',
+    },
+  ],
+});
+</script>
+</body>
+</html>

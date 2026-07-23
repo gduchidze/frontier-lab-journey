@@ -1,0 +1,187 @@
+<!DOCTYPE html>
+<html lang="ka">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>გაკვეთილი 12 · Storage Engine-ების შიდა სამყარო</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<div class="lesson">
+  <header class="lesson-header">
+    <p class="kicker">გაკვეთილი 0012 · ფაზა 2 — პროგრამული არქიტექტურა და საიმედოობა · <a href="0012-storage-engine-internals.html">English version</a></p>
+    <h1>Storage Engine-ების შიდა სამყარო</h1>
+    <p class="dek">B-tree vs LSM — ეს არის read vs write amplification (გამრავლების) გადაწყვეტილება: database-ის შიდა მოწყობის ის ერთი თემა, რომელსაც ინტერვიუები ნამდვილად აჯილდოებენ.</p>
+  </header>
+
+  <div class="mission-tie">
+    <strong>მისიასთან კავშირი.</strong> როცა Anthropic-ის ამოცანა რაღაცის შენახვას გთხოვს — usage-ივენთები 100k ჩაწერა/წმ-ზე, შეკვეთების ისტორია, inbox — „Postgres-ს გამოვიყენებ" ბრენდია და არა დიზაინი. დამატებითი კითხვა ყოველთვის ერთია: <em>„რატომ ეს store და რა გატყდება ამ ჩაწერის ტემპზე?"</em> ვინც ამბობს „ეს append-heavy დატვირთვაა, ამიტომ LSM engine read amplification-ს თმობს sequential ჩაწერის გამტარუნარიანობის სანაცვლოდ", ის შიდა მექანიზმებიდან მსჯელობს — ზუსტად ის უნარი, რომელსაც <a href="https://dataintensive.net/">DDIA-ის მე-3 თავი</a> ასწავლის და ეს გაკვეთილი კუმშავს.
+  </div>
+
+  <h2>1 · Log-ი თვითონ არის database</h2>
+  <p>უმარტივესი database append-only ფაილია — და ჩაწერაში თითქმის დაუმარცხებელია, რადგან append (მიწერა ბოლოში) ერთადერთია, რასაც დისკი სრული სიჩქარით აკეთებს. <a href="../reference/0002-estimation-kit.html">Estimation Kit-ის</a> რიცხვები: მბრუნავი დისკი ~10 ms იხდის ყოველ შემთხვევით seek-ზე (~100 random IOPS), sequential (თანმიმდევრული) კითხვისას კი 100–200 MB/s-ს აწვდის — რამდენიმე ათასჯერადი უფსკრული. SSD-ები უფსკრულს ამცირებენ, მაგრამ ინარჩუნებენ (<a href="https://queue.acm.org/detail.cfm?id=1563874">ACM Queue, "The Pathologies of Big Data"</a>).</p>
+  <p>ამიტომ <strong>ყველა სერიოზული engine ორჯერ წერს</strong>: ჯერ <strong>write-ahead log-ში (WAL)</strong> — სუფთა append, დისკზე ჩასული კლიენტის დადასტურებამდე; მერე ნამდვილ სტრუქტურაში. Crash-ის შემდეგ recovery log-ს თავიდან უკრავს ბოლო checkpoint-იდან — log-ი სიმართლეა, სტრუქტურა მისი cache-ია (<a href="https://www.postgresql.org/docs/current/wal-intro.html">Postgres WAL docs</a>; <a href="https://dataintensive.net/">DDIA ch. 3</a>). ორივე ოჯახი ქვემოთ ერთი კითხვის სხვადასხვა პასუხია: „log-ი სწრაფია, მაგრამ მოუძებნელი — როგორ დავამატოთ ძებნა?"</p>
+
+  <h2>2 · Index-ები: იხდი ჩაწერისას, რომ დაზოგო კითხვისას</h2>
+  <p>შიშველი log-ი O(1) ჩაწერას და O(N) კითხვას იძლევა. <strong>Index</strong> დამატებითი სტრუქტურაა, რომელიც ზოგ კითხვას აჩქარებს — მაგრამ DDIA-ის კანონი ურყევია: <em>ყოველი index ჩაწერას ანელებს</em>, რადგან ყოველმა ჩაწერამ ისიც უნდა განაახლოს. უფასო index არ არსებობს — არსებობს მხოლოდ არჩეული გაცვლა. B-tree-ები ანგარიშს ჩაწერისას იხდიან, ადგილზე; LSM-ები ანგარიშს გადაავადებენ და background-ში, ბითუმად იხდიან.</p>
+
+  <h2>3 · B-tree-ები: კითხვაზე ოპტიმიზებული წესრიგი</h2>
+  <p>B-tree — Postgres-ის, MySQL/InnoDB-ის, Oracle-ის ძრავა — database-ს ფიქსირებული ზომის <strong>page-ებად</strong> (გვერდებად, ~4 KB) ჭრის და ხედ აწყობს: შიდა page რამდენიმე ასეულ დალაგებულ key-ს ინახავს შვილებზე მიმთითებლებით (<a href="https://www.postgresql.org/docs/current/btree-implementation.html">Postgres B-tree internals</a>).</p>
+  <p><strong>სიღრმის ნამუშევარი მაგალითი:</strong> branching factor 500-ით სიღრმე log<sub>500</sub>(N)-ით იზრდება — <strong>ოთხდონიანი ხე 4 KB page-ებით ~500<sup>4</sup> ≈ 62 მილიარდ leaf-მითითებას ≈ 256 TB მონაცემს წვდება</strong>. ოთხი page-ის წაკითხვა ნებისმიერ key-მდე მეოთხედ პეტაბაიტში — ამიტომაა B-tree-ის read latency ასეთი ბრტყელი და პროგნოზირებადი.</p>
+  <p>ჩაწერები <strong>ადგილზე (in-place)</strong> ხდება: იპოვე leaf, გადააწერე. სავსე page <strong>split-დება</strong> (იყოფა) ორად — და რადგან crash-ი მრავალ-page-იან ნაბიჯებს შორის ხეს დააზიანებდა, B-tree-ებს საკუთარი WAL აქვთ და პარალელურ წვდომას <strong>latch-ებით</strong> (მოკლევადიანი page-ლოქებით) მართავენ. სად იგებენ: point read-ები, <strong>range scan-ები</strong> (leaf-ები key-ის რიგითაა — „მომხმარებელ 4711-ის შეკვეთები, ბოლო 50" მეზობელ page-ებს მიუყვება), read-heavy ნარევები, მომწიფებული ტრანზაქციები. E-commerce შეკვეთების ისტორია არქეტიპია.</p>
+
+  <h2>4 · LSM-tree-ები: ჩაწერაზე ოპტიმიზებული წესრიგი</h2>
+  <p><strong>Log-structured merge-tree</strong> (<a href="https://www.cs.umb.edu/~poneil/lsmtree.pdf">O'Neil et al., 1996</a>) შემთხვევით ჩაწერებზე საერთოდ ამბობს უარს. გზა: ჩაწერები მიდის მეხსიერების დალაგებულ <strong>memtable-ში</strong> (პლუს WAL); ზღვარზე ის იცლება (flush) — ერთი sequential ჩაწერით — უცვლელ დალაგებულ ფაილად, <strong>SSTable-ად</strong>; background <strong>compaction</strong> (შემჭიდროება) SSTable-ებს უფრო მსხვილებად merge-ავს და გადაწერილ მნიშვნელობებს ყრის.</p>
+  <p>კითხვა ამის ფასს იხდის: lookup ამოწმებს memtable-ს, მერე SSTable-ებს ახლიდან ძველისკენ. Point read-ებს <strong>Bloom filter-ები</strong> იხსნიან — პაწია ალბათური სტრუქტურა თითო table-ზე, რომელიც „აქ ნამდვილად არ არის"-ს ერთი probe-ით პასუხობს (<a href="https://github.com/facebook/rocksdb/wiki/RocksDB-Bloom-Filter">RocksDB wiki: Bloom Filter</a>). წარმომავლობა: 1996-ის ნაშრომი → Google-ის <a href="https://static.googleusercontent.com/media/research.google.com/en//archive/bigtable-osdi06.pdf">Bigtable (OSDI '06)</a> → HBase, Cassandra, LevelDB, <a href="https://github.com/facebook/rocksdb/wiki">RocksDB</a>. სად იგებენ: შეუჩერებელი write-heavy ingest. Messaging inbox არქეტიპია — ყოველი მესიჯი ჩაწერაა და Cassandra-ს LSM ძრავა ისრუტავს იმ ნაკადს, რომელიც B-tree-ის random-I/O ჩაწერის გზას გაანადგურებდა.</p>
+
+  <h2>5 · გამრავლების (amplification) სამკუთხედი</h2>
+  <p>ძრავები სამ გამრავლებაზე დარდება — და <a href="http://daslab.seas.harvard.edu/rum-conjecture/">RUM-ჰიპოთეზა</a> ამბობს: Read-იდან, Update-იდან და Memory/სივრციდან ნებისმიერ ორს მესამის ხარჯზე თუ გააუმჯობესებ. <strong>Read amplification</strong> — რამდენ ნაჭერს კითხულობ ერთ ლოგიკურ read-ზე; <strong>write amplification</strong> — რამდენი ბაიტი იწერება ფიზიკურად ერთ ლოგიკურ ბაიტზე; <strong>space amplification</strong> — რამდენი ბაიტი ინახება ერთ ცოცხალ ბაიტზე.</p>
+  <p><strong>არითმეტიკა, რომლის მოსმენაც ინტერვიუერს უნდა:</strong> B-tree 100-ბაიტიანი სტრიქონის განახლებაზე მთელ 4 KB page-ს გადაწერს — <strong>40× write amplification</strong> WAL-ის ასლამდე. LSM <em>leveled</em> compaction-ით (fanout 10) ყოველ ჩანაწერს ~10-ჯერ გადაწერს თითო დონეზე; 3–4 დონე = <strong>~30–40×</strong> — მაგრამ ყველა ეს ბაიტი მსხვილ sequential merge-ებში მოძრაობს, ამიტომ ingest-ის რბოლას LSM მაინც იგებს (<a href="https://github.com/facebook/rocksdb/wiki/Compaction">RocksDB wiki: Compaction</a>). ლაბის <em>size-tiered</em> მინი-LSM-ში 100k ჩაწერა 292k ჩანაწერ-ჩაწერა დაჯდა — write amp 2.92×.</p>
+  <table>
+    <tr><th>Compaction სტრატეგია</th><th>Write amp</th><th>Read amp</th><th>Space amp</th><th>სახლი</th></tr>
+    <tr><td><strong>Leveled</strong> — თითო დონეზე ერთი დალაგებული run, ყოველი ~10×-ით დიდი</td><td>მაღალი (~10 დონეზე)</td><td>დაბალი (≤ 1 table დონეზე)</td><td>დაბალი (~1.1×)</td><td>LevelDB, RocksDB default</td></tr>
+    <tr><td><strong>Size-tiered</strong> — მსგავსი ზომის table-ები ერთიანდებიან, როცა tier ივსება</td><td>დაბალი (~1 tier-merge-ზე)</td><td>მაღალი (ბევრი გადამფარავი table)</td><td>მაღალი (~2×-მდე merge-მდე)</td><td>Cassandra STCS default</td></tr>
+  </table>
+  <p>Compaction <strong>background გადასახადია</strong>, რომელიც დისკს და CPU-ს foreground ტრაფიკს უზიარებს. თუ ingest merge-ზე სწრაფად მოდის, table-ები გროვდება, კითხვები ნელდება და engine ბოლოს ჩაწერებს აჩერებს — <strong>write stall-ები</strong> (<a href="https://github.com/facebook/rocksdb/wiki/Write-Stalls">RocksDB wiki: Write Stalls</a>).</p>
+
+  <h2>6 · პირისპირ: რომელი engine როდის</h2>
+  <table>
+    <tr><th>განზომილება</th><th>B-tree (Postgres, MySQL/InnoDB)</th><th>LSM (Cassandra, RocksDB, LevelDB)</th></tr>
+    <tr><td>Point read-ები</td><td>ბრტყელი, პროგნოზირებადი — ერთი მოკლე ჩასვლა</td><td>კარგი Bloom filter-ებ<em>ით</em>; უარესდება table-ების დაგროვებისას</td></tr>
+    <tr><td>Range scan-ები</td><td>შესანიშნავი — leaf-ები key-ის რიგით</td><td>სუსტი — ყველა table უნდა merge-დეს; Bloom-ები range-ს ვერ შველიან</td></tr>
+    <tr><td>ჩაწერის გამტარუნარიანობა</td><td>შეზღუდულია random in-place page I/O-თი</td><td>შესანიშნავი — მხოლოდ sequential flush-ები და merge-ები</td></tr>
+    <tr><td>სივრცე</td><td>ფრაგმენტაცია: page-ები ~⅔-ით სავსეა</td><td>უფრო მჭიდრო — compaction მკვრივად გადაწერს და კარგად კუმშავს</td></tr>
+    <tr><td>Latency-ის პროგნოზირებადობა</td><td>მაღალი — მნიშვნელოვანი background გადაწერები არ არის</td><td>Compaction-ის ტალღები p99-ის პიკებს და write stall-ებს იწვევს</td></tr>
+    <tr><td>ტრანზაქციების სიმწიფე</td><td>ათწლეულების MVCC, locking, constraint-ები</td><td>თხელი — ტიპურად per-key ატომურობა, დანარჩენი აპლიკაციაზეა</td></tr>
+  </table>
+  <p>ცერის წესი: <strong>read-mostly, რელაციური, ტრანზაქციული → B-tree</strong> (შეკვეთები, ანგარიშები, კატალოგი). <strong>Write-heavy, append-mostly, უზარმაზარი ingest → LSM</strong> (ივენთები, მესიჯები, time series, log-ები). ჯერ დატვირთვის ფორმა თქვი — engine თავად გამოჰყვება. (<a href="https://dataintensive.net/">DDIA ch. 3</a>)</p>
+
+  <h2>7 · Object vs block vs file storage</h2>
+  <table>
+    <tr><th>მოდელი</th><th>ერთეული და API</th><th>ნაწილობრივი განახლება?</th><th>კლასიკური სახლი</th></tr>
+    <tr><td><strong>Block</strong></td><td>ფიქსირებული ბლოკები; offset-ით წერა/კითხვა (EBS, SAN)</td><td>კი — ეს არის მთელი აზრი</td><td>database-ებისა და ფაილსისტემების ქვეშ</td></tr>
+    <tr><td><strong>File</strong></td><td>იერარქიული გზები, POSIX (NFS, EFS)</td><td>კი — in-place დიაპაზონები</td><td>საზიარო დირექტორიები, legacy პროგრამები</td></tr>
+    <tr><td><strong>Object</strong></td><td>ბრტყელი keyspace, უცვლელი blob-ები + metadata HTTP-ზე (S3, GCS)</td><td><strong>არა — მთელი ობიექტი იცვლება</strong></td><td>მედია, backup-ები, data lake-ები, SSTable-ები</td></tr>
+  </table>
+  <p>S3-ის მოდელი ერთ ამოსუნთქვაზე: ობიექტები მთლიანად იწერება და მთლიანად იცვლება — 1 GB ობიექტს 200 ბაიტის მიწერა ახალი ობიექტის ატვირთვას ნიშნავს; read-ები და <code>LIST</code>-ები 2020 წლის დეკემბრიდან <strong>strongly consistent</strong>-ია (<a href="https://aws.amazon.com/s3/consistency/">AWS S3 consistency</a>); durability (მდგრადობა) კი <strong>თერთმეტი ცხრიანია</strong> — 99.999999999%: შეინახე 10 მილიონი ობიექტი და ერთის დაკარგვას ~10,000 წელიწადში ერთხელ ელოდე (<a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/DataDurability.html">AWS S3 durability docs</a>). Object storage ფაილსისტემას ცვლის ზუსტად მაშინ, როცა მონაცემი <strong>write-once, read-many და დიდია</strong> — ამიტომ თანამედროვე LSM ძრავები უცვლელ SSTable-ებს პირდაპირ S3-ში აწყობენ.</p>
+
+  <h2>8 · Failure mode-ები, რომლებიც ინტერვიუებს წყვეტენ</h2>
+  <ul>
+    <li><strong>Compaction-ის ვალის სპირალი.</strong> ხანგრძლივი ჩაწერის ტალღა compaction-ს უსწრებს; SSTable-ები გროვდება; ყოველი read მეტ table-ს ეკითხება, latency იზრდება, <em>სანამ</em> compaction იმავე დისკზე იბრძვის; ბოლოს engine <strong>write stall-ებს</strong> აწესებს — შენი „ჩაწერაზე ოპტიმიზებული" store ჩაწერებს ზღუდავს (<a href="https://github.com/facebook/rocksdb/wiki/Write-Stalls">RocksDB: Write Stalls</a>). შველა: compaction-ის მარაგი (ingest ≤ ~½ merge-ის გამტარობის), ingest-ის შეზღუდვა ზემოდან, pending-compaction bytes როგორც პირველი რიგის alert.</li>
+    <li><strong>უსაზღვრო tombstone-ები.</strong> LSM-ში delete <em>ჩაწერაა</em> — <strong>tombstone</strong> (საფლავის ქვა) მარკერი, რომელიც compaction-მდე უნდა იცოცხლოს. Delete-heavy დატვირთვები (რიგები Cassandra-ში, გასუფთავებული inbox-ები) tombstone-ების მინდვრებს აშენებენ, რომლებშიც read ცოცხალ მონაცემამდე უნდა გაიკვლიოს — Cassandra 100k tombstone-ზე query-ს default-ად კლავს (<a href="https://thelastpickle.com/blog/2016/07/27/about-deletes-and-tombstones.html">The Last Pickle: About Deletes and Tombstones</a>; Discord-მა ზუსტად ეს იწვნია მასიურად წაშლილი არხების კითხვისას — <a href="https://discord.com/blog/how-discord-stores-billions-of-messages">How Discord Stores Billions of Messages</a>). გამოსავალი მონაცემთა მოდელშია: delete-ებზე რიგებს ნუ ააშენებ; დროით დაანაწილე და მთელი partition-ები გადაყარე.</li>
+    <li><strong>შემთხვევითი key-ები B-tree-ის page-ების წინააღმდეგ.</strong> Random UUIDv4 primary key-ებით ყოველი insert <em>შემთხვევით</em> leaf page-ზე ჯდება: buffer pool-ი იფლითება, page-ები გამუდმებით split-დებიან და ნახევრად ცარიელები რჩებიან, write amplification ფეთქდება — <a href="https://www.percona.com/blog/uuids-are-popular-but-bad-for-performance-lets-discuss/">Percona-მ გაზომა InnoDB-ის ჩავარდნა</a>, როგორც კი index RAM-ს გადააჭარბებს. თანმიმდევრული key-ები (auto-increment, <strong>ULID</strong>, UUIDv7) insert-ებს მარჯვენა კიდის leaf-ზე ინახავენ — ამიტომ იყენებს Shopify-ის payments გუნდი ULID-ებს idempotency key-ებად (<a href="https://shopify.engineering/building-resilient-payment-systems">Shopify: Building Resilient Payment Systems</a>). ლაბში: sequential→random გადართვა მინი-B-tree-ის write amp-ს ~2×-დან ~44×-მდე ზრდის.</li>
+  </ul>
+
+  <h2>9 · ერთი AI შენიშვნა, მერე ისევ საფუძვლები</h2>
+  <p>ჩვენი LLM inference პლატფორმის KV-cache მენეჯერი <em>თვითონ არის</em> storage engine GPU-ს კოსტიუმში: ტოკენების გენერაცია append-heavy დატვირთვაა; <a href="https://arxiv.org/abs/2309.06180">PagedAttention (vLLM)</a> cache-ს ფიქსირებული ზომის ბლოკებად ანაწილებს მიმართვის ცხრილით — §3-ის page-და-მიმთითებლის ხრიკი, attention-მდგომარეობაზე გადატანილი; დასრულებული sequence-ების eviction (განდევნა) და defragmentation compaction-ის ბიძაშვილებია; prefix-გაზიარება კი — deduplication. იგივე სამკუთხედი, ძვირი ბაიტები. ეს მთელი შენიშვნაა — ინტერვიუ §1–§8-ს აფასებს.</p>
+
+  <h2>10 · ინტერვიუს სალაპარაკო პუნქტები</h2>
+  <ol>
+    <li><strong>ჯერ დატვირთვა დაახარისხე, მერე store დაასახელე:</strong> read/write თანაფარდობა, point vs range, delete-ების ტემპი, ტრანზაქციები.</li>
+    <li><strong>დისკზე დაამაგრე:</strong> „sequential I/O ათასობითჯერ იაფია random-ზე — B-tree random ჩაწერებს იხდის იაფი კითხვისთვის, LSM გადავადებულ merge-ებს sequential ჩაწერისთვის."</li>
+    <li><strong>სიღრმის მათემატიკა თქვი</strong> (§3): „branching 500, ოთხი დონე, ~256 TB", და write-amp-ისა (§5): „4 KB page 100-ბაიტიან სტრიქონზე — 40×."</li>
+    <li><strong>სამივე amplification დაასახელე</strong> და თქვი, რომელს სწირავ — ერთი წინადადება, რომელიც RUM-ის ცოდნას ასხივებს.</li>
+    <li><strong>Failure mode ინტერვიუერზე ადრე ახსენე</strong> (§8): compaction-ის ვალი LSM-არჩევანზე, random-key split-ები B-tree-ზე, tombstone-ები delete-heavy დიზაინზე.</li>
+    <li><strong>უცვლელი blob-ები object storage-ში გაუშვი</strong> (§7) და შეზღუდვა ხმამაღლა თქვი: „ნაწილობრივი განახლება არ არსებობს."</li>
+    <li><strong>ოპერაციული სიგნალით დახურე:</strong> „alert-ს დავაყენებდი pending compaction bytes-ზე / buffer-pool miss rate-ზე."</li>
+  </ol>
+
+  <h2>11 · ლაბი — შეაჯიბრე LSM და B-tree</h2>
+  <div class="callout"><span class="label">პრაქტიკა (ქვიზამდე გააკეთე)</span>
+    ორივე engine ამ გაკვეთილიდან ნულიდან აწყობილია <code>labs/lab-0012-lsm-vs-btree/</code>-ში:
+    <code>python3 lsm_btree_lab.py</code> უშვებს სამ ექსპერიმენტს — ჩაწერის ღირებულება და write
+    amplification 100k insert-ზე (size-tiered compaction vs buffer pool-ის page-ების flush-ები),
+    point read-ები ცხელ / ცივ / <em>არარსებულ</em> key-ებზე Bloom filter-ებით და მათ გარეშე, და
+    range scan-ები, რომლებიც LSM-ს ყველა table-ის merge-ს აიძულებენ. შემდეგ README-ს E1–E4:
+    <em>იწინასწარმეტყველე, შეცვალე CONFIG, გაუშვი თავიდან, შეადარე</em> — გაანახევრე memtable,
+    გამორთე bloom-ები, გაარანდომე key-ები, გათიშე compaction. მცდარი პროგნოზები დავალების შედეგია.
+  </div>
+
+  <h2>12 · პროექტის ნაბიჯი</h2>
+  <p>ორი გადაწყვეტილება <strong>LLM inference პლატფორმისთვის</strong>: აირჩიე storage engine (ა) <strong>request/usage log-ისთვის</strong> (ყოველი მოთხოვნა ემატება, ბილინგდება, იშვიათად იკითხება ხელახლა) და (ბ) <strong>metadata store-ისთვის</strong> (მომხმარებლები, API key-ები, კვოტები), თითოეული ორი წინადადებით დაიცავი. დასაცავი მაგალითი: <em>(ა) LSM ძრავა (RocksDB-ზე დაფუძნებული, ან Kafka-მერე-object-storage), რადგან log-ი სუფთა append-heavy ingest-ია, რომელიც ადგილზე არასდროს ახლდება — read amplification-ს ვთმობთ, რომელსაც იშვიათად ვიხდით; (ბ) Postgres, რადგან metadata პატარაა, read-mostly და ტრანზაქციები და constraint-ები სჭირდება — B-tree-ის ტერიტორია.</em> დაწერე შენი წყვილი — ჯერ დატვირთვის ფორმა, მერე engine — და მოიტანე შემდეგ სესიაზე.</p>
+
+  <h2>შეამოწმე შენი თავი</h2>
+  <div class="quiz" id="quiz"></div>
+
+  <h2>ძირითადი წყარო</h2>
+  <p>წაიკითხე <strong>DDIA-ის მე-3 თავი, „Storage and Retrieval"</strong> (<a href="https://dataintensive.net/">dataintensive.net</a>) — SSTable-ები და LSM-tree-ები, B-tree-ები და „Comparing B-Trees and LSM-Trees" სექცია ამ გაკვეთილის კანონიკური სრული ფორმაა, რომელსაც ინტერვიუერები თითქმის სიტყვასიტყვით ციტირებენ. მერე გადახედე <a href="https://github.com/facebook/rocksdb/wiki">RocksDB wiki-ს</a> — განსაკუთრებით <a href="https://github.com/facebook/rocksdb/wiki/Compaction">Compaction</a> და <a href="https://github.com/facebook/rocksdb/wiki/RocksDB-Bloom-Filter">Bloom Filter</a> გვერდებს.</p>
+
+  <footer class="lesson-footer">
+    <p><strong>გაიჭედე ან გაინტერესებს?</strong> ჰკითხე მასწავლებელს (აგენტს) ნებისმიერი რამ — „რატომ ვერ აჩქარებენ Bloom filter-ები range scan-ებს?" შესანიშნავი დამატებითი კითხვაა.</p>
+    <nav class="lesson-nav">
+      <span><a href="0011-api-design-deep.ka.html">◀ წინა: 0011 · API დიზაინი, სიღრმისეულად</a></span>
+      <span><a href="0013-streams-and-events.ka.html">შემდეგი: 0013 · Streams და ივენთები ▶</a></span>
+    </nav>
+  </footer>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+renderQuiz(document.getElementById('quiz'), {
+  title: 'შეამოწმე შენი თავი',
+  questions: [
+    {
+      q: 'LSM-tree ძრავა ერთსა და იმავე დისკზე B-tree-ზე გაცილებით მაღალ ჩაწერის გამტარუნარიანობას აღწევს. რა არის ბირთვი მექანიზმი?',
+      options: [
+        'ყოველ ჩაწერას შენახვამდე კუმშავს ალგორითმით',
+        'ჩაწერებს sequential append-ებად კრებს ჯგუფურად',
+        'Write-ahead log-ს საერთოდ გამოტოვებს ყოველთვის',
+      ],
+      answer: 1,
+      explain: 'ჩაწერები memtable-ში ჯდება და დისკს მხოლოდ sequential flush-ებად და merge-ებად აღწევს — ყველაზე სწრაფი, რასაც დისკი აკეთებს. LSM-ები WAL-ს მაინც ინახავენ crash-უსაფრთხოებისთვის, კუმშვა კი სივრცეს შველის და არა ჩაწერის გზას.',
+    },
+    {
+      q: 'LSM-tree-ზე point read-ს შესაძლოა ბევრი SSTable-ის შემოწმება მოუწიოს. რა ინარჩუნებს ამას იაფად პრაქტიკაში?',
+      options: [
+        'Bloom filter-ები აცილებენ table-ებს key-ის გარეშე',
+        'Memtable-ები აორმაგებენ ყველა table-ის key-ებს',
+        'Compaction ყოველთვის აერთიანებს ყველაფერს ერთ table-ად',
+      ],
+      answer: 0,
+      explain: 'თითო-table-ზე Bloom filter „აქ ნამდვილად არ არის"-ს ერთი probe-ით პასუხობს, ამიტომ key-ის არმქონე table-ები თითქმის არაფერი ჯდება — ლაბში არარსებული key-ების ღირებულება ~68-დან ~6-მდე დაეცა.',
+    },
+    {
+      q: 'DDIA-ის ნამუშევარი მაგალითი: B-tree 4 KB page-ებით და branching factor 500-ით. დაახლოებით რამდენი დონე ფარავს ~256 TB მონაცემს?',
+      options: [
+        'თოთხმეტი დონე აღწევს ამ მასშტაბს დაახლოებით',
+        'ორმოცი დონე აღწევს ამ მასშტაბს ძლივს',
+        'ოთხი დონე აღწევს ამ მასშტაბს კომფორტულად',
+      ],
+      answer: 2,
+      explain: 'სიღრმე log₅₀₀-ით იზრდება: ყოველი დონე წვდომას 500-ჯერ ამრავლებს, ამიტომ 500⁴ ≈ 62 მილიარდი leaf-მითითება ≈ 256 TB მხოლოდ ოთხ დონეში. ამიტომ რჩება B-tree-ის point-read latency ბრტყელი.',
+    },
+    {
+      q: 'Leveled compaction-ით, fanout 10-ით, სამ დონეზე — დაახლოებით რა write amplification უნდა დაასახელო?',
+      options: [
+        'დაახლოებით სამი სულ, ერთი დონეზე',
+        'დაახლოებით ოცდაათი სულ, ათი დონეზე',
+        'დაახლოებით სამასი სულ, ასი დონეზე',
+      ],
+      answer: 1,
+      explain: 'Leveled compaction ჩანაწერს ყოველ დონეში ჩასვლისას ~fanout-ჯერ (~10) გადაწერს, ამიტომ სამი დონე ~30×-ს იძლევა. ნუგეში: ეს ბაიტები მსხვილ sequential merge-ებში მოძრაობენ, ამიტომ ingest-ს LSM მაინც იგებს.',
+    },
+    {
+      q: 'Cassandra-ში key-ის წაშლა tombstone მარკერს წერს. რატომ შეუძლია მასიურ delete-ებს კითხვის მკვეთრად შენელება?',
+      options: [
+        'Read-ები tombstone-ებს სკანავენ, სანამ compaction წაშლის მათ',
+        'Tombstone-ები memtable-ს კეტავენ, სანამ compaction წაშლის მათ',
+        'Tombstone-ები ყოველ read-მდე table-ების სრულ გადაწერას აიძულებენ',
+      ],
+      answer: 0,
+      explain: 'Tombstone უნდა იცოცხლოს, სანამ compaction მას key-ის ყველა ძველ ასლს არ გადაატარებს — ამიტომ delete-heavy partition-ები მარკერების მინდვრები ხდება, რომლებშიც read ცოცხალ მონაცემამდე იკვლევს გზას. ეს არის Discord-ის ნაცნობი პრობლემა.',
+    },
+    {
+      q: 'შენმა სერვისმა S3-ში შენახულ 1 GB log ობიექტს 200 ბაიტი უნდა მიაწეროს. რას გაიძულებს object storage-ის მოდელი?',
+      options: [
+        'ბაიტების მიწერას ადგილზე range-ჩაწერების საშუალებით',
+        'ობიექტის დაბლოკვას და მის პირდაპირ რედაქტირებას იქვე',
+        'მთელი ობიექტის ხელახლა შედგენას და სრულად ატვირთვას',
+      ],
+      answer: 2,
+      explain: 'ობიექტები უცვლელია: ნაწილობრივი განახლება არ არსებობს, ამიტომ ცვლილება მთლიანად ახალი ობიექტის ჩაწერას ნიშნავს. ამიტომ ერგება object storage write-once, read-many blob-ებს — მაგალითად flush-ილ SSTable-ებს — და არა აქტიურად მიწერად ფაილებს.',
+    },
+  ],
+});
+</script>
+</body>
+</html>

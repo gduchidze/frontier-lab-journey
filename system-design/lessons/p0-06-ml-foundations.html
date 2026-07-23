@@ -1,0 +1,197 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lesson p0-06 · ML Foundations</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<div class="lesson">
+  <header class="lesson-header">
+    <p class="kicker">Lesson p0-06 · Phase 0 Track B — ML/DL/NLP · <a href="p0-06-ml-foundations.ka.html">ქართული ვერსია</a></p>
+    <h1>ML Foundations</h1>
+    <p class="dek">Loss, gradient descent, generalization — and the metrics that decide whether a model ships.</p>
+  </header>
+
+  <div class="mission-tie">
+    <strong>Mission tie.</strong> Even in Anthropic's <em>systems</em> rounds, ML fluency is assumed: propose quantizing a model or routing traffic to a cheaper one, and the follow-up is "how do you know quality didn't drop?" The only defensible answer is a held-out set, a metric, and a threshold — this lesson's exact content. Chip Huyen's <a href="https://www.oreilly.com/library/view/designing-machine-learning-systems/9781098107956/">Designing Machine Learning Systems</a> (ch. 1–3) frames ML this way — as an engineering discipline with SLO-like targets, not a bag of algorithms. (<a href="https://www.tryexponent.com/blog/anthropic-system-design-interview">Exponent's Anthropic guide</a>)
+  </div>
+
+  <div class="callout"><span class="label">Lab first (ADHD-friendly order)</span>
+    Don't read this top-to-bottom cold. Open <code>labs/lab-p0-06-gradient-descent/</code>, run
+    <code>python3 gradient_descent_lab.py</code>, skim the three output tables, <em>then</em> read —
+    each section below explains a number you have already seen.
+  </div>
+
+  <h2>1 · Learning is curve-fitting with a report card</h2>
+  <p>A model is a parameterized function <code>f(x; w)</code>; <strong>training</strong> is searching for parameters <code>w</code> that make it match data. In <strong>supervised learning</strong> you have labeled pairs <code>(x, y)</code> — regression predicts numbers, classification predicts categories. <strong>Unsupervised learning</strong> finds structure without labels (clustering, dimensionality reduction). LLM pretraining is <strong>self-supervised</strong>: the label is just the next token, so the labels come free with the text. (<a href="https://developers.google.com/machine-learning/crash-course">Google ML Crash Course</a>, <a href="https://www.oreilly.com/library/view/designing-machine-learning-systems/9781098107956/">DMLS ch. 1</a>)</p>
+  <p>The report card has two grades: error on data you trained on, and error on data you didn't. Only the second one ships.</p>
+
+  <h2>2 · The loss is the spec</h2>
+  <p>The <strong>loss function</strong> turns "match the data" into a single number to minimize. Choosing it is choosing what the model optimizes for — it is the SLO of training. (<a href="https://mml-book.github.io/">MML, ch. 8</a>)</p>
+  <table>
+    <tr><th>Task</th><th>Loss</th><th>Reads as</th></tr>
+    <tr><td>Regression</td><td>MSE (mean squared error)</td><td>average squared miss — big misses punished quadratically</td></tr>
+    <tr><td>Classification</td><td>Cross-entropy</td><td>negative log of the probability given to the right answer</td></tr>
+    <tr><td>LLM pretraining</td><td>Cross-entropy over next tokens</td><td>same loss; its exponential is <em>perplexity</em> (lesson p0-14)</td></tr>
+  </table>
+  <div class="callout"><span class="label">Vocabulary</span>
+    <strong>Loss</strong> is what training minimizes; a <strong>metric</strong> (accuracy, precision, recall) is what humans judge by. They are usually different — cross-entropy is differentiable, accuracy is not — and confusing the two is a classic review-round mistake.
+  </div>
+
+  <h2>3 · Gradient descent, one step at a time</h2>
+  <p>The <strong>gradient</strong> is the direction of steepest loss increase; step the opposite way, scaled by the <strong>learning rate</strong>. That is the whole algorithm — everything from linear regression to Claude's pretraining is this loop at different scales. (<a href="https://mml-book.github.io/">MML ch. 7</a>, <a href="https://www.3blue1brown.com/topics/neural-networks">3Blue1Brown</a>)</p>
+  <pre><code>Data: (x, y) = (1, 2) and (2, 4).   Model: ŷ = a·x, start a = 0, lr = 0.1.
+Loss: MSE(a) = mean((a·x − y)²)        grad = mean(2·(a·x − y)·x) = 5(a − 2)
+
+step 0: preds (0, 0)  errors (−2, −4)  MSE = (4+16)/2 = 10.0
+        grad = −10        a ← 0 − 0.1·(−10) = 1.0
+step 1: preds (1, 2)  errors (−1, −2)  MSE = 2.5
+        grad = −5         a ← 1.0 + 0.5 = 1.5
+step 2: grad = −2.5       a ← 1.75         MSE = 0.625
+Each step multiplies the distance to a = 2 by (1 − lr·5) = 0.5: geometric convergence.</code></pre>
+  <p>In practice you use <strong>SGD</strong>: the gradient is estimated on a random <em>mini-batch</em>, not the full dataset — noisier per step, vastly cheaper per step.</p>
+
+  <h2>4 · The learning-rate knob</h2>
+  <p>Reuse the factor from the worked example: each update multiplies the error in <code>a</code> by <code>(1 − lr·curvature)</code>. Three regimes fall out:</p>
+  <ul>
+    <li><strong>Too small</strong> — factor ≈ 1: converges, but wastes your step budget (lab: <code>lr=0.001</code> barely moves in 200 steps).</li>
+    <li><strong>Right</strong> — factor well inside (−1, 1): fast geometric convergence.</li>
+    <li><strong>Too big</strong> — factor beyond −1: each step <em>overshoots</em> further than it started; with <code>lr = 0.45</code> the same problem gives a → 0, 4.5, −1.1, 5.9… divergence. The lab's sweep shows loss hitting 10¹².</li>
+  </ul>
+  <p>This is the single highest-leverage hyperparameter, and the loss curve diagnoses it: flat = too small, exploding = too big, smooth decay = right. Momentum and Adam (lesson p0-07) are refinements of this knob, not replacements. (<a href="https://karpathy.github.io/2019/04/25/recipe/">Karpathy, "A Recipe for Training Neural Networks"</a>)</p>
+
+  <h2>5 · Train / validation / test discipline</h2>
+  <p>Three splits, three jobs, three touch frequencies. Blur them and your numbers stop meaning anything. (<a href="https://scikit-learn.org/stable/modules/cross_validation.html">scikit-learn: cross-validation</a>)</p>
+  <table>
+    <tr><th>Split</th><th>Used for</th><th>Touched</th></tr>
+    <tr><td>Train</td><td>fitting parameters <code>w</code></td><td>every gradient step</td></tr>
+    <tr><td>Validation</td><td>choosing hyperparameters, early stopping, model selection</td><td>every experiment</td></tr>
+    <tr><td>Test</td><td>the final, reportable estimate of real-world error</td><td><strong>once</strong>, at the end</td></tr>
+  </table>
+  <p><strong>Leakage</strong> is any path by which information about held-out examples reaches training: duplicates across splits, normalizing with statistics computed on the full dataset, or splitting time-series randomly instead of by time. Leakage makes offline numbers great and production numbers a surprise. (<a href="https://www.oreilly.com/library/view/designing-machine-learning-systems/9781098107956/">DMLS ch. 4 on leakage</a>)</p>
+
+  <h2>6 · Bias–variance, and the fixes</h2>
+  <p>Two error signatures, two opposite treatments. Diagnose from the train/val gap <em>before</em> reaching for a fix:</p>
+  <table>
+    <tr><th>Train error</th><th>Val error</th><th>Diagnosis</th><th>Fix</th></tr>
+    <tr><td>high</td><td>high</td><td>high <strong>bias</strong> (underfit)</td><td>bigger model, better features, train longer</td></tr>
+    <tr><td>low</td><td>high</td><td>high <strong>variance</strong> (overfit)</td><td>more data, regularization, simpler model</td></tr>
+    <tr><td>low</td><td>low</td><td>done</td><td>ship it; spend the budget elsewhere</td></tr>
+  </table>
+  <p><strong>Regularization</strong> buys variance reduction without collecting data. <strong>L2</strong> adds <code>λ·Σw²</code> to the loss, shrinking weights toward zero and smoothing the learned function; <strong>early stopping</strong> halts before the model memorizes noise; dropout (p0-07) randomly disables units. In the lab, a degree-9 polynomial on 10 points hits val MSE ≈ 10⁸ — and a whisper of L2 (λ = 0.001) drops it back to ≈ 0.1. Train error <em>always</em> improves with capacity; only held-out error is U-shaped.</p>
+
+  <h2>7 · Precision, recall, AUC</h2>
+  <p>Classifiers output scores; a <strong>threshold</strong> turns scores into decisions, producing true/false positives and negatives. <strong>Precision</strong> = TP/(TP+FP): when it flags, is it right? <strong>Recall</strong> = TP/(TP+FN): of the real positives, how many did it catch? Sliding the threshold trades one for the other — the lab table shows precision 0.52→1.00 while recall falls 1.00→0.05. <strong>F1</strong> is their harmonic mean; <strong>AUC</strong> is threshold-free: the probability a random positive outranks a random negative, 0.5 = coin flip. (<a href="https://scikit-learn.org/stable/modules/model_evaluation.html">scikit-learn: model evaluation</a>)</p>
+  <div class="callout"><span class="label">The accuracy trap</span>
+    With 99% negatives, "predict negative always" scores 99% accuracy and catches nothing. On imbalanced data, quote precision/recall at your operating threshold — never bare accuracy.
+  </div>
+
+  <h2>8 · Sharp edges</h2>
+  <ul>
+    <li><strong>Test-set overfitting without touching it.</strong> Run 50 experiments, pick the best by validation, and validation itself is now optimistically biased — teams "climb the leaderboard" into models that fail in production.</li>
+    <li><strong>Leakage via preprocessing.</strong> Fit scalers, vocabularies, and feature statistics on the train split only, then apply to the rest.</li>
+    <li><strong>Metric–cost mismatch.</strong> Optimizing F1 when false positives cost 10× false negatives ships the wrong threshold. Price the errors first (lab E4).</li>
+    <li><strong>Distribution shift.</strong> Offline metrics are computed on yesterday's distribution; production serves today's. Monitoring is the fix, not a bigger test set. (<a href="https://www.oreilly.com/library/view/designing-machine-learning-systems/9781098107956/">DMLS ch. 8</a>)</li>
+    <li><strong>Noisy comparisons.</strong> Model A beating model B by 0.3% on 500 examples is likely noise — significance testing arrives in p0-13.</li>
+  </ul>
+
+  <h2>9 · Lab — fit, overfit, measure</h2>
+  <div class="callout"><span class="label">Hands-on (do this before the quiz)</span>
+    Everything above is now verifiable in <code>labs/lab-p0-06-gradient-descent/</code>:
+    <code>python3 gradient_descent_lab.py</code> runs three experiments — gradient descent recovering
+    <code>y = 3x − 1</code> with a learning-rate sweep that finds the divergence cliff, the
+    bias–variance table (watch degree 9 hit val MSE ≈ 10⁸ and L2 rescue it), and the
+    precision/recall threshold sweep with AUC. Then do exercises E1–E4 in the lab README:
+    <em>predict, edit CONFIG, re-run, compare.</em> Wrong predictions are the deliverable.
+  </div>
+
+  <h2>10 · Project step</h2>
+  <p>Our spine project — the LLM inference platform — will eventually route each request to a small cheap model or a large expensive one via a classifier ("is this query hard?"). Write its 5-line eval sheet: (1) which error is worse, sending hard queries to the small model (quality hit) or easy ones to the big model (cost hit)? (2) therefore, precision or recall priority, and a threshold; (3) where the held-out set comes from (real logged queries, deduplicated); (4) when the test set gets spent; (5) the minimum win that justifies shipping. The same discipline prices quantization and speculative decoding quality checks in Phase 4, and cross-entropy returns as perplexity in p0-14.</p>
+
+  <h2>Interview talking points</h2>
+  <ul>
+    <li>"Training minimizes loss on the train set, but the product ships generalization — the train/validation gap is the first thing I diagnose."</li>
+    <li>"Both errors high means bias — bigger model, better features. Big gap means variance — more data, regularization, simpler model."</li>
+    <li>"Learning rate is the highest-leverage hyperparameter: the loss curve tells you which side you're on — flat is too small, exploding is too big."</li>
+    <li>"Validation is for making choices; test is a one-shot final answer. Every peek at test leaks it into model selection."</li>
+    <li>"Accuracy is meaningless on imbalanced data — I quote precision and recall at the operating threshold, and AUC for threshold-free ranking."</li>
+    <li>"The threshold itself is a product decision — the relative cost of false positives versus false negatives — not an ML decision."</li>
+  </ul>
+
+  <h2>Check yourself</h2>
+  <div class="quiz" id="quiz"></div>
+
+  <h2>Primary source</h2>
+  <p>Read <strong>Designing Machine Learning Systems, chapters 1–3</strong> (Chip Huyen, <a href="https://www.oreilly.com/library/view/designing-machine-learning-systems/9781098107956/">O'Reilly</a>; overview on <a href="https://huyenchip.com/books/">huyenchip.com</a>). Free alternative covering the same ground: Google's <a href="https://developers.google.com/machine-learning/crash-course">Machine Learning Crash Course</a> plus the scikit-learn user-guide pages on <a href="https://scikit-learn.org/stable/modules/cross_validation.html">cross-validation</a> and <a href="https://scikit-learn.org/stable/modules/model_evaluation.html">model evaluation</a>.</p>
+
+  <footer class="lesson-footer">
+    <p><strong>Stuck or curious?</strong> Ask your teacher (the agent) anything — "why can't we just train on the metric instead of a differentiable loss?" is an excellent follow-up question.</p>
+    <nav class="lesson-nav">
+      <span>◀ Prev: <a href="p0-05-senior-code-craft.html">p0-05 · Senior Code Craft</a></span>
+      <span>Next: <a href="p0-07-dl-foundations.html">p0-07 · DL Foundations</a> ▶</span>
+    </nav>
+  </footer>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+renderQuiz(document.getElementById('quiz'), {
+  title: 'Check yourself',
+  questions: [
+    {
+      q: 'Your model shows 1% training error and 25% validation error. What is the diagnosis?',
+      options: [
+        'High bias: the model is underfitting training data',
+        'Data leakage: the validation labels appeared during training',
+        'High variance: the model is overfitting training data',
+      ],
+      answer: 2,
+      explain: 'A large train–validation gap is the signature of variance (overfitting): the model memorized the train set. Fixes: more data, regularization, or a simpler model.',
+    },
+    {
+      q: 'You raise the learning rate 100× and the training loss now grows every step. What happened?',
+      options: [
+        'Steps overshoot the minimum so updates diverge',
+        'Model capacity dropped so training loss rises',
+        'Gradient vanished entirely so training loss stalls',
+      ],
+      answer: 0,
+      explain: 'When the update factor (1 − lr·curvature) goes beyond −1, each step lands farther from the minimum than it started — oscillating divergence. The lab sweep shows the exact cliff.',
+    },
+    {
+      q: 'Blocking a legitimate email is far worse than letting spam through. Which metric do you prioritize?',
+      options: [
+        'Recall, so that no spam ever escapes',
+        'Precision, so flagged messages are really spam',
+        'Accuracy, so overall error rate stays low',
+      ],
+      answer: 1,
+      explain: 'Precision = TP/(TP+FP) directly controls false positives — blocked legitimate mail. You accept lower recall (some spam gets through) to keep precision high.',
+    },
+    {
+      q: 'Why must the final test set be used only once, at the very end?',
+      options: [
+        'Because test data is expensive and must be conserved',
+        'Because repeated testing will slowly corrupt the training labels',
+        'Because tuning against it leaks it into model selection',
+      ],
+      answer: 2,
+      explain: 'Every decision made by looking at test performance makes the test estimate optimistically biased — it silently becomes a second validation set, and you lose your unbiased final number.',
+    },
+    {
+      q: "Your classifier's ROC AUC is 0.5. What does that tell you?",
+      options: [
+        'It predicts the positive class perfectly on every example',
+        'It ranks positives above negatives no better than chance',
+        'It labels every single example negative regardless of input',
+      ],
+      answer: 1,
+      explain: 'AUC is the probability that a random positive scores above a random negative. 0.5 means the ranking is a coin flip — the scores carry no signal.',
+    },
+  ],
+});
+</script>
+</body>
+</html>

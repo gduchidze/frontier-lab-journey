@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lesson p0-01 · Data Structures for Systems</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<div class="lesson">
+  <header class="lesson-header">
+    <p class="kicker">Lesson p0-01 · Phase 0 Track A — Programming/CS · <a href="p0-01-data-structures-for-systems.ka.html">ქართული ვერსია</a></p>
+    <h1>Data Structures for Systems</h1>
+    <p class="dek">Hash tables, B-trees, heaps, tries, Bloom filters, consistent hashing — and why "O(1)" comes with an asterisk your p99 pays for.</p>
+  </header>
+
+  <div class="mission-tie">
+    <strong>Mission tie.</strong> Every Anthropic design prompt eventually lands on a data-structure decision: the rate limiter is a hash map with a resize problem, the distributed KV store is a consistent-hash ring, the batching scheduler is a heap, the storage engine is a B-tree or LSM-tree. Interviewers probe <em>one level below</em> the box you drew — this lesson is that level. (<a href="https://github.com/donnemartin/system-design-primer">System Design Primer</a>, <a href="https://teachyourselfcs.com/">Teach Yourself CS</a>)
+  </div>
+
+  <div class="callout"><span class="label">Lab first (ADHD rule)</span>
+    Before reading further, run <code>python3 hash_vs_tree_lab.py</code> in <code>labs/lab-p0-01-hash-vs-tree/</code>. Watch a Python dict's p999 insert spike, then come back — every section below explains something you just saw.
+  </div>
+
+  <h2>1 · Big-O is a starting point, not an answer</h2>
+  <p>Big-O describes how cost <em>scales</em> as n grows; it deliberately ignores constants, caches, and memory layout. Systems care about all three. A linear scan over 100 contiguous integers beats a red-black tree lookup, because sequential memory reads are prefetched while tree traversal is pointer-chasing — a cache miss per level. (<a href="https://teachyourselfcs.com/">TYCS: algorithms + architecture together</a>)</p>
+  <table>
+    <tr><th>Structure</th><th>Lookup (avg)</th><th>Lookup (worst)</th><th>Ordered scan?</th><th>Disk-friendly?</th></tr>
+    <tr><td>Hash table</td><td class="num">O(1)</td><td class="num">O(n)</td><td>No</td><td>Poor</td></tr>
+    <tr><td>Balanced BST</td><td class="num">O(log n)</td><td class="num">O(log n)</td><td>Yes</td><td>Poor</td></tr>
+    <tr><td>B-tree</td><td class="num">O(log n)</td><td class="num">O(log n)</td><td>Yes</td><td>Excellent</td></tr>
+    <tr><td>Heap</td><td class="num">O(1) min only</td><td class="num">O(1) min only</td><td>No</td><td>—</td></tr>
+    <tr><td>Trie</td><td class="num">O(key length)</td><td class="num">O(key length)</td><td>Yes (prefix)</td><td>Fair</td></tr>
+  </table>
+  <p>The systems question is never "which is asymptotically fastest" — it is "which access pattern am I paying for, on which storage tier, at which percentile."</p>
+
+  <h2>2 · Hash tables: O(1)* — the asterisk owns your p99</h2>
+  <p>A hash table hashes the key to a bucket index. Average insert/lookup is O(1). But when the table's <strong>load factor</strong> crosses a threshold, it must <strong>resize</strong>: allocate a bigger array and <strong>rehash every stored key</strong>. That single insert costs O(n) — and some real request pays it. (<a href="https://github.com/donnemartin/system-design-primer">Primer</a>)</p>
+  <pre><code>CPython dict: resizes when 2/3 full; capacity roughly doubles.
+1,000,000 inserts → resizes near 5k, 10k, 21k, 43k, 87k, 174k, ... entries.
+Mean insert  ≈ 50 ns.
+The insert that triggers the 699k-key rehash ≈ tens of MILLIONS of ns.
+Mean: unchanged. p999: a cliff. This is "amortized O(1)" seen from the tail.</code></pre>
+  <div class="callout"><span class="label">Vocabulary</span>
+    <strong>Amortized</strong> = averaged over a sequence of operations. Amortized O(1) permits rare O(n) spikes — fine for total runtime, hostile to latency SLOs. Production fixes: pre-size the table, or use <em>incremental rehashing</em> (Redis migrates a few buckets per operation so no single request pays the whole bill).
+  </div>
+
+  <h2>3 · B-trees: designed for pages, not pointers</h2>
+  <p>Disks and SSDs read fixed-size <strong>pages</strong> (~4 KB); each read costs ~150 µs. A B-tree makes every node exactly one page holding hundreds of sorted keys, so the tree is extremely <em>wide</em> and therefore extremely <em>shallow</em>. This is why nearly every relational index is a B-tree. (<a href="https://www.oreilly.com/library/view/designing-data-intensive-applications/9781098119058/">DDIA ch. 3</a>)</p>
+  <pre><code>Branching factor b ≈ 500 keys per 4 KB page.
+height ≈ log_b(N):   N = 10^9 keys → log_500(10^9) ≈ 3.3 → 4 page reads.
+Binary tree instead: log2(10^9) ≈ 30 pointer hops = 30 page reads on disk.
+At 150 µs per random SSD read:  B-tree ≈ 0.6 ms   binary tree ≈ 4.5 ms.
+Same O(log n). 7× fewer I/Os. Bases matter when each level is an I/O.</code></pre>
+  <p>Because keys sit sorted inside pages, B-trees also answer <strong>range queries</strong> (<code>WHERE ts BETWEEN …</code>) by walking to the start key and scanning siblings — a hash index simply cannot do this. That is the interview one-liner for "why not hash indexes everywhere."</p>
+
+  <h2>4 · Heaps: the shape of every scheduler</h2>
+  <p>A <strong>binary heap</strong> keeps the minimum (or maximum) element at the root: peek O(1), pop/push O(log n), stored flat in an array — no pointers, cache-friendly. Wherever a system repeatedly asks "what is next?", there is a heap: OS run queues, timer wheels' cousins, Dijkstra, top-K rankings, and <code>heapq</code> under Python's <code>asyncio</code> scheduled callbacks.</p>
+  <p>Systems framing: a heap is how you serve "most urgent first" without re-sorting on every arrival. Re-sorting a list per event is O(n log n) each time; a heap pays O(log n) per event. A request scheduler that picks the earliest deadline among 100k in-flight jobs does it in ~17 comparisons.</p>
+
+  <h2>5 · Tries: prefixes as first-class keys</h2>
+  <p>A <strong>trie</strong> stores strings as a tree of characters (or bytes): lookup cost is O(length of key), independent of how many keys exist. Everything sharing a prefix shares a path — so "all keys starting with <code>/api/v2/</code>" is a subtree, not a scan. (<a href="https://en.wikipedia.org/wiki/Trie">Trie</a>)</p>
+  <p>Where you meet them: router URL matching, autocomplete, IP routing tables (longest-prefix match in radix-trie form), and dictionary-encoded search indexes. The trade: pointer-heavy memory layout; production systems use compressed variants (radix/Patricia tries, adaptive radix trees).</p>
+
+  <h2>6 · Bloom filters: buying "definitely not" with bits</h2>
+  <p>A <strong>Bloom filter</strong> is a bit array plus k hash functions. Insert: set k bits. Query: if any of the k bits is 0 → <strong>definitely absent</strong>; if all are 1 → <em>probably</em> present. False positives happen; false negatives never do. (<a href="https://en.wikipedia.org/wiki/Bloom_filter">Bloom filter</a>)</p>
+  <pre><code>Design rule: m/n bits per element, optimal k ≈ 0.69 × (m/n).
+At 10 bits/element → k ≈ 7 → FP ≈ (1 − e^(−kn/m))^k ≈ 0.5^7 ≈ 0.8%.
+1 billion URLs as raw 64-byte strings  ≈ 64 GB.
+Same set as a Bloom filter @ 10 bits   ≈ 1.25 GB — 50× smaller.
+Price: 0.8% of absent URLs answered "maybe" — you verify those in storage.</code></pre>
+  <p>Classic deployments: LSM storage engines (skip SSTables that can't contain the key — DDIA ch. 3), CDN "have I cached this?" checks, crawlers de-duplicating URLs, databases short-circuiting disk reads for missing rows.</p>
+
+  <h2>7 · Consistent hashing: adding a server without a stampede</h2>
+  <p>Shard by <code>hash(key) mod N</code> and the arithmetic betrays you: change N and almost every key's answer changes. <strong>Consistent hashing</strong> places servers and keys on a hash ring; each key belongs to the next server clockwise. Adding a server steals only a slice of the ring. (<a href="https://en.wikipedia.org/wiki/Consistent_hashing">Consistent hashing</a>, <a href="https://github.com/donnemartin/system-design-primer">Primer</a>)</p>
+  <table>
+    <tr><th>Scheme</th><th>Servers 10 → 11</th><th>Keys that move</th><th>Cache consequence</th></tr>
+    <tr><td>hash(key) mod N</td><td class="num">N changes</td><td class="num">~10/11 ≈ 91%</td><td>Mass miss storm; DB gets hammered</td></tr>
+    <tr><td>Consistent hash ring</td><td class="num">1 node added</td><td class="num">~1/11 ≈ 9%</td><td>One slice warms up; rest unaffected</td></tr>
+  </table>
+  <p>Real rings use <strong>virtual nodes</strong> (each server appears ~100–200 times on the ring) to smooth load imbalance. This structure underlies Memcached client sharding, Dynamo/Cassandra partitioning, and every "design a distributed cache" answer you will give.</p>
+
+  <h2>8 · Sharp edges — where these structures hurt you</h2>
+  <ul>
+    <li><strong>Rehash pause at peak traffic.</strong> The resize triggers exactly when the table is biggest — i.e., at your traffic high-water mark. Pre-size or rehash incrementally.</li>
+    <li><strong>Hash-flooding DoS.</strong> Adversarial keys that all collide degrade a hash table to O(n) per op. Languages patched this with randomized/SipHash seeds — know the phrase.</li>
+    <li><strong>Unordered means unordered.</strong> Pick a hash index, lose range scans and sorted pagination forever. Schema/index choice is an access-pattern commitment.</li>
+    <li><strong>Bloom filters can't delete.</strong> Clearing bits corrupts other keys' membership. Use counting Bloom filters or rebuild periodically.</li>
+    <li><strong>Hot keys break sharding math.</strong> Consistent hashing balances <em>key counts</em>, not <em>traffic</em>. One celebrity key still melts one server — see Phase 3's Twitter rep.</li>
+    <li><strong>Heap without decrease-key.</strong> Stdlib heaps can't update a buried entry; the standard trick is lazy deletion (push a new entry, ignore stale ones on pop).</li>
+  </ul>
+
+  <h2>9 · Lab — hash vs tree, measured</h2>
+  <div class="callout"><span class="label">Hands-on (do this before the quiz)</span>
+    In <code>labs/lab-p0-01-hash-vs-tree/</code>: <code>python3 hash_vs_tree_lab.py</code> runs four experiments — (1) per-operation dict insert timing: watch p999 spikes cluster at resize sizes while the mean stays flat; (2) lookup scaling: linear scan vs <code>bisect</code> vs dict as n grows 1k→100k; (3) a real Bloom filter: measured false-positive rate vs the (1−e<sup>−kn/m</sup>)<sup>k</sup> theory; (4) mod-N vs consistent-hash ring: fraction of keys that move when one server joins. Then do README exercises E1–E4: <em>predict, edit CONFIG, re-run, compare.</em>
+  </div>
+
+  <h2>10 · Project step</h2>
+  <p>Wire today's structures into the spine project (the LLM inference gateway). In a scratch note, assign a structure to each component and one failure mode you now anticipate: session/API-key lookup (hash map — pre-sized? incremental rehash?), request queue ordered by deadline or priority (heap), routing requests to model workers (consistent-hash ring — what happens on worker death?), and "have we seen this exact prefix before" for prefix caching (hash of token blocks — vLLM hashes fixed-size KV blocks exactly this way: <a href="https://blog.vllm.ai/2025/09/05/anatomy-of-vllm.html">Inside vLLM</a>). Bring the note to the next session; your teacher will attack the failure modes.</p>
+
+  <h2>Interview talking points</h2>
+  <ul>
+    <li>"Hash tables are amortized O(1) — the resize rehashes every key, so I pre-size or use incremental rehashing when p99 matters."</li>
+    <li>"Databases index with B-trees because one 4 KB node holds hundreds of keys: a billion rows is ~4 I/Os, and sorted pages give me range scans hash indexes can't."</li>
+    <li>"A Bloom filter gives me 'definitely not present' in ~10 bits per element with ~1% false positives — I put it in front of disk reads and only verify the maybes."</li>
+    <li>"hash mod N remaps ~90% of keys when I add a server; a consistent-hash ring with virtual nodes moves only ~1/N — that's the difference between a cache warm-up and a miss storm."</li>
+    <li>"Consistent hashing balances key counts, not load — hot keys still need replication or request spreading on top."</li>
+    <li>"For small hot sets I'd benchmark a flat array before reaching for trees: big-O ignores the cache hierarchy, and pointer chasing loses to sequential scans at small n."</li>
+  </ul>
+
+  <h2>Check yourself</h2>
+  <div class="quiz" id="quiz"></div>
+
+  <h2>Primary source</h2>
+  <p>Read <strong>DDIA, chapter 3 — "Storage and Retrieval"</strong> (B-trees, LSM-trees, Bloom filters in real engines; <a href="https://www.oreilly.com/library/view/designing-data-intensive-applications/9781098119058/">2nd ed., O'Reilly</a>). Free alternative: the <a href="https://github.com/donnemartin/system-design-primer">System Design Primer</a> sections on caching, consistent hashing, and databases, plus <a href="https://teachyourselfcs.com/">Teach Yourself CS</a> for the algorithms track.</p>
+
+  <footer class="lesson-footer">
+    <p><strong>Stuck or curious?</strong> Ask your teacher (the agent) anything — "why do LSM-trees beat B-trees for writes?" is the perfect bridge question into DDIA ch. 3.</p>
+    <nav class="lesson-nav">
+      <span>◀ (first Phase 0 lesson)</span>
+      <span>Next: <a href="p0-02-os-essentials.html">p0-02 · OS Essentials</a> ▶</span>
+    </nav>
+  </footer>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+renderQuiz(document.getElementById('quiz'), {
+  title: 'Check yourself',
+  questions: [
+    {
+      q: 'Your service stores sessions in a hash map. Inserts are amortized O(1), yet p99 insert latency spikes periodically. Why?',
+      options: [
+        'Random collisions slow down every insert equally',
+        'Occasional resizes rehash all keys at once',
+        'Memory allocators fragment the heap over time',
+      ],
+      answer: 1,
+      explain: 'Amortized O(1) hides rare O(n) resizes: when the load factor crosses its threshold, every key is rehashed, and one unlucky request pays the whole bill. Mean stays flat; the tail shows it.',
+    },
+    {
+      q: 'Why do databases build indexes with B-trees rather than hash indexes?',
+      options: [
+        'B-trees keep keys ordered, enabling efficient range scans',
+        'B-trees compress stored keys better than any hash',
+        'B-trees always store all keys entirely in memory',
+      ],
+      answer: 0,
+      explain: 'Sorted keys in wide page-sized nodes give both few-I/O point lookups AND range queries (BETWEEN, ORDER BY, prefix scans). Hash indexes only ever answer exact-match.',
+    },
+    {
+      q: "A Bloom filter reports 'key present'. What do you actually know?",
+      options: [
+        'The key is certainly stored in the set',
+        'The key was recently deleted from the set',
+        'The key is possibly present, maybe false positive',
+      ],
+      answer: 2,
+      explain: 'Bloom filters never produce false negatives, but all-k-bits-set can happen by collision — a false positive. "Present" means "go verify"; only "absent" is certain.',
+    },
+    {
+      q: 'You shard cache keys by hash(key) mod N. What happens when you add one server?',
+      options: [
+        'Only keys on the new server move elsewhere',
+        'Nearly all keys remap, causing mass cache misses',
+        'No keys move because hashing stays fully deterministic',
+      ],
+      answer: 1,
+      explain: 'Changing N changes the modulus, so ~N/(N+1) of keys land on a different server — a miss storm that hammers the database. Consistent hashing moves only ~1/(N+1).',
+    },
+    {
+      q: 'For a 100-item hot list scanned on every request, why might a plain array beat a tree?',
+      options: [
+        'Trees always use more memory than arrays do',
+        'Arrays reduce big-O complexity below tree structure levels',
+        'Sequential cache-friendly scans beat pointer chasing when small',
+      ],
+      answer: 2,
+      explain: 'Big-O ignores constants and the memory hierarchy. At small n, a contiguous scan rides the prefetcher while each tree level is a potential cache miss — measure before assuming.',
+    },
+  ],
+});
+</script>
+</body>
+</html>

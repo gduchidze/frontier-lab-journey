@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html lang="ka">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>გაკვეთილი 13 · ნაკადები და მოვლენები</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<div class="lesson">
+  <header class="lesson-header">
+    <p class="kicker">გაკვეთილი 0013 · ფაზა 2 — პროგრამული არქიტექტურა და საიმედოობა · <a href="0013-streams-and-events.html">English version</a></p>
+    <h1>ნაკადები და მოვლენები</h1>
+    <p class="dek">Log-ი როგორც system-of-record — Kafka-ს მოდელი, event-driven არქიტექტურა, event sourcing/CQRS, და რას ნიშნავს სინამდვილეში "exactly-once", როცა გადახდის email ზუსტად ერთხელ უნდა გავიდეს.</p>
+  </header>
+
+  <div class="mission-tie">
+    <strong>მისიასთან კავშირი.</strong> ყველა მასშტაბურ დიზაინის ამოცანაში ადრე თუ გვიან ჩნდება ისარი წარწერით "events" — <em>„როგორ იგებენ downstream სერვისები, რომ შეკვეთა გაიგზავნა?"</em> — და დამატებითი კითხვები ყოველთვის ერთი და იგივეა: <em>„რა ordering-ს (მიმდევრობას) იღებ სინამდვილეში?"</em> და <em>„რა ხდება, როცა consumer-ი batch-ის შუაში კვდება?"</em> ვინც ამბობს „Kafka-ზე დავდოთ", ჩერდება; ვინც ასახელებს partition key-ს, delivery semantics-ს და idempotency-ის გეგმას, აგრძელებს. ხერხემალი: <a href="https://dataintensive.net/">DDIA</a> თავი 11 და Jay Kreps-ის <a href="https://engineering.linkedin.com/distributed-systems/log-what-every-software-engineer-should-know-about-real-time-datas-unifying">"The Log"</a>.
+  </div>
+
+  <h2>1 · Message queue vs event log</h2>
+  <p>კლასიკური broker-ები (RabbitMQ, SQS) შეტყობინებას <em>დავალებად</em> თვლიან: ერთი consumer-ი იღებს, ack-ს აბრუნებს, broker-ი <strong>შლის</strong> (<a href="https://www.rabbitmq.com/docs/confirms">RabbitMQ: acknowledgements</a>). Kafka შეტყობინებას <em>ფაქტად</em> თვლის: უცვლელი ჩანაწერი <strong>შენახულ log-ში</strong>; consumer-ები უბრალოდ იმახსოვრებენ, სად მიაღწიეს (offset), და კითხვა არაფერს ანადგურებს (<a href="https://kafka.apache.org/documentation/#design">Kafka design docs</a>).</p>
+  <p>ეს ერთი განსხვავება — delete-on-ack vs retain-and-track — ყველაფერს ცვლის: შეკვეთების ნაკადს <em>მეორე</em> consumer-ს (ანალიტიკა) აბამ პირველის (fulfillment) ხელშეუხებლად; გასულ კვირას გამოსწორებულ bug-ში <strong>replay</strong> (თავიდან გატარება) უკეთებ; ახალ სერვისს ისტორიიდან ტვირთავ. Kreps-ის აზრი: LinkedIn-ის ათობით point-to-point მილსადენი (activity events → warehouse, → search, → recommendations) ფარულად ერთი და იგივე იყო — log shipping — და ერთ გამძლე, მოწესრიგებულ, replay-ად log-ს შეეძლო O(N²) ინტეგრაციების ჩანაცვლება. წესი ინტერვიუსთვის: queue, როცა სამუშაო უნდა მოხდეს <em>ერთხელ, მალე, ვინც თავისუფალია</em>; log, როცა ფაქტს <em>მრავალი აუდიტორია ჰყავს დროში</em>.</p>
+
+  <h2>2 · Kafka-ს მოდელი, ზუსტად</h2>
+  <table>
+    <tr><th>ცნება</th><th>რა არის</th><th>რას გაძლევს</th></tr>
+    <tr><td><strong>Topic</strong></td><td>მოვლენების დასახელებული კატეგორია (<code>orders</code>, <code>clicks</code>)</td><td>სახელთა სივრცე; per-topic retention და სქემა</td></tr>
+    <tr><td><strong>Partition</strong></td><td>append-only, სრულად მოწესრიგებული log; topic არის P ცალი მათგანი</td><td>ordering-ისა <em>და</em> პარალელიზმის ერთეული</td></tr>
+    <tr><td><strong>Offset</strong></td><td>consumer-ის პოზიცია ერთ partition-ში</td><td>იაფი გაგრძელება, გადახვევა, replay</td></tr>
+    <tr><td><strong>Consumer group</strong></td><td>consumer-ების ჯგუფი; თითო partition-ს ზუსტად ერთი წევრი ფლობს</td><td>ჰორიზონტალური სკალირება per-partition ordering-ის შენარჩუნებით</td></tr>
+  </table>
+  <p>Partition-ში მოვლენები სრულად მოწესრიგებულია; partition-ებს <em>შორის</em> — საერთოდ არა. Consumer-ი ან კვდება თუ ემატება — ჯგუფი <strong>rebalance</strong>-ს აკეთებს (partition-ების გადანაწილება). აქედან: ჯგუფში სასარგებლო consumer-ების მაქსიმუმი = partition-ების რაოდენობა. მე-9 consumer-ი 8-partition-იან topic-ზე არაფერს ფლობს და არაფერს აკეთებს (ლაბი ზუსტად ამას აჩვენებს).</p>
+  <p><strong>ნამუშევარი მაგალითი — არითმეტიკა, რომლის მოსმენაც ინტერვიუერს უნდა.</strong> Checkout clickstream: 200,000 event/s × ~1 KB = 200 MB/s. Partition-ი ~10 MB/s ჩაწერას უძლებს → broker-ის მხარეს ≥ 20 partition-ი სჭირდება. მაგრამ consumer-ი event-ს ამდიდრებს და store-ში ~2,500 event/s სიჩქარით წერს → 200,000 / 2,500 = 80 consumer-ი → და რაკი consumers ≤ partitions, საჭიროა ≥ 80 partition-ი. Partition-ების რაოდენობას, ჩვეულებრივ, consumer-ის მხარე კარნახობს და არა broker-ის. აიღე ~96 მარაგით და ხმამაღლა თქვი: მოგვიანებით repartitioning key-ების განლაგებას არევს — ამიტომ ახლავე იღებ მეტს.</p>
+
+  <h2>3 · Partition key წყვეტს, რას ნიშნავს „მოწესრიგებული"</h2>
+  <p>Producer-ი partition-ს <strong>key-ის hash-ით</strong> ირჩევს: ერთი key-ის ყველა event ერთ partition-ში ხვდება, გაგზავნის თანმიმდევრობით. ანუ Kafka-ს რეალური გარანტია <em>per key</em> ordering-ია, და key-ის არჩევა ordering-კონტრაქტის არჩევაა:</p>
+  <ul>
+    <li><strong><code>order_id</code>:</strong> ერთი შეკვეთის ყველა მოვლენა (created → paid → shipped) მოწესრიგებულია — ზუსტად ის, რაც შეკვეთების მილსადენს სჭირდება.</li>
+    <li><strong><code>user_id</code>:</strong> ერთი მომხმარებლის ქმედებები მოწესრიგებულია (fraud-წესებისთვის საჭირო) — მაგრამ ბოტი ან ცნობილი ანგარიში <strong>hot key</strong> ხდება და მისი partition-ი ჯგუფის ყველაზე ნელი ზოლი. იგივე celebrity პრობლემა, რაც sharding-სა და cache-ში — მესამედ ამ კურსში.</li>
+    <li><strong>შემთხვევითი / უkey-ო:</strong> იდეალურად თანაბარი partition-ები, მაქსიმალური throughput, ნულოვანი ordering. კარგია დამოუკიდებელი ფაქტებისთვის; კატასტროფაა ყველაფრისთვის, რასაც state აქვს.</li>
+  </ul>
+  <p>ლაბში zipf(1.1) key-ებზე ყველაზე ცხელი key ტრაფიკის <strong>15.9%-ს</strong> ატარებს და ერთი partition-ი მოვლენების 23%-ზეა (1.87× სამართლიანი წილისა) — და მარტო ეს partition-ი ზღუდავს მთელი ჯგუფის დასრულების დროს.</p>
+
+  <h2>4 · Delivery semantics: საიდან მოდიან დუბლიკატები</h2>
+  <table>
+    <tr><th>გარანტია</th><th>მექანიზმი</th><th>ჩავარდნის ფასი</th><th>როდის</th></tr>
+    <tr><td><strong>At-most-once</strong></td><td>offset-ის commit <em>დამუშავებამდე</em></td><td>Crash batch-ის შუაში → მოვლენები ჩუმად იკარგება</td><td>მეტრიკები, ტელემეტრია</td></tr>
+    <tr><td><strong>At-least-once</strong></td><td>offset-ის commit <em>დამუშავების შემდეგ</em></td><td>Crash commit-მდე → batch-ი თავიდან მოდის, ორჯერ მუშავდება</td><td>ნაგულისხმევი + idempotent consumer</td></tr>
+    <tr><td><strong>Exactly-once</strong></td><td>idempotent producer + ტრანზაქციები (Kafka-ს შიგნით)</td><td>სირთულე; <em>არ</em> ფარავს გარე ეფექტებს</td><td>Kafka Streams მილსადენები</td></tr>
+  </table>
+  <p>დუბლიკატები ორი კარიდან შემოდიან. <strong>Producer:</strong> გაგზავნა timeout-დება, producer-ი იმეორებს, მაგრამ პირველი ცდა რეალურად ჩაჯდა — log-ში event ორჯერაა. Kafka-ს <em>idempotent producer</em> ამ კარს sequence-ნომრებით კეტავს (<a href="https://kafka.apache.org/documentation/#semantics">Kafka docs §4.6</a>). <strong>Consumer:</strong> consumer-ი ამუშავებს, კვდება <em>offset-ის commit-მდე</em>, rebalance — და ახალი მფლობელი ბოლო commit-იდან კითხულობს: ყველაფერი მას შემდეგ თავიდან მოდის. ლაბში ეს სცენარი ~148 დუბლიკატს იძლევა commit-after-batch-ით, ან ~258 <em>დაკარგულ</em> event-ს commit-before-თი.</p>
+  <p>„Exactly-once"-ის გულახდილი ვერსია: Kafka-ს ტრანზაქციები ატომურს ხდის <em>read-process-write-ს Kafka-ს შიგნით</em> (<a href="https://www.confluent.io/blog/exactly-once-semantics-are-possible-heres-how-apache-kafka-does-it/">Confluent: exactly-once semantics</a>). ისინი <strong>ვერ</strong> ფარავენ email-ს, Postgres-ის სტრიქონს, ბარათის ჩამოჭრას. გარე ეფექტებისთვის რეალური მექანიზმია <strong>at-least-once + idempotent დამუშავება</strong>: უნიკალური event ID და consumer-ის ეფექტი, რომელიც მეორე მიწოდებაზე no-op-ია (<code>INSERT … ON CONFLICT DO NOTHING</code> event ID-ზე). Exactly-once მიწოდების გარანტია კი არა, შენ მიერ აგებული end-to-end თვისებაა.</p>
+
+  <h2>5 · Retention და compaction: მეხსიერების ორი ფორმა</h2>
+  <p><strong>დროითი/ზომითი retention</strong> ყველაფერს N დღე ინახავს და ძველიდან შლის — log-ი როგორც შემოსაზღვრული ისტორია. <strong>Log compaction (შემჭიდროება)</strong> სამუდამოდ ინახავს <em>თითო key-ის უახლეს ჩანაწერს</em> და გადაწერილ წინამორბედებს შლის (<a href="https://kafka.apache.org/documentation/#compaction">Kafka docs: compaction</a>). შემჭიდროებული topic-ი <strong>changelog-ია</strong>: replay და მიმდინარე state ზუსტად აღდგება — ლაბი იდენტურ state-ს 1,766 ჩანაწერიდან აშენებს 30,000-ის ნაცვლად, 17× ნაკლები replay.</p>
+  <p>ესაა <strong>CDC-ის (change data capture)</strong> საფუძველი: <a href="https://debezium.io/">Debezium</a> database-ის replication log-ს ადევნებს თვალს და ყოველ ცვლილებას topic-ზე აქვეყნებს — DB ნაკადი ხდება, cache-ები და ინდექსები კი replay-თი აღდგენადი consumer-ები. ერთი წინასწარი შენიშვნა: DB-ში ჩაწერა <em>და</em> event-ის გამოქვეყნება ორ ცალკე მოქმედებად შეიძლება ნახევრად ჩავარდეს; <strong>transactional outbox</strong> ამას იმავე ტრანზაქციაში ჩაწერით და CDC-თი გამოქვეყნებით ასწორებს. სრული განხილვა — შემდეგ გაკვეთილში.</p>
+
+  <h2>6 · Event-driven არქიტექტურა, event sourcing და CQRS</h2>
+  <p>ორი სტილი (<a href="https://martinfowler.com/articles/201701-event-driven.html">Fowler: Event-Driven</a>): <strong>choreography</strong> — order-service აქვეყნებს <code>OrderPlaced</code>-ს; inventory, payment, email თითოეული თავად რეაგირებს; კოორდინატორი არ არსებობს — და <strong>orchestration</strong> — კოორდინატორი ყოველ ნაბიჯს პირდაპირ მართავს. Choreography ავტონომიასა და ჩავარდნების იზოლაციას იძლევა; ფასი ისაა, რომ <em>შეკვეთის მიმდინარე state-ზე ვერავინ მიუთითებს</em> — სიმართლე ხუთი consumer-ის offset-ებზეა გადაფენილი და debugging არქეოლოგია ხდება. ორივე შემთხვევაში <strong>event-ები კონტრაქტებია</strong>: სქემის registry (<a href="https://docs.confluent.io/platform/current/schema-registry/index.html">schema registry</a>), მხოლოდ backward-compatible ცვლილებები — event-სქემა საჯარო API-ა, რომლის გამომწერებსაც ვერ ჩამოთვლი.</p>
+  <p><strong>Event sourcing</strong> log-ს system-of-record-ად აქცევს: state-ის ნაცვლად („ბალანსი = $90") ინახავ მოვლენათა მიმდევრობას („გახსნა, შეიტანა 100, გაიტანა 10") და state-ს მათზე fold-ით იღებ (<a href="https://martinfowler.com/eaaDev/EventSourcing.html">Fowler: Event Sourcing</a>). გადახდების ledger-ი კანონიკური მაგალითია — ბუღალტრები append-only ჟურნალებს ხუთი საუკუნეა იყენებენ. <strong>CQRS</strong>: ჩაწერები event-ებს ამატებენ; კითხვები <strong>projection-ებს</strong> (მატერიალიზებულ view-ებს) ხვდებიან, რომლებიც ნაკადის fold-ით შენდება და replay-თი თავიდან აშენებადია (<a href="https://martinfowler.com/bliki/CQRS.html">Fowler: CQRS</a>). როდისაა ზედმეტი? ჩვეულებრივ CRUD-ს არ სჭირდება: იხდი eventual consistency-ს, უცვლელი ისტორიის სქემა-ვერსიონირებას და replay-ის დროებს. გამოიყენე იქ, სადაც ისტორია <em>თავად ღირებულებაა</em> — ledger-ები, შეკვეთები, მარაგის მოძრაობა.</p>
+
+  <h2>7 · Lag და failure mode-ები, რომლებიც ინტერვიუებს წყვეტენ</h2>
+  <p><strong>Consumer lag</strong> (ჩამორჩენა) — ბოლო დაწერილი offset მინუს ბოლო commit-ებული, per partition — event-მილსადენის ერთადერთი ჯანმრთელობის მეტრიკაა. Latency კარგად გამოიყურება, სანამ lag ჩუმად იზრდება; LinkedIn-მა <a href="https://github.com/linkedin/Burrow">Burrow</a> სწორედ lag-ის <em>ტრენდის</em> შესაფასებლად ააგო. Alert-ი lag-ის ზრდაზე და დროში გადათარგმნილ lag-ზე („consumer-ი 40 წუთითაა ჩამორჩენილი").</p>
+  <ul>
+    <li><strong>Rebalance-ის შტორმები.</strong> ნელი consumer-ი heartbeat-ს აცდენს → ჯგუფიდან აგდებენ → rebalance მთელ ჯგუფს აჩერებს → სხვებიც ჩამორჩებიან → კიდევ აგდებენ. შველა: გონივრული <code>max.poll.interval</code>, cooperative rebalancing, static membership.</li>
+    <li><strong>Lag-ის სასიკვდილო სპირალი, ციფრებით.</strong> სიმძლავრე 220k event/s, შემოდის 200k/s → მარაგი 20k/s. ერთსაათიანი წყვეტა 720M event-ს აგროვებს; 20k/s მარაგით დაწევას სჭირდება 720M / 20k = 36,000 წმ = <strong>10 საათი</strong>. 24-საათიანი retention-ით კიდევ ერთი ინციდენტი — და log-ი წაუკითხავ event-ებს შლის. მარაგი ფუფუნება კი არა, აღდგენის დროის ბიუჯეტია.</li>
+    <li><strong>სქემის მსხვრევა ნაკადის შუაში.</strong> Producer-მა ველს სახელი გადაარქვა — ყველა consumer-ი ყველა event-ზე exception-ს ისვრის: ფლოტური poison pill. ამიტომ თავსებადობის შემოწმება CI-შია, registry-ით.</li>
+    <li><strong>დუბლიკატის fan-out.</strong> §4-ის redelivery არა-idempotent email-consumer-ს წვდება: მომხმარებელი გადახდის ორ დადასტურებას იღებს; არა-idempotent ledger-consumer-ი გადასახადს ორჯერ წერს. ერთი მიზეზი, სრულიად სხვადასხვა აფეთქების რადიუსი — idempotency-ის ძალისხმევა რადიუსს გაჰყევი.</li>
+    <li><strong>Poison pill.</strong> ერთი დაუმუშავებელი event — და partition-ი (და მასში ყველა key) მის უკან სამუდამოდ იჭედება. გამოსავალი: N ცდის შემდეგ <strong>DLQ (dead-letter queue)</strong> და წინსვლა, იმ key-ის ordering-ის დროებით გატეხვის ფასად (<a href="https://www.uber.com/blog/reliable-reprocessing/">Uber: reliable reprocessing</a>).</li>
+    <li><strong>Compaction-მა ისტორია შეჭამა.</strong> ვიღაცამ compaction ჩართო topic-ზე, რომლის სრული ისტორიაც ანალიტიკას მერე დასჭირდა — ყველა შუალედური state უბრუნებლად წაშლილია, დიზაინით. Compaction state-ს ინახავს და არა ისტორიას; topic-ზე გააზრებულად აირჩიე.</li>
+  </ul>
+
+  <div class="callout"><span class="label">LLM შტრიხი</span>
+    Inference-პლატფორმის usage-მილსადენი ეს გაკვეთილია სიტყვასიტყვით: ყოველი მოთხოვნა usage event-ს აგდებს log-ზე (tenant, model, tokens, latency); billing-ი, eval-ი და abuse-detection დამოუკიდებელი consumer group-ებია ერთსა და იმავე topic-ზე; partitioning <code>tenant_id</code>-ით per-tenant ordering-ს იძლევა hot-tenant რისკით, რომელსაც უკვე სახელით იცნობ; და replay მთავარი იარაღია — უკეთესი ქულების მოდელი გამოუშვი, eval-consumer-ი გადაახვიე, გასული თვის ტრაფიკი თავიდან შეაფასე serving-ის ხელშეუხებლად. Billing = payments-ledger შემთხვევა: at-least-once + idempotency event ID-ზე, რადგან tenant-ის ორჯერ დარიცხვა email-twice ჩავარდნაა ინვოისით.
+  </div>
+
+  <h2>8 · ლაბი — გაუშვი partitioned log შენი ხელით</h2>
+  <div class="callout"><span class="label">პრაქტიკა (ქვიზამდე გააკეთე)</span>
+    ყველაფერი ზემოთქმული ახლა დათვლადია: <code>labs/lab-0013-mini-kafka/</code>-ში
+    <code>python3 mini_kafka_lab.py</code> უშვებს სამ ექსპერიმენტს — 50k zipf-key-იანი event 8
+    partition-ზე (ნული per-key ordering-დარღვევა, ~24k გლობალური ინვერსია, ერთი partition-ი
+    სამართლიანი წილის 1.87×-ზე), consumer-ჯგუფის sweep, სადაც აჩქარება partition-ების
+    რაოდენობაზე მკვდრად ჩერდება და შუა-რბენის crash ~148 დუბლიკატს (commit-after) ან ~258
+    დანაკარგს (commit-before) იძლევა, და 17×-ად შემჭიდროებული changelog, რომელიც იდენტურ
+    state-ს აშენებს. შემდეგ README-ს E1–E4: <em>იწინასწარმეტყველე, შეცვალე კონფიგი, გაუშვი
+    თავიდან, შეადარე.</em> მცდარი პროგნოზები არის დავალების შედეგი.
+  </div>
+
+  <h2>9 · პროექტის ნაბიჯი</h2>
+  <p>დააპროექტე <strong>usage-metering event-ნაკადი</strong> LLM inference-პლატფორმისთვის: დაასახელე topic-ი, partition key და delivery semantics და ორი წინადადებით დაიცავი. დასაცავი მაგალითი: <em>topic <code>usage-events</code>, key <code>tenant_id</code> (per-tenant ordering billing-ის სისწორისთვის, hot-tenant skew მიღებული და მონიტორინგზე აყვანილი), at-least-once მიწოდება billing-consumer-ით, რომელიც idempotent-ია უნიკალურ <code>request_id</code>-ზე — რადგან დაკარგული usage event შემოსავლის გაჟონვაა, დუბლირებული კი გაბრაზებული მომხმარებელი, და idempotency ერთადერთი გამოსავალია, რომელიც ორივეს უძლებს.</em> დაწერე შენი ორი წინადადება — key + semantics + რატომ — და მოიტანე შემდეგ სესიაზე.</p>
+
+  <h2>შეამოწმე შენი თავი</h2>
+  <div class="quiz" id="quiz"></div>
+
+  <h2>ძირითადი წყარო</h2>
+  <p>წაიკითხე <strong>DDIA თავი 11 — Stream Processing</strong> (<a href="https://dataintensive.net/">dataintensive.net</a>): messaging vs log-ები, CDC, event sourcing — ყველაფერი ერთ თავში. დაუმატე Jay Kreps-ის <a href="https://engineering.linkedin.com/distributed-systems/log-what-every-software-engineer-should-know-about-real-time-datas-unifying">"The Log"</a> — LinkedIn-ის ესსე, რომელმაც log-ი ინფრასტრუქტურის ცენტრალურ აბსტრაქციად გადააზრებინა სამყაროს, და Kafka-ს საუკეთესო მოტივაციაა დღემდე. მექანიკისთვის — <a href="https://kafka.apache.org/documentation/#design">Kafka design docs</a> (განსაკუთრებით §4.6 delivery semantics).</p>
+
+  <footer class="lesson-footer">
+    <p><strong>გაიჭედე ან გაინტერესებს?</strong> ჰკითხე მასწავლებელს (აგენტს) ნებისმიერი რამ — „თუ ტრანზაქციები Kafka-ს შიგნით exactly-once-ს იძლევა, რატომღა მჭირდება idempotency key ჩემს database-ში?" შესანიშნავი დამატებითი კითხვაა.</p>
+    <nav class="lesson-nav">
+      <span><a href="0012-storage-engine-internals.ka.html">◀ წინა: 0012 · Storage Engine-ის შიდა მექანიკა</a></span>
+      <span><a href="0014-distributed-transactions.ka.html">შემდეგი: 0014 · განაწილებული ტრანზაქციები და კოორდინაცია ▶</a></span>
+    </nav>
+  </footer>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+renderQuiz(document.getElementById('quiz'), {
+  title: 'შეამოწმე შენი თავი',
+  questions: [
+    {
+      q: 'გუნდმა შეკვეთების მილსადენში RabbitMQ Kafka-თი ჩაანაცვლა. რა ახალ შესაძლებლობას მატებს თავად შენახული log-ი?',
+      options: [
+        'შეტყობინებები consumer-ის ack-ისთანავე მაშინვე სამუდამოდ იშლება',
+        'Consumer-ებს შეუძლიათ ისტორიის replay ნებისმიერი offset-იდან',
+        'Producer-ებს retry აღარ სჭირდებათ, მიწოდება გარანტირებულია',
+      ],
+      answer: 1,
+      explain: 'Retention სწორედ ამის შესახებაა: log-ი event-ებს წაკითხვის შემდეგაც ინახავს, ამიტომ ახალი consumer-ები ისტორიიდან იტვირთებიან და გატეხილები უკან იხვევენ და თავიდან ამუშავებენ. Delete-on-ack RabbitMQ-ს მოდელია; producer-ები კვლავ იმეორებენ (ეს დუბლიკატების ერთი წყაროა).',
+    },
+    {
+      q: 'Order-events topic-ს 12 partition-ი აქვს, key არის order_id. რა ordering-ს იძლევა Kafka სინამდვილეში?',
+      options: [
+        'სრული ordering ყველა partition-ზე მთელი topic-ის მასშტაბით',
+        'არანაირი ordering არსად, სანამ ტრანზაქციები არაა ჩართული',
+        'Ordering მხოლოდ თითოეული ცალკეული partition-ის შიგნით ინდივიდუალურად',
+      ],
+      answer: 2,
+      explain: 'Partition-ი სრულად მოწესრიგებული log-ია; topic-ი უბრალოდ P ცალი მათგანია გვერდიგვერდ. order_id key ერთი შეკვეთის event-ებს ერთ partition-ში აგზავნის, ამიტომ შეკვეთის ციკლი მოწესრიგებულია — სხვადასხვა შეკვეთა კი თავისუფლად ერევა. ტრანზაქციებს ordering-თან კავშირი არ აქვთ.',
+    },
+    {
+      q: 'Consumer-ი გადახდის event-ს ამუშავებს და offset-ის commit-მდე კვდება. რა ხდება rebalance-ის შემდეგ?',
+      options: [
+        'Event-ი თავიდან მოდის და მეორედაც მუშავდება',
+        'Event-ი იკარგება და აღარასდროს დამუშავდება საერთოდ',
+        'Broker-ი მას შეტყობინების იდენტიფიკატორებით თავად ადუბლიკატებს',
+      ],
+      answer: 0,
+      explain: 'ახალი მფლობელი ბოლო commit-ებული offset-იდან აგრძელებს, რომელიც დამუშავებულ-მაგრამ-არ-commit-ებულ event-ზე ადრეა — ამიტომ ის თავიდან მიეწოდება. ეს at-least-once სემანტიკაა და ზუსტად ამიტომ უნდა იყოს მნიშვნელოვანი რამის consumer-ი idempotent. Broker-ი redelivery-ს არ ადუბლიკატებს.',
+    },
+    {
+      q: 'Event-ები email-სერვისზეც ნაწილდება. რა იცავს რეალურად მომხმარებელს გადახდის დუბლირებული დადასტურების წერილებისგან?',
+      options: [
+        'Kafka-ს ტრანზაქციები, რომლებიც ყველა გარე ეფექტს ფარავენ',
+        'Consumer-ის idempotency, აწყობილი უნიკალურ event იდენტიფიკატორზე',
+        'Producer-ის retry-ების გამორთვა მთელი მილსადენის მასშტაბით',
+      ],
+      answer: 1,
+      explain: 'Kafka-ს ტრანზაქციები read-process-write-ს მხოლოდ Kafka-ს შიგნით ხდის ატომურს — გაგზავნილ email-ს ვერ გააუქმებენ. რეალური გამოსავალია at-least-once + idempotent consumer: „უკვე გავგზავნე გადახდა 4711-ისთვის?" შემოწმებული უნიკალურ ID-ზე. Retry-ების გამორთვა დუბლიკატებს დანაკარგებში ცვლის.',
+    },
+    {
+      q: 'ახალმა consumer-მა მიმდინარე per-key state უნდა ააშენოს თვეების ისტორიის replay-ის გარეშე. რომელი კონფიგურაცია ემსახურება ამას?',
+      options: [
+        'დროითი retention, რომელიც ყველაფრის შვიდ დღეს ინახავს',
+        'ზომითი retention, შემოფარგლული ასი გიგაბაიტის ლიმიტით',
+        'Log compaction, რომელიც თითო key-ის უახლეს ჩანაწერს ინახავს',
+      ],
+      answer: 2,
+      explain: 'შემჭიდროებული topic-ი changelog-ია: სამუდამოდ ინახავს key-ის უახლეს ჩანაწერს და გადაწერილებს შლის, ამიტომ მისი replay ზუსტად მიმდინარე state-ს აღადგენს — ლაბში 1,766 ჩანაწერი 30,000-ის ნაცვლად. დროითი და ზომითი retention ნედლი ისტორიის ფანჯარას ინახავს, რომელიც უფრო დიდია და შეიძლება არასრულიც.',
+    },
+    {
+      q: 'Consumer group-ში 8 consumer-ია, topic-ს კი 4 partition-ი აქვს. რა throughput-ს მატებენ მეხუთე-მერვე consumer-ები?',
+      options: [
+        'არაფერს, რადგან ოთხი ზედმეტი consumer-ი უქმად ზის',
+        'ორმაგდება, რადგან სამუშაო რვავეზე თანაბრად გადანაწილდება',
+        'ნახევრდება, რადგან rebalancing-ის ხარჯი მთელ ჯგუფს ახრჩობს',
+      ],
+      answer: 0,
+      explain: 'თითო partition-ს ჯგუფის ზუსტად ერთი წევრი ფლობს, ამიტომ მაქსიმუმ 4 consumer-ი მუშაობს; დანარჩენი 4 არაფერს ფლობს (გამოსადეგია მხოლოდ ცხელ სათადარიგოდ). Partition-ების რაოდენობა პარალელიზმის ჭერია, რომელსაც დიზაინის დროს აფიქსირებ.',
+    },
+  ],
+});
+</script>
+</body>
+</html>

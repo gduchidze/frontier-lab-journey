@@ -1,0 +1,208 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lesson 20 · News Feed: Fanout &amp; the Celebrity Problem</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<div class="lesson">
+  <header class="lesson-header">
+    <p class="kicker">Lesson 0020 · Phase 3 — Classic Design Reps · <a href="0020-news-feed.ka.html">ქართული ვერსია</a></p>
+    <h1>Twitter Timeline / News Feed</h1>
+    <p class="dek">Every follower relationship is a promise to deliver. Fanout is where you decide <em>when</em> to keep that promise — at write time, at read time, or a threshold-driven mix of both.</p>
+  </header>
+
+  <div class="mission-tie">
+    <strong>Mission tie.</strong> The news feed is <em>the</em> canonical read-vs-write amplification trade-off: precompute on write and you multiply writes by follower count; compute on read and you multiply reads by followee count. Every cache/queue/shard tool from Phase 1 gets spent here on one question — where does the multiplication happen? The celebrity problem — one hot key whose fanout starves everyone else — is the same skew you will later fight as hot-tenant scheduling in LLM-serving gateways.
+  </div>
+
+  <div class="callout"><span class="label">Rep protocol (do this FIRST)</span>
+    Before reading further: run a <strong>40-minute solo timed design, out loud</strong>, on the prompt "design the Twitter home timeline" using the lesson-0009 four-step framework (clarify → estimate → high-level → deep dive). Only then read this lesson and log the deltas — what you missed, what you over-built — as a learning record. Reading first turns a rep into a memory test.
+  </div>
+
+  <h2>1 · The prompt, and what it actually tests</h2>
+  <p><em>"Design the Twitter home timeline"</em> (equivalently: news feed, Instagram home, LinkedIn feed). The interviewer is testing four things: (1) do you discover the read-heavy ratio and <em>spend</em> it on precomputation; (2) do you see that fanout-on-write is a deliberate choice to move cost from the read path to the write path, not a free lunch; (3) do you find the celebrity problem yourself — ideally in your own Step-2 arithmetic — and reach the hybrid; (4) do you treat feed staleness as an SLO with a monitorable symptom (queue lag), not an afterthought. A candidate who names "fanout" but cannot do the write-amplification math is pattern-matching; the math is the rep.</p>
+
+  <h2>2 · Clarify (5–8 min): buy the right feed</h2>
+  <table>
+    <tr><th>Requirement</th><th>Type</th><th>Contract</th></tr>
+    <tr><td>Post a tweet (text ≤ 280 chars; media = a URL to blob storage)</td><td>Functional</td><td>Accepted &amp; durable on 201</td></tr>
+    <tr><td>Follow / unfollow a user</td><td>Functional</td><td>Effective for future posts within seconds</td></tr>
+    <tr><td>Home timeline: recent posts from all followees, newest-first, paginated</td><td>Functional</td><td>~20 posts per page</td></tr>
+    <tr><td>Feed read latency</td><td>Non-functional</td><td>p99 &lt; 200 ms</td></tr>
+    <tr><td><strong>Feed freshness SLO</strong></td><td>Non-functional</td><td>Post visible to followers p95 &lt; 60 s</td></tr>
+    <tr><td>Availability / consistency</td><td>Non-functional</td><td>99.9%; eventual consistency fine — a feed 30 s stale is acceptable, a lost post is not</td></tr>
+  </table>
+  <p><strong>Out of scope</strong> (say it, write it): search, DMs, media processing, ads and ranking models (a twist returns to both in §10), moderation, auth. The freshness SLO is the load-bearing clarification — it is the number that will later disqualify pure push for celebrities.</p>
+
+  <h2>3 · Estimate (~5 min): numbers you will spend</h2>
+<pre><code>Writes:  100M posts/day ÷ ~100k s/day ≈ 1.2k posts/s avg, ×3 peak ≈ 3.5k/s
+Reads:   200M DAU × 10 feed opens/day = 2B reads/day ≈ 23k QPS avg, ×3 ≈ 70k peak
+Ratio:   2B ÷ 100M = 20:1 request-level (each read renders ~20 posts → ~400:1 item-level)
+Fanout:  100M posts × 200 avg followers = 20B feed inserts/day
+         ≈ 230k inserts/s avg, ×3 ≈ 700k inserts/s peak  ← 200× write amplification
+Celebrity: 1 post × 50M followers = 50M inserts ≈ 217 s of the ENTIRE avg fanout capacity
+Storage: 100M posts/day × 1 KB ≈ 100 GB/day ≈ 36 TB/year (text only)</code></pre>
+  <p>Spend every number: <strong>70k read QPS at p99 &lt; 200 ms</strong> → reads must be precomputed list lookups, not queries — a feed cache. <strong>200× write amplification</strong> → fanout must be asynchronous, behind a queue, horizontally scaled workers; never inline with <code>POST /posts</code>. <strong>50M inserts ≈ 217 s of the whole cluster</strong> vs a 60 s freshness SLO → pure fanout-on-write is arithmetically disqualified; hybrid required (§6). <strong>36 TB/year</strong> → shard the posts store; time-sortable Snowflake IDs from lesson 0019 become the sort key for free (§8).</p>
+
+  <h2>4 · High-level design (~15 min): boxes, API, data model</h2>
+<pre><code>POST /posts                        {text}              → 201 {post_id}
+POST /users/{id}/follow            {followee_id}
+GET  /feed?cursor={max_id}&amp;limit=20                   → newest-first page
+GET  /users/{id}/posts                                 → user (profile) timeline</code></pre>
+  <p><strong>Data model.</strong> <code>posts(post_id SNOWFLAKE PK, author_id, text, created_at)</code>, sharded by post_id. <code>follows(follower_id, followee_id)</code> with <em>two</em> indexes: by followee_id (fanout asks "who follows this author?") and by follower_id (read path asks "whom do I follow?"). <strong>Feed cache:</strong> one Redis list per user, <code>feed:{user_id}</code>, holding post IDs only, capped at ~800 entries.</p>
+  <p><strong>Write path:</strong> client → LB → post service → (a) append to posts store, (b) enqueue a fanout job. Fanout workers pull the job, fetch the author's follower list, and push the post_id onto each follower's Redis list. <strong>Read path:</strong> feed service reads the user's Redis list, hydrates IDs from a post cache (fall through to DB), merges in celebrity posts at read time (§6), optionally ranks (§8), returns a page. Narrate the trade-off as you draw: the queue buys a fast, durable <code>POST</code> at the price of bounded staleness — which the 60 s SLO explicitly permits.</p>
+
+  <h2>5 · Deep dive: fanout-on-write vs fanout-on-read</h2>
+  <table>
+    <tr><th>Dimension</th><th>Fanout-on-write (push)</th><th>Fanout-on-read (pull)</th></tr>
+    <tr><td>Write amplification</td><td class="num">200× avg — one insert per follower</td><td class="num">1× — store the post once</td></tr>
+    <tr><td>Read latency</td><td>O(1): one list fetch + hydrate</td><td>k-way merge over ~200 followee timelines, every read</td></tr>
+    <tr><td>Storage</td><td>Duplicated post IDs — terabytes of feed cache (§7)</td><td>Nothing beyond per-author timelines</td></tr>
+    <tr><td>Staleness</td><td>Bounded by queue drain — seconds normally, minutes under lag</td><td>Zero — always current at read time</td></tr>
+    <tr><td>Inactive-user waste</td><td>Full fanout work for the ~75% who won't log in this week</td><td>Zero work for dormant users</td></tr>
+    <tr><td>Fits</td><td>Normal accounts in a 20:1 read-heavy system</td><td>Celebrities, dormant users, very-low-read systems</td></tr>
+  </table>
+  <p>The ratio decides the default: at 20:1 request-level (and ~400:1 item-level), paying 200× once per post to make 70k QPS of reads O(1) is a good trade — <em>except</em> where follower count makes "once per post" explode. That exception is the next section, and finding it yourself is the senior signal.</p>
+
+  <h2>6 · Deep dive: the celebrity problem and the hybrid</h2>
+  <p>Do the arithmetic for one Lady-Gaga-class post, 50M followers. At 10k inserts/s per worker, that is 5,000 worker-seconds — 100 workers grinding ~50 s on <em>one post</em>. Cluster-wide at 700k inserts/s peak capacity it still monopolizes everything for ~71 s — while every normal post queues behind it (head-of-line blocking) and the 60 s freshness SLO burns for the whole site. Worse, those 50M inserts are near-random writes sprayed across every feed-cache shard simultaneously. A handful of accounts can generate more fanout load than the other 200M combined. Pure push does not degrade gracefully under skew — it fails at its heaviest key.</p>
+  <p><strong>The hybrid:</strong> pick a follower-count threshold (set it where fanout time for one post ≈ your freshness SLO). Below it, push as normal. Above it, <em>don't fan out at all</em>: the celebrity's post stays only on their author timeline. The read path becomes: fetch the user's precomputed list, <em>plus</em> the recent author timelines of the few celebrities they follow (usually &lt; 10), and k-way merge by ID. The cost moves to reads — but a celebrity's author timeline is the hottest, most cacheable data in the system: one cached copy serves millions of merges. Dormant users get the same treatment for the opposite reason: no push for accounts unlikely to read (§7 eviction), rebuild by pull when they return.</p>
+
+  <h2>7 · Deep dive: feed cache internals</h2>
+  <p>Per user: <code>LPUSH feed:{uid} post_id</code> then <code>LTRIM feed:{uid} 0 799</code> — an O(1) capped insert. (A sorted set keyed by Snowflake ID adds dedup and range queries at higher memory cost; the list is the cheap default.) 800 entries ≈ 40 pages of scroll — beyond realistic depth; deeper history is rebuildable from the posts store, so the cap is safe.</p>
+<pre><code>IDs alone:  200M users × 800 entries × 8 B (Snowflake) ≈ 1.28 TB
+Redis overhead (list nodes, pointers, key space): ×3–5 → ~4–6 TB
+→ a sharded cluster of dozens–hundreds of nodes … unless you evict</code></pre>
+  <p><strong>Eviction is a design decision, not an ops detail.</strong> Only materialize feeds for recently active users (LRU / ~30-day TTL). If ~25% of users are weekly-active, resident feeds drop to ~50M → ~320 GB of IDs (~1–1.5 TB real) — from "hundreds of nodes" to "a modest cluster". A returning user's first read misses, falls back to fanout-on-read to rebuild the list, then resumes push. This is exactly the inactive-user-waste row of §5's table turned into architecture: don't push to people who don't read.</p>
+
+  <h2>8 · Deep dive: ordering, ranking, pagination</h2>
+  <p><strong>Ordering.</strong> Snowflake IDs (lesson 0019) are time-sortable, so "merge by time" is "merge by ID" — no timestamp joins. The read path's k-way merge (own list + celebrity timelines) is a heap-merge over sorted-by-ID lists: cheap, and identical in shape to the merge every LSM-tree and search engine does.</p>
+  <p><strong>Pagination.</strong> Cursor, not offset: the client passes the smallest post_id it has seen (<code>max_id</code>), the server returns the next 20 older items. Offsets break in a feed because new posts arrive continuously — page 2 by offset shifts under the reader and shows duplicates. The cursor is stable because IDs only grow.</p>
+  <p><strong>Ranking.</strong> The ranking service is an <em>insertion point</em>, not a redesign: fetch ~800 chronological candidates exactly as above, score them (recency, author affinity, engagement), rerank, return. Candidates-then-rank keeps the storage layer chronological and makes "Latest" mode a one-flag fallback — which is also your degraded mode when the ranker is down.</p>
+
+  <h2>9 · Failure modes &amp; monitoring</h2>
+  <table>
+    <tr><th>Failure</th><th>Symptom</th><th>Mitigation</th></tr>
+    <tr><td>Fanout queue lag grows</td><td><strong>Feeds go silently stale</strong> — no errors anywhere; posts vanish for followers until the queue drains</td><td>Alert on queue age, not depth; end-to-end freshness probe (synthetic post → time-to-visible); autoscale workers</td></tr>
+    <tr><td>Feed-cache shard dies</td><td>Affected users' feeds empty; mass rebuild-by-pull stampede</td><td>Replica per shard; coalesce rebuilds (one flight per user); jittered backoff (lesson 0008)</td></tr>
+    <tr><td>Thundering herd on login after an outage</td><td>Cold caches × login spike → pull-path overload on the posts store</td><td>Serve degraded feed (sample of followees), request coalescing, gradual cache warm-up</td></tr>
+    <tr><td>Hot partition: celebrity's follower list &amp; post row</td><td>One shard saturates during fanout; hot reads on one key</td><td>Chunk fanout jobs by follower-ID range; cache follower lists; replicate hot post rows</td></tr>
+  </table>
+  <p>Dashboard: fanout queue age &amp; insert rate, feed read p99, freshness-probe latency, Redis memory/evictions per shard. The metric that pages a human is the <em>freshness probe</em> — queue lag is its leading indicator.</p>
+
+  <h2>10 · Variants &amp; twists</h2>
+  <ul>
+    <li><strong>Ads / injected content.</strong> Never fan out ads — targeting is per-viewer, so injection belongs at read/rank time, budgeted per page. Same slot mechanism serves "suggested posts".</li>
+    <li><strong>Notify vs pull-to-refresh.</strong> Instead of pushing content, push a cheap counter ("12 new posts") and deliver content on the user's explicit refresh — halves effective fanout for lurkers and turns delivery into demand-driven work.</li>
+    <li><strong>Multi-datacenter.</strong> Home-region the user: feed cache lives near the reader; posts replicate globally; fanout runs per region into local caches (write amplification × #regions) — versus single-home, which is cheaper but adds cross-region latency for travelers. The freshness SLO now includes replication lag.</li>
+  </ul>
+  <p><strong>AI corner.</strong> An LLM gateway with one hot tenant is this exact lesson wearing GPUs: a whale's burst can head-of-line-block the shared batch queue for everyone, and the medicine is identical — per-tenant queues, a threshold that reclassifies whales, and special-cased scheduling for them instead of pretending all keys are equal.</p>
+
+  <h2>11 · Interview talking points</h2>
+  <ul>
+    <li><em>Spending the ratio:</em> "20:1 reads and a 60-second freshness budget — that pair is why I precompute feeds on write instead of querying on read."</li>
+    <li><em>Finding the dragon yourself:</em> "Before you ask: 50M followers × 1 post is 50M inserts — about 217 seconds of my entire fanout capacity, versus a 60-second SLO. Pure push is arithmetically dead; here's the hybrid."</li>
+    <li><em>Threshold justification:</em> "The celebrity cutoff isn't folklore — it's where fanout time for one post crosses the freshness SLO."</li>
+    <li><em>Memory math on demand:</em> "200M users × 800 IDs × 8 bytes is 1.28 TB before Redis overhead — which is why I only materialize feeds for active users and rebuild the rest by pull."</li>
+    <li><em>Failure mode unprompted:</em> "The scariest failure is silent: queue lag means stale feeds with zero errors. I monitor freshness end-to-end with a synthetic-post probe, not just queue depth."</li>
+    <li><em>Pagination detail:</em> "Cursor by max_id, because offsets shift as new posts land — and Snowflake IDs give me the time-ordering for free."</li>
+  </ul>
+
+  <h2>12 · Lab &amp; project step</h2>
+  <div class="callout"><span class="label">Hands-on (do this before the quiz)</span>
+    In <code>labs/lab-0020-feed-fanout/</code>, <code>python3 fanout_lab.py</code> builds a 10,000-user
+    power-law social graph, fires post and read traffic at it, and measures all three
+    strategies — push, pull, hybrid — on write ops, lists merged per read, staleness, and
+    memory. Then <code>--threshold X</code> moves the celebrity cutoff and a sweep table shows the
+    U-curve you will otherwise have to take on faith. Predict before every run (README E1–E4).
+  </div>
+  <p><strong>Project step.</strong> After the lab, write one paragraph in your learning record mapping the sweep result onto the spine project: at what "follower count" (concurrent request share) would you reclassify a tenant of your inference gateway as a whale, and what changes for it — its own queue, its own batch budget, or read-time merging of results? The threshold-picking logic is the transferable asset.</p>
+
+  <h2>Check yourself</h2>
+  <div class="quiz" id="quiz"></div>
+
+  <h2>Primary source</h2>
+  <p>Read the Primer's <a href="https://github.com/donnemartin/system-design-primer#design-the-twitter-timeline-and-search">Twitter timeline &amp; search worked solution</a> — the canonical written rep for this prompt. Then the real thing: <a href="http://highscalability.com/blog/2013/7/8/the-architecture-twitter-uses-to-deal-with-150m-active-users.html">High Scalability's account of Twitter's timeline architecture at 150M actives</a> — note how closely production Twitter matches the hybrid you just designed, including the Redis lists and the celebrity exception.</p>
+
+  <footer class="lesson-footer">
+    <p><strong>Stuck or curious?</strong> Ask your teacher (the agent) anything — "how would the design change if the freshness SLO were 1 s instead of 60 s?" is an excellent follow-up question.</p>
+    <nav class="lesson-nav">
+      <span>◀ <a href="0019-tinyurl-pastebin.html">0019 · TinyURL &amp; Pastebin</a></span>
+      <span><a href="0021-chat-system.html">0021 · Chat System</a> ▶</span>
+    </nav>
+  </footer>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+renderQuiz(document.getElementById('quiz'), {
+  title: 'Check yourself',
+  questions: [
+    {
+      q: 'Why does fanout-on-write suit a feed whose read:write ratio is 20:1?',
+      options: [
+        'Reads become cheap precomputed list lookups',
+        'Writes become cheaper than reads overall',
+        'Storage shrinks because feeds are shared',
+      ],
+      answer: 0,
+      explain: 'Push spends the cheap resource (write capacity, ×200 amplified) to make the expensive, dominant operation — 70k QPS of reads — an O(1) list fetch. Writes get more expensive, not cheaper, and storage grows.',
+    },
+    {
+      q: 'A 50M-follower account posts once. Under pure fanout-on-write, which cost explodes first?',
+      options: [
+        'Read latency for every follower timeline',
+        'Storage consumed by the posts table',
+        'Write amplification across the feed caches',
+      ],
+      answer: 2,
+      explain: 'One post becomes 50M feed inserts — roughly 217 seconds of the entire average fanout capacity — which also head-of-line-blocks every normal post behind it. Reads stay O(1); the posts table stores the post once.',
+    },
+    {
+      q: 'Why cap each Redis feed list at roughly 800 entries?',
+      options: [
+        'Snowflake identifiers overflow lists longer than that',
+        'Bounding memory while covering realistic scroll depth',
+        'Redis performance degrades sharply beyond that length',
+      ],
+      answer: 1,
+      explain: '800 IDs ≈ 40 pages of scroll — deeper than almost anyone reads — and the cap turns 200M feeds into a computable memory budget (~1.28 TB of raw IDs). Deeper history is rebuildable from the posts store, so nothing is lost.',
+    },
+    {
+      q: "In the hybrid design, what happens to a celebrity's new post?",
+      options: [
+        'It fans out immediately to every follower feed',
+        'Followers merge it into timelines at read time',
+        'It waits until the fanout queue is empty',
+      ],
+      answer: 1,
+      explain: 'Above the threshold there is no fanout at all: the post lives only on the celebrity\'s author timeline, and each follower\'s read path k-way merges that ultra-hot, ultra-cacheable list with their precomputed feed.',
+    },
+    {
+      q: 'Fanout queue lag climbs from seconds to ten minutes. What do users experience?',
+      options: [
+        'Home timelines silently go stale for followers',
+        'Posting fails with errors for most authors',
+        'Feed reads slow down across every user',
+      ],
+      answer: 0,
+      explain: 'Nothing errors and nothing slows down — posts commit fine and reads still hit the cache — but new posts stop appearing in followers\' feeds until the queue drains. That silence is why you monitor freshness end-to-end, not just error rates.',
+    },
+    {
+      q: 'Why paginate the feed with a cursor instead of an offset?',
+      options: [
+        'Cursors compress network responses better than offsets',
+        'Snowflake identifiers cannot be counted for offsets',
+        'New arrivals shift offset pages, duplicating items',
+      ],
+      answer: 2,
+      explain: 'A feed grows at the head continuously, so "items 20–40" changes between requests and the reader sees repeats. A max_id cursor pins the position in the ID order — stable because Snowflake IDs only increase with time.',
+    },
+  ],
+});
+</script>
+</body>
+</html>

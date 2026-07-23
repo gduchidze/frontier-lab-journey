@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lesson 10 · Monolith → Microservices</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<div class="lesson">
+  <header class="lesson-header">
+    <p class="kicker">Lesson 0010 · Phase 2 — Software Architecture &amp; Reliability · <a href="0010-monolith-to-microservices.ka.html">ქართული ვერსია</a></p>
+    <h1>Monolith → Microservices</h1>
+    <p class="dek">Decomposition is a trade you pay for in latency, failure math, and ops. This lesson prices the trade — in-process calls vs network hops, 0.999<sup>20</sup>, tail amplification — so you know when to split, how to split, and above all when NOT to.</p>
+  </header>
+
+  <div class="mission-tie">
+    <strong>Mission tie.</strong> Anthropic's design prompts hand you a system and watch which boxes you draw — and weak candidates draw twelve microservices by reflex. Strong candidates start from one process, name the specific force (scaling, team autonomy, fault isolation) that justifies each cut, and then <em>price</em> the cut: "twenty services in a serial chain at three nines each is a 98% system." Interviewers escalate on exactly this arithmetic, because it separates architecture from box-drawing. This lesson gives you the forces, the criteria, and the numbers. (<a href="https://www.tryexponent.com/blog/anthropic-system-design-interview">Exponent's 2026 Anthropic guide</a>)
+  </div>
+
+  <h2>1 · The monolith is the right default</h2>
+  <p>One codebase, one process, one deploy. Before scorning it, list what you get for free: a function call between modules costs ~50 <em>nanoseconds</em>; a network hop between services costs ~1 <em>millisecond</em> — a <strong>20,000× cliff</strong> you re-cross on every decomposed call. Transactions spanning modules are a single ACID <code>COMMIT</code>. Debugging is one stack trace. Deploys, rollbacks, and local dev are one artifact. DHH calls this the <a href="https://m.signalvnoise.com/the-majestic-monolith/">"majestic monolith"</a> — Basecamp serves millions from one, on purpose. Fowler's advice is blunter: <a href="https://martinfowler.com/bliki/MonolithFirst.html">MonolithFirst</a> — nearly every successful microservice story he has seen started with a monolith that grew too big; systems built as microservices from scratch tend to end in serious trouble, because you only learn the right service boundaries by operating the domain.</p>
+  <p>The strongest counterexample to "big must mean microservices" is <a href="https://shopify.engineering/deconstructing-monolith-designing-software-maximizes-developer-productivity">Shopify</a>: one of the world's largest Rails codebases, deliberately kept as a <strong>modular monolith</strong> — code split into components with enforced internal boundaries (their <code>packwerk</code> tooling fails the build on illegal cross-component calls), while deployment stays one unit. Boundaries without the network. That is the position to defend by default in an interview: modularity is mandatory, distribution is optional.</p>
+
+  <h2>2 · What actually forces the split</h2>
+  <p>Four forces — and note that most are <em>organizational</em>, not technical:</p>
+  <ul>
+    <li><strong>Independent scaling.</strong> Checkout needs 50 machines at peak; invoicing needs 2. In a monolith you scale the whole binary to the hottest module's needs and waste the difference.</li>
+    <li><strong>Team autonomy (Conway's law).</strong> <a href="http://www.melconway.com/Home/Conways_Law.html">"Organizations design systems that mirror their communication structures."</a> Fifty engineers in one codebase serialize on merge queues, shared schemas, and release trains. Amazon hit this wall around 2001: Werner Vogels describes carving the retail monolith into services, each owned end-to-end — "you build it, you run it" — by a <strong>two-pizza team</strong>, precisely so teams could deploy without asking permission (<a href="https://queue.acm.org/detail.cfm?id=1142065">ACM Queue: A Conversation with Werner Vogels</a>).</li>
+    <li><strong>Fault isolation.</strong> A memory leak in the recommendations module takes down checkout when they share a process. As separate services, recommendations can die while checkout degrades gracefully to "no suggestions today."</li>
+    <li><strong>Independent deploy cadence.</strong> The pricing team ships hourly; the ledger team ships weekly after audit. One deploy pipeline forces both to the slower, scarier rhythm.</li>
+  </ul>
+  <p>Interview move: never justify a split with "scalability" in the abstract. Name which of these four forces applies to <em>this</em> system, or keep the module in-process.</p>
+
+  <h2>3 · Where to cut: bounded contexts, not layers</h2>
+  <p>Given a real force, where do the seams go? By <strong>business capability</strong>, never by technical layer. A "UI service + business-logic service + database service" split means every user action crosses all of them — you have distributed your layers, not your domain. Cut instead along DDD <a href="https://martinfowler.com/bliki/BoundedContext.html">bounded contexts</a>: Orders, Payments, Inventory, Shipping — units where a word like "customer" has one consistent meaning, and which change for one reason. Fowler and Lewis's original <a href="https://martinfowler.com/articles/microservices.html">microservices article</a> makes this the first characteristic: services organized around business capabilities, each owning its own data, replaceable independently.</p>
+  <p>And you migrate incrementally, never big-bang: the <a href="https://martinfowler.com/bliki/StranglerFigApplication.html">strangler fig</a>. Put a routing facade in front of the monolith, carve out one capability at a time behind it, shift traffic route by route, and let the monolith shrink until what remains is deletable. The old system keeps serving production throughout — every step is small, reversible, and shippable, which is exactly what a two-year rewrite is not.</p>
+
+  <h2>4 · The microservice tax — the arithmetic interviewers want to hear</h2>
+  <p>Every split re-prices three things. Say these numbers unprompted and you sound like you have operated this.</p>
+  <p><strong>Latency.</strong> The in-process call you replaced was free; the network hop has a mean (~1 ms in-datacenter) <em>and a tail</em>. In the lab, the same 20 ms of work split across a serial chain: p99 goes from 20 ms (monolith) to ~29 ms at N=2, ~44 ms at N=10, ~58 ms at N=20. The mean grew 1 ms per hop; the <em>p99</em> grew almost twice as fast, because tails add across serial hops.</p>
+  <p><strong>Availability.</strong> A serial chain multiplies failure. Each service at 99.9%: <code>0.999<sup>20</sup> ≈ 98.0%</code> — your twenty three-nines services compose into a <em>two</em>-nines system. At 10 M requests/day that is ~200,000 failures/day, versus ~10,000 for the single-service baseline. Retries claw nines back but multiply load — and a retry storm during a partial outage is extra traffic aimed precisely at the sick service (<a href="https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/">AWS Builders' Library: timeouts, retries, and backoff with jitter</a>).</p>
+  <p><strong>Tail amplification under fan-out.</strong> When a page calls N services in <em>parallel</em>, it waits for the slowest. If each backend exceeds its p99 1% of the time, the chance your request hits at least one straggler is <code>1 − 0.99<sup>N</sup></code>: 18% at N=20, 63% at N=100 — the rare slow call becomes the common case. This is the central result of Dean &amp; Barroso's <a href="https://research.google/pubs/the-tail-at-scale/">"The Tail at Scale"</a>; their mitigation, hedged requests (send a backup copy after the 95th-percentile delay, take the first answer), caps the tail for ~5% extra load — you will measure exactly this trade in the lab.</p>
+  <table>
+    <tr><th>N services (serial)</th><th>p99 latency (lab, 20 ms work)</th><th>Availability at 0.999/svc</th><th>Fan-out: req. hitting a p99 straggler</th></tr>
+    <tr><td>1 (monolith)</td><td>20 ms</td><td>99.9%</td><td>1%</td></tr>
+    <tr><td>2</td><td>~29 ms</td><td>99.8%</td><td>2%</td></tr>
+    <tr><td>5</td><td>~36 ms</td><td>99.5%</td><td>4.9%</td></tr>
+    <tr><td>10</td><td>~44 ms</td><td>99.0%</td><td>9.6%</td></tr>
+    <tr><td>20</td><td>~58 ms</td><td>98.0%</td><td>18.2%</td></tr>
+  </table>
+  <p>Then the bill that never fits in a table: N deploy pipelines, N on-call rotations, distributed tracing to reassemble one request's story, service discovery, versioned APIs between everything. The tax is real; pay it only where §2's forces earn it back.</p>
+
+  <h2>5 · Service discovery — how services find each other</h2>
+  <p>Once instances scale up, die, and move, hardcoded addresses are over. Instances register (or are registered) in a <strong>service registry</strong> — <a href="https://developer.hashicorp.com/consul/docs">Consul</a>, <a href="https://etcd.io/docs/">etcd</a>, ZooKeeper — with <strong>health checks</strong> (heartbeats or TTLs) so dead instances stop resolving. Two lookup topologies (<a href="https://github.com/donnemartin/system-design-primer#service-discovery">Primer §Service discovery</a>):</p>
+  <table>
+    <tr><th>Model</th><th>Who queries the registry</th><th>Wins</th><th>Pays</th><th>Examples</th></tr>
+    <tr><td><strong>Client-side</strong> (<a href="https://microservices.io/patterns/client-side-discovery.html">pattern</a>)</td><td>The calling service itself, then load-balances across instances</td><td>One less hop; client picks smart per-request choices</td><td>Discovery logic in every client, per language</td><td>Netflix Eureka + Ribbon</td></tr>
+    <tr><td><strong>Server-side</strong> (<a href="https://microservices.io/patterns/server-side-discovery.html">pattern</a>)</td><td>A load balancer / router; clients just call a stable name</td><td>Clients stay dumb; discovery centralized once</td><td>Extra hop; the LB is infrastructure to run</td><td>AWS ALB, Kubernetes Services</td></tr>
+  </table>
+  <p>Transport matters too: <strong>DNS-based</strong> discovery (Consul DNS, K8s cluster DNS) is universal but caches — TTLs delay failover; <strong>API-based</strong> discovery (registry queries, or a watch stream) is fresh but couples you to the registry client. Modern platforms mostly hide this: a Kubernetes <code>Service</code> name is server-side discovery with health-checked endpoints behind stable DNS. In an interview, one sentence suffices — "instances register in Consul with TTL health checks; callers resolve through the mesh/LB" — but know which model you just described.</p>
+
+  <h2>6 · API gateway vs BFF</h2>
+  <p>Clients should not know your internal topology. An <strong>API gateway</strong> (<a href="https://microservices.io/patterns/apigateway.html">pattern</a>) is the single front door that handles edge concerns once: authentication, rate limiting, TLS termination, routing, request aggregation — so thirty services don't implement auth thirty ways. The costs are symmetrical: it is a chokepoint that can become a <em>single point of failure</em> (so it runs replicated and dumb), and a shared codebase every team wants to edit (so it stays thin — routing and policy, not business logic).</p>
+  <p>When one general-purpose gateway starts accumulating per-client aggregation — mobile wants a lean payload, web wants a rich one, TV wants something else — Sam Newman's <a href="https://samnewman.io/patterns/architectural/bff/">Backend-for-Frontend</a> pattern splits the edge: one small backend <em>per frontend</em>, owned by that frontend's team, each shaping and aggregating for exactly one client. You trade some duplication for autonomy — which is the whole microservices trade in miniature, replayed at the edge.</p>
+
+  <h2>7 · Data ownership — the join you lost</h2>
+  <p>The rule that makes services real: <strong>database-per-service</strong> (<a href="https://microservices.io/patterns/data/database-per-service.html">pattern</a>). Each service owns its data; nobody else touches its tables. Shared tables are a shared schema, and a shared schema is a deploy-time coupling that silently reassembles the monolith. The price is steep and specific: <strong>the join is gone.</strong> "Orders joined with customer names" was one SQL line; now it is either an API composition (call both, join in memory — fan-out tax applies) or a <strong>materialized local copy</strong> — the Orders service keeps a read-only projection of the customer fields it needs, updated by events. That copy is <em>eventually consistent</em>: for some window, Orders may show a customer's old name. Cross-service transactions are likewise gone; sagas and event-driven consistency get their own treatment in lessons 0013–0014 — for now, know that every arrow between two services on your whiteboard is also a consistency boundary (<a href="https://dataintensive.net/">DDIA</a>, chs. 7 and 9, is the deep background).</p>
+
+  <h2>8 · Failure modes that decide interviews</h2>
+  <ul>
+    <li><strong>The distributed monolith — the worst of both.</strong> Services that deploy in lockstep, share a database, and call each other synchronously for everything: you pay every network and ops tax of microservices while keeping every coupling of the monolith. Diagnostic questions: can you deploy one service alone? Does one schema change fan out to five repos? Does every request thread through the same call chain?</li>
+    <li><strong>Cascading failure via synchronous chains.</strong> A → B → C, C slows, B's threads block waiting, B's pool exhausts, A follows — one slow leaf takes the whole chain down, and retries amplify the wave. Defenses: timeouts, circuit breakers, bounded queues, load shedding (<a href="https://sre.google/sre-book/addressing-cascading-failures/">Google SRE book: Addressing Cascading Failures</a>). Deeper treatment next lessons; name the mechanism now.</li>
+    <li><strong>Version skew.</strong> With N services deploying independently, both old and new API versions are <em>always</em> live somewhere mid-rollout. Contracts must be backward-compatible (add fields, never repurpose them), and consumer-driven contract tests replace the compiler you lost when the call left the process.</li>
+    <li><strong>Org smaller than architecture.</strong> Fowler's <a href="https://martinfowler.com/bliki/MicroservicePrerequisites.html">MicroservicePrerequisites</a> — "you must be this tall": rapid provisioning, basic monitoring, rapid deployment, DevOps culture. Five engineers running forty services fail this bar. <a href="https://segment.com/blog/goodbye-microservices/">Segment famously reversed course</a>: they consolidated ~140 per-destination services back into a monolith after the operational overhead — versioning drift across dozens of repos, per-service queues and autoscaling — swamped a small team. Consolidation restored their velocity. Merging back is not failure; it is re-pricing the trade.</li>
+  </ul>
+
+  <h2>9 · One AI note, then back to fundamentals</h2>
+  <p>The spine project maps cleanly onto this lesson: an LLM inference platform decomposes into <strong>gateway → router → batching scheduler → workers → KV-cache manager</strong> because §2's forces are genuinely present — GPU workers scale on different hardware than the CPU-bound gateway, and the scheduler deploys far more often than workers holding model weights. But the tax still rules the cuts: the <em>tokenizer</em> stays in-process with the gateway or worker, because tokenizing is a sub-millisecond CPU task and a "tokenizer service" would spend more on the network hop than on the work — the purest microservice-tax violation there is. Same forces, same arithmetic; that is the whole note.</p>
+
+  <h2>10 · Interview talking points</h2>
+  <p>How to deploy this lesson live, in order:</p>
+  <ol>
+    <li><strong>Start monolith-first, out loud.</strong> "I'd begin as a modular monolith — Shopify-style enforced module boundaries — and split only where a force demands it." This instantly separates you from reflexive box-drawers.</li>
+    <li><strong>Name the force per split</strong> (§2): "checkout splits for independent scaling; payments splits for fault and compliance isolation" — never a bare "for scalability."</li>
+    <li><strong>Cut by capability, not layer</strong> (§3), and migrate strangler-fig: facade in front, one capability at a time, reversible steps.</li>
+    <li><strong>Price the tax unprompted</strong> (§4): "20 services serial at three nines is 98% end-to-end — so I'll keep the synchronous chain to 3–4 services and make the rest async."</li>
+    <li><strong>Raise the tail</strong>: "the page fans out to 20 backends, so 18% of requests hit a p99 straggler — I'd hedge requests at p95 for ~5% extra load." Citing Tail at Scale by name is a strong signal.</li>
+    <li><strong>State the data rule</strong> (§7): database-per-service, joins become composition or materialized views, eventual consistency named with a bound.</li>
+    <li><strong>Volunteer the failure modes</strong> (§8): distributed monolith, cascade via sync chains ("timeouts + circuit breakers + shedding"), and the org bar — mention Segment's reversal to show you know the trade runs both ways.</li>
+  </ol>
+
+  <h2>11 · Lab — pay the tax yourself</h2>
+  <div class="callout"><span class="label">Hands-on (do this before the quiz)</span>
+    Everything above is now measurable in <code>labs/lab-0010-microservice-tax/</code>:
+    <code>python3 microservice_tax_lab.py</code> runs three experiments — the same 20 ms of work
+    split across N=1/2/5/10/20 services with lognormal hops (watch p99 outrun the mean),
+    availability of a serial chain over 100k requests vs the theoretical 0.999<sup>N</sup>,
+    and fan-out tail amplification with hedged requests at p95 (Tail at Scale, measured).
+    Then do exercises E1–E4 in the lab README: <em>predict, edit config, re-run, compare.</em>
+    Wrong predictions are the deliverable — bring them to the next session.
+  </div>
+
+  <h2>12 · Project step</h2>
+  <p>Decision time for the <strong>LLM inference platform</strong>: which components are separate services, and which live in one process? Defend it in two sentences. A defensible pick: <em>gateway, router/scheduler, and GPU workers are separate services because they scale on different hardware and deploy on different cadences; the tokenizer and per-worker KV-cache bookkeeping stay in-process with the worker, because a ~0.1 ms CPU task must not pay a ~1 ms network hop on every request.</em> Write your own two sentences — name the force for every cut, name the tax for every merge — and bring them to the next session for critique.</p>
+
+  <h2>Check yourself</h2>
+  <div class="quiz" id="quiz"></div>
+
+  <h2>Primary source</h2>
+  <p>Read the <strong>System Design Primer §Microservices</strong> (<a href="https://github.com/donnemartin/system-design-primer#microservices">microservices + service discovery</a>) for the interview vocabulary, then Fowler's <a href="https://martinfowler.com/microservices/">Microservices Guide</a> — especially the original <a href="https://martinfowler.com/articles/microservices.html">article's</a> nine characteristics, <a href="https://martinfowler.com/bliki/MonolithFirst.html">MonolithFirst</a>, and <a href="https://martinfowler.com/bliki/MicroservicePrerequisites.html">MicroservicePrerequisites</a>. For the numbers, <a href="https://research.google/pubs/the-tail-at-scale/">"The Tail at Scale"</a> (Dean &amp; Barroso, CACM 2013) is short, canonical, and quotable in interviews; <a href="https://dataintensive.net/">DDIA</a> chapters 7–9 are the deep background for what you lose when data crosses service boundaries.</p>
+
+  <footer class="lesson-footer">
+    <p><strong>Stuck or curious?</strong> Ask your teacher (the agent) anything — "why does a materialized local copy beat a synchronous join call even though it can serve stale data?" is an excellent follow-up question.</p>
+    <nav class="lesson-nav">
+      <span><a href="0009-interview-os.html">◀ Prev: 0009 · The Interview OS</a></span>
+      <span><a href="0011-api-design-deep.html">Next: 0011 · API Design, Deeply ▶</a></span>
+    </nav>
+  </footer>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+renderQuiz(document.getElementById('quiz'), {
+  title: 'Check yourself',
+  questions: [
+    {
+      q: 'Twenty services each offer 99.9% availability, and a request must traverse all of them in a serial chain. Roughly what end-to-end availability should you quote?',
+      options: [
+        'About 99.9%, since availability follows the weakest service',
+        'About 98%, since per-service availabilities multiply across chains',
+        'About 99.99%, since redundant services add extra nines',
+      ],
+      answer: 1,
+      explain: 'Serial availability multiplies: 0.999^20 ≈ 0.980. Twenty three-nines services compose into a two-nines system — at 10M requests/day, ~200k failures. This multiplication is the availability line of the microservice tax.',
+    },
+    {
+      q: "You must migrate a legacy monolith to services without a risky big-bang rewrite. Which approach does Fowler's strangler-fig pattern prescribe?",
+      options: [
+        'Route traffic through a facade, replacing functionality piece by piece incrementally',
+        'Freeze the monolith entirely, rewriting every feature in one final release',
+        'Duplicate the whole database, running both systems forever in parallel permanently',
+      ],
+      answer: 0,
+      explain: 'The strangler fig puts a routing facade in front of the monolith and carves out one capability at a time behind it. Every step is small, reversible, and shippable — the opposite of a big-bang rewrite, which Fowler explicitly warns against.',
+    },
+    {
+      q: "A page fans out to 100 backends in parallel and waits for all of them; each backend exceeds its p99 1% of the time. What does 'The Tail at Scale' predict?",
+      options: [
+        'Most requests finish under typical latency, stragglers stay rare overall',
+        'Parallel calls cancel their tails, so p99 latency improves greatly',
+        'Most requests now include a straggler, so slowness becomes typical',
+      ],
+      answer: 2,
+      explain: 'The request waits for the slowest of N. P(at least one straggler) = 1 − 0.99^100 ≈ 63% — the rare slow call becomes the common case. Dean & Barroso’s mitigation is hedged requests: send a backup after the p95 delay, take the first answer.',
+    },
+    {
+      q: "Mobile and web need differently shaped responses, and the shared gateway keeps accumulating client-specific aggregation logic. What does Sam Newman's BFF pattern recommend?",
+      options: [
+        "One shared gateway holding every client's aggregation logic together centrally",
+        'One dedicated edge backend per frontend, owned by that team',
+        'One generic client library reshaping responses inside every frontend directly',
+      ],
+      answer: 1,
+      explain: 'Backend-for-Frontend gives each frontend its own small edge backend, owned by the frontend team, shaping data for exactly one client. You trade duplication for autonomy — the core microservices trade replayed at the edge.',
+    },
+    {
+      q: 'Your services deploy only together, share one database, and call each other synchronously on every request. What have you actually built?',
+      options: [
+        'A distributed monolith paying network costs without gaining independence anywhere',
+        'A proper microservice architecture demonstrating loose coupling and clear autonomy',
+        'A modular monolith showing clean internal boundaries and shared deployment',
+      ],
+      answer: 0,
+      explain: 'Lockstep deploys plus a shared database plus synchronous coupling means every monolith coupling survived while every network and ops tax got added — the distributed monolith, the worst of both worlds. A modular monolith would at least skip the network.',
+    },
+    {
+      q: 'Orders and Customers are separate services with database-per-service. A screen needs data from both. What replaces the SQL join you lost?',
+      options: [
+        "Reach directly into the other service's tables for reading",
+        'Share one database schema again between both owning services',
+        'Compose over APIs, or maintain a materialized local copy',
+      ],
+      answer: 2,
+      explain: 'With database-per-service, cross-service joins become either API composition (call both, join in memory) or a materialized, eventually consistent local projection updated by events. Touching another service’s tables re-creates the shared-schema coupling you decomposed to escape.',
+    },
+  ],
+});
+</script>
+</body>
+</html>

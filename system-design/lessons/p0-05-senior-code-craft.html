@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lesson p0-05 · Senior Code Craft</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<div class="lesson">
+  <header class="lesson-header">
+    <p class="kicker">Lesson p0-05 · Phase 0 Track A — Programming/CS · <a href="p0-05-senior-code-craft.ka.html">ქართული ვერსია</a></p>
+    <h1>Senior Code Craft</h1>
+    <p class="dek">API contracts, idempotency, testing strategy, profiling — the four habits that separate "it works" from "it survives production."</p>
+  </header>
+
+  <div class="mission-tie">
+    <strong>Mission tie.</strong> Anthropic's coding rounds are realistic work samples, not leetcode: build or debug a real component under time, with clean code and testing instincts graded explicitly. And in the system-design round, "how do you avoid double-charging on retry?" is a classic follow-up to any payment or API prompt — the answer is this lesson's idempotency-key recipe, straight from <a href="https://stripe.com/blog/idempotency">Stripe's engineering blog</a> and the <a href="https://sre.google/sre-book/table-of-contents/">Google SRE book</a>.
+  </div>
+
+  <div class="callout"><span class="label">Lab first (ADHD rule)</span>
+    Before reading further, run the lab: <code>cd labs/lab-p0-05-profile-and-idempotency && python3 craft_lab.py</code>. Watch a hidden O(n²) get named by a profiler, 60 customers get double-charged, and retries double the load on a dying server. Then read on — the lesson explains what you just saw.
+  </div>
+
+  <h2>1 · Senior code is boring on purpose</h2>
+  <p>Junior code optimizes for writing; senior code optimizes for <em>reading, debugging at 3 a.m., and changing safely a year later</em>. The concrete signature: obvious names, small functions, errors handled at every boundary, and — the theme of this lesson — <strong>designing for failure before it happens</strong>. Networks drop responses, processes die mid-request, callers retry. Senior code assumes all three on every line that touches I/O. The SRE book's framing: hope is not a strategy; <a href="https://sre.google/sre-book/introduction/">reliability is a feature you engineer</a>, not an accident you inherit.</p>
+
+  <h2>2 · API design: the contract is the product</h2>
+  <p>An API is a promise you cannot easily un-make — clients compile against it. The craft checklist (see <a href="https://cloud.google.com/apis/design">Google's API design guide</a> and the <a href="https://github.com/donnemartin/system-design-primer#communication">Primer's communication section</a>):</p>
+  <ul>
+    <li><strong>Nouns for resources, verbs from HTTP</strong>: <code>POST /charges</code>, not <code>POST /doCharge</code>. Predictability is a feature.</li>
+    <li><strong>Errors are part of the contract</strong>: machine-readable code + human message + what the caller should do (retry? fix input? give up). A bare 500 is an abdication.</li>
+    <li><strong>Never break existing callers</strong>: add optional fields freely; never repurpose or remove fields without a versioning story.</li>
+    <li><strong>Pagination and limits from day one</strong> — every unbounded list endpoint is a future outage.</li>
+  </ul>
+
+  <div class="callout"><span class="label">Vocabulary</span>
+    An operation is <strong>idempotent</strong> if performing it N times has the same effect as performing it once. <code>GET</code> and <code>PUT</code> are idempotent by HTTP contract; <code>POST</code> is not — which is exactly why the next three sections exist.
+  </div>
+
+  <h2>3 · The at-least-once world</h2>
+  <p>Here is the trap every distributed system sets for you: a client sends <code>POST /charges</code>, the server charges the card, and the <em>response is lost</em> (connection reset, timeout, proxy hiccup). The client now cannot distinguish "server never got it" from "server did it and the reply died." Its only sane move is to <strong>retry</strong> — so real networks deliver requests <em>at least once</em>, not exactly once. Do the math on what that costs:</p>
+  <pre><code>200 clients, each pays once.  P(success response lost) = 0.30, up to 3 retries.
+
+P(a client retries at least once)      = 0.30            → ~60 clients retry
+Each retry after a SUCCESSFUL charge   = another charge!
+E[extra charges] ≈ 200 × (0.30 + 0.30² + 0.30³) ≈ 200 × 0.417 ≈ 83 duplicates
+
+Lab measurement: 282 total charges for 200 purchases, 60 customers double-charged.</code></pre>
+  <p>No bug in the code, no malice — just physics. Retries are mandatory, so <strong>safety must be engineered server-side</strong>.</p>
+
+  <h2>4 · Idempotency keys: exactly-once effects</h2>
+  <p>The industry-standard fix, popularized by <a href="https://docs.stripe.com/api/idempotent_requests">Stripe's <code>Idempotency-Key</code> header</a>: the client generates a unique key <em>per logical operation</em> (one purchase = one key, however many retries), and the server keeps a small table:</p>
+  <ol>
+    <li>Request arrives with key <code>K</code>. Look up <code>K</code>.</li>
+    <li><strong>Seen before?</strong> Return the <em>stored response</em>. Do not re-execute anything.</li>
+    <li><strong>New?</strong> Execute the operation, store <code>(K → response)</code>, return it.</li>
+  </ol>
+  <p>Effect: the operation may be <em>delivered</em> many times but is <em>applied</em> once — at-least-once delivery plus server-side dedup equals exactly-once effect. This one idea shows up in payments, message queues (lesson 8), sagas (lesson 14), and inference-request submission alike. (<a href="https://stripe.com/blog/idempotency">Stripe: "Designing robust and predictable APIs with idempotency"</a>)</p>
+
+  <h2>5 · Sharp edges of idempotency</h2>
+  <p>Where real implementations go wrong — each of these is a production incident that has actually happened somewhere:</p>
+  <ul>
+    <li><strong>Key generated per attempt, not per operation.</strong> Client makes a fresh UUID on every retry → dedup never triggers → double charge anyway. The key must survive the retry loop.</li>
+    <li><strong>Concurrent duplicates.</strong> Two retries land simultaneously; both see "key unseen" and both execute. Fix: reserve the key atomically (insert-first with a unique constraint), make the second request wait or 409.</li>
+    <li><strong>Storing only the key, not the response.</strong> The replay must return the <em>original outcome</em> — including the original failure — or clients see inconsistent worlds.</li>
+    <li><strong>Infinite key retention.</strong> The table grows forever; Stripe prunes keys after 24 h. Expiry is a contract decision, not a cleanup detail.</li>
+    <li><strong>"Idempotent" handlers with hidden side effects</strong> — sends an email, increments a metric, calls a partner API. Dedup the <em>whole</em> effect or you've deduped nothing.</li>
+  </ul>
+
+  <h2>6 · Retries amplify outages — budget them</h2>
+  <p>Idempotency makes retries <em>safe</em>; it does not make them <em>free</em>. When a server browns out, naive client retries multiply its load precisely when it can least afford it. With failure rate <em>p</em> and up to <em>k</em> attempts, expected sends per logical request form a geometric series:</p>
+  <pre><code>load multiplier = 1 + p + p² + … + pᵏ⁻¹
+p = 0.5, k = 4:  1 + 0.5 + 0.25 + 0.125 = 1.875×   (lab measured: 1.89×)</code></pre>
+  <p>Nearly double the traffic aimed at a half-dead server — the shove that turns a brownout into a blackout. The SRE prescriptions (<a href="https://sre.google/sre-book/handling-overload/">Handling Overload</a>, <a href="https://sre.google/sre-book/addressing-cascading-failures/">Addressing Cascading Failures</a>): exponential backoff <em>with jitter</em>, per-client <strong>retry budgets</strong> (e.g., retries ≤ 10% of base traffic), and retrying at most once per layer so a three-layer stack doesn't cube the retries.</p>
+
+  <h2>7 · Testing strategy: the pyramid buys speed</h2>
+  <p>Senior testing is a portfolio decision, not a virtue contest. The canonical shape (<a href="https://martinfowler.com/articles/practical-test-pyramid.html">Fowler's practical test pyramid</a>, <a href="https://testing.googleblog.com/2010/12/test-sizes.html">Google's test sizes</a>):</p>
+  <table>
+    <tr><th>Layer</th><th>Scope</th><th class="num">Speed</th><th class="num">Count</th><th>Catches</th></tr>
+    <tr><td>Unit</td><td>one function/class, no I/O</td><td class="num">ms</td><td class="num">many</td><td>logic bugs, edge cases</td></tr>
+    <tr><td>Integration</td><td>service + real DB/queue</td><td class="num">seconds</td><td class="num">some</td><td>wiring, schemas, SQL</td></tr>
+    <tr><td>End-to-end</td><td>whole system, user flow</td><td class="num">minutes</td><td class="num">few</td><td>config, contracts, deploys</td></tr>
+  </table>
+  <p>Why this shape: feedback latency compounds. A 10-minute suite gets run before every commit; a 2-hour suite gets run never. Two senior reflexes: <strong>every bug fix starts with a failing test</strong> that reproduces it (regression insurance), and <strong>flaky tests are deleted or fixed, never retried into green</strong> — a suite people don't trust is worse than no suite.</p>
+
+  <h2>8 · Profiling: measure, don't guess</h2>
+  <p>Engineers' intuitions about hotspots are famously wrong — the bottleneck is rarely where the code "looks slow." The rule: <strong>no optimization without a profile.</strong> Python ships one in the stdlib (<a href="https://docs.python.org/3/library/profile.html">cProfile</a>):</p>
+  <pre><code>python3 -m cProfile -s cumulative my_service.py | head -20
+
+ncalls  tottime  cumtime  filename:lineno(function)
+ 30000    0.006    0.006  craft_lab.py:49(add_line)      ← hotspot names itself</code></pre>
+  <p>Read <code>cumtime</code> top-down: the first non-framework line is usually your answer. The lab's example is the classic accidental O(n²) — building a string with <code>+=</code> in a loop copies the whole string each pass, so 4× the input costs ~16× the time. One profile view finds in 10 seconds what an afternoon of guessing misses. (For sampling production processes without stopping them, the ecosystem term to know is a <em>sampling profiler</em> — e.g. py-spy — same reading skill, zero pause.)</p>
+
+  <h2>9 · Reading production Python and Go</h2>
+  <p>Seniors read 10× more code than they write, and they read in a fixed order: <strong>entry points → data shapes → error paths</strong>. Find <code>main()</code>/the route table; find the core structs/dataclasses (data shapes explain a codebase faster than any comment); then read what happens when things fail — that's where quality lives. Language-specific tells:</p>
+  <ul>
+    <li><strong>Python</strong>: type hints + dataclasses mark the data spine; context managers (<code>with</code>) mark resource boundaries; a bare <code>except:</code> is a red flag every reviewer should catch.</li>
+    <li><strong>Go</strong> (<a href="https://go.dev/doc/effective_go">Effective Go</a>): <code>if err != nil</code> after every call makes error paths <em>visible by construction</em>; <code>defer</code> marks cleanup; goroutines + channels mark concurrency boundaries. Go reads flat on purpose — boring is the house style.</li>
+  </ul>
+
+  <h2>10 · Lab — retry storms and hotspots</h2>
+  <div class="callout"><span class="label">Hands-on (do this before the quiz)</span>
+    <code>labs/lab-p0-05-profile-and-idempotency/</code> → <code>python3 craft_lab.py</code>. Three experiments: the O(n²) concat measured and then profiled with cProfile; a 200-client retry storm with and without idempotency keys (count the double charges); retry amplification vs a retry budget. Then do README exercises E1–E4: <em>predict, edit CONFIG, re-run, compare.</em> Wrong predictions are the deliverable.
+  </div>
+
+  <h2>11 · Project step</h2>
+  <p>Our spine project — the LLM inference gateway — accepts generation requests that cost real money in GPU-seconds. Write (scratch note is fine) the gateway's <strong>idempotency contract</strong>: what is the key (client-supplied header? request hash?), what exactly is stored as the replayable response for a <em>streaming</em> generation, how long keys live, and what a concurrent duplicate receives mid-generation. Streaming makes "replay the stored response" genuinely interesting — bring your answer to the next session and defend it.</p>
+
+  <h2>Interview talking points</h2>
+  <ul>
+    <li>"Networks are at-least-once: a lost response forces the client to retry, so any non-idempotent endpoint will eventually execute twice."</li>
+    <li>"My fix is Stripe-style idempotency keys: one key per logical operation, server stores key → response, replays instead of re-executing."</li>
+    <li>"The two classic implementation bugs: regenerating the key on each retry, and not reserving the key atomically against concurrent duplicates."</li>
+    <li>"Retries need budgets and jittered backoff — at 50% failure, four naive attempts nearly double the load on an already-dying server."</li>
+    <li>"I never optimize without a profile; the hotspot is rarely where intuition points, and cProfile finds it in one command."</li>
+    <li>"My test portfolio is pyramid-shaped: many milliseconds-fast unit tests, some integration tests, few end-to-end — because feedback latency compounds."</li>
+  </ul>
+
+  <h2>Check yourself</h2>
+  <div class="quiz" id="quiz"></div>
+
+  <h2>Primary source</h2>
+  <p>Read <strong>Stripe's <a href="https://stripe.com/blog/idempotency">"Designing robust and predictable APIs with idempotency"</a></strong> — the canonical write-up of the key recipe, by the team that made it an industry norm. Free alternative covering the reliability half: the Google SRE book's <a href="https://sre.google/sre-book/handling-overload/">"Handling Overload"</a> chapter (retry budgets, cascading failure), free online.</p>
+
+  <footer class="lesson-footer">
+    <p><strong>Stuck or curious?</strong> Ask your teacher (the agent) anything — "how would an idempotency key work for a <em>streaming</em> LLM response?" is an excellent follow-up question.</p>
+    <nav class="lesson-nav">
+      <span>◀ Prev: <a href="p0-04-networking.html">p0-04 · Networking</a></span>
+      <span>Next: <a href="p0-06-ml-foundations.html">p0-06 · ML Foundations</a> ▶</span>
+    </nav>
+  </footer>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+renderQuiz(document.getElementById('quiz'), {
+  title: 'Check yourself',
+  questions: [
+    {
+      q: 'A client times out on POST /charges and retries. Without an idempotency key, what can happen?',
+      options: [
+        'The server always detects and rejects the duplicate request',
+        'The customer may be charged twice for one purchase',
+        'The retry always fails because the connection was dropped',
+      ],
+      answer: 1,
+      explain: 'A timeout hides the outcome: the first request may have succeeded with only the response lost. The retry then executes the charge again. Only server-side dedup prevents this.',
+    },
+    {
+      q: 'Why does building a large string with += in a loop become quadratic?',
+      options: [
+        'Each concatenation copies the entire string built so far',
+        'Each concatenation allocates one extra byte of memory only',
+        'Each concatenation triggers garbage collection of older string objects',
+      ],
+      answer: 0,
+      explain: 'Strings are immutable: += creates a new string by copying old + new each iteration. Total copied work is 1+2+…+n ≈ n²/2. Accumulate in a list and join once instead.',
+    },
+    {
+      q: 'Why does the test pyramid put many unit tests below few end-to-end tests?',
+      options: [
+        'Unit tests find every bug that end-to-end tests find',
+        'End-to-end tests are cheaper to maintain than unit tests',
+        'Unit tests stay fast; broad end-to-end tests break easily',
+      ],
+      answer: 2,
+      explain: 'Feedback latency compounds: millisecond unit tests run on every commit, while slow flaky E2E suites get skipped. Each layer catches different bugs — the shape is about cost per catch.',
+    },
+    {
+      q: 'What is the first step before optimizing a slow service?',
+      options: [
+        'Rewrite the hottest loop in a faster compiled language',
+        'Profile it and let measurements locate the real hotspot',
+        'Add caching in front of the slowest database queries',
+      ],
+      answer: 1,
+      explain: 'Intuition about hotspots is famously wrong. A profiler (cProfile, py-spy) names the actual bottleneck in one command — then you fix that, and only that.',
+    },
+    {
+      q: 'A server is failing half its requests. Clients retry up to three extra times without backoff. What happens to its load?',
+      options: [
+        'Load drops because many failing requests give up early',
+        'Load stays flat because retries replace the failed requests',
+        'Load nearly doubles, pushing the struggling server toward collapse',
+      ],
+      answer: 2,
+      explain: 'Expected sends = 1 + 0.5 + 0.25 + 0.125 = 1.875× base load, aimed at a server already in trouble. This is why SRE mandates retry budgets and jittered exponential backoff.',
+    },
+  ],
+});
+</script>
+</body>
+</html>

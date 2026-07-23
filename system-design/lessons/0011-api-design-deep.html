@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lesson 11 · API Design, Deeply</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<div class="lesson">
+  <header class="lesson-header">
+    <p class="kicker">Lesson 0011 · Phase 2 — Software Architecture &amp; Reliability · <a href="0011-api-design-deep.ka.html">ქართული ვერსია</a></p>
+    <h1>API Design, Deeply</h1>
+    <p class="dek">An API is a promise you keep for years. Semantics, versioning, pagination, and idempotency are where senior candidates separate — because they are exactly the places where a lazy choice becomes a double charge, a broken integration, or a double-shipped order.</p>
+  </header>
+
+  <div class="mission-tie">
+    <strong>Mission tie.</strong> Every Anthropic design prompt eventually surfaces an API: <em>"design the public interface for this service"</em> — and the follow-ups are always the same: <em>"what happens when the client times out and retries that POST?"</em> and <em>"how do you ship a breaking change to 10,000 integrations?"</em> Candidates who sketch endpoints keep talking; candidates who name idempotency keys, cursor pagination, and a deprecation policy get the senior signal. The classic systems where these ideas earned their names — Stripe payments, GitHub's API, e-commerce checkout — are this lesson's material. (<a href="https://www.tryexponent.com/blog/anthropic-system-design-interview">Exponent's 2026 Anthropic guide</a>)
+  </div>
+
+  <h2>1 · REST semantics done right</h2>
+  <p>REST's real content is not "pretty URLs" — it is the <strong>uniform contract</strong> of HTTP methods, defined in <a href="https://www.rfc-editor.org/rfc/rfc9110">RFC 9110</a>. Two properties do all the work: <strong>safe</strong> (no server state change — free to cache and prefetch) and <strong>idempotent</strong> (N identical requests ≡ 1 — free to <em>retry</em>). Every retry policy, cache, and proxy on the internet is built on this table; violate it and they all break silently.</p>
+  <table>
+    <tr><th>Method</th><th>Safe</th><th>Idempotent</th><th>Contract</th></tr>
+    <tr><td><strong>GET</strong></td><td>yes</td><td>yes</td><td>Read a resource; never mutate on GET (crawlers will "click" it)</td></tr>
+    <tr><td><strong>PUT</strong></td><td>no</td><td>yes</td><td>Full replace at a known URI; repeating it lands the same state</td></tr>
+    <tr><td><strong>DELETE</strong></td><td>no</td><td>yes</td><td>Remove; a second DELETE may 404, but state is unchanged — still idempotent</td></tr>
+    <tr><td><strong>PATCH</strong></td><td>no</td><td>no*</td><td>Partial update; idempotent only if the patch itself is (set vs increment)</td></tr>
+    <tr><td><strong>POST</strong></td><td>no</td><td><strong>no</strong></td><td>Create / process; retrying may create twice — §4 exists because of this row</td></tr>
+  </table>
+  <p>Status codes are contract too — the coarse-grained ones every client branches on: <strong>200</strong> OK, <strong>201</strong> Created (return a <code>Location</code>), <strong>202</strong> Accepted (async — job started, poll for it), <strong>204</strong> No Content (DELETE's natural reply). Then the pairs interviewers probe: <strong>400 vs 422</strong> (malformed syntax vs well-formed-but-semantically-invalid), <strong>401 vs 403</strong> (unauthenticated — who are you? — vs unauthorized — you may not), <strong>409</strong> Conflict (version/state clash, the optimistic-locking code), <strong>429</strong> Too Many Requests, and <strong>503 + <code>Retry-After</code></strong> (overloaded, and telling clients <em>when</em> to come back instead of letting them decide).</p>
+
+  <h2>2 · Designing the resource model</h2>
+  <p>Resources are <strong>nouns</strong>; the method supplies the verb. <code>POST /orders</code>, not <code>POST /createOrder</code> — the moment verbs leak into paths, every operation becomes bespoke and nothing composes. Conventions that survive years (<a href="https://stripe.com/blog/payment-api-design">Stripe on payment API design</a>, <a href="https://github.com/microsoft/api-guidelines">Microsoft REST API Guidelines</a>):</p>
+  <ul>
+    <li><strong>Nest one level, max two.</strong> <code>/customers/{id}/orders</code> reads well; <code>/customers/{id}/orders/{id}/items/{id}/discounts</code> welds the URL to today's data model. Deep sub-resources get promoted to top level with a filter: <code>/order-items?order_id=…</code>.</li>
+    <li><strong>Filtering and sorting are query params</strong>, not new endpoints: <code>GET /orders?status=shipped&amp;sort=-created</code>. One list endpoint with parameters beats five near-duplicate endpoints drifting apart.</li>
+    <li><strong>PATCH vs PUT.</strong> PUT replaces the whole representation (client must send every field — old clients silently erase new fields, a classic outage). PATCH sends only changes. Stripe-style APIs use partial update semantics almost everywhere for exactly that forward-compatibility reason.</li>
+    <li><strong>Expandable objects over deep nesting in responses:</strong> return <code>customer: "cus_123"</code> by default and inflate it only when the caller asks (<code>?expand=customer</code>) — Stripe's pattern for keeping payloads small without a second endpoint.</li>
+  </ul>
+
+  <h2>3 · Pagination, deeply: offset vs cursor</h2>
+  <p><strong>Worked example — the arithmetic interviewers want to hear.</strong> <code>ORDER BY created DESC LIMIT 20 OFFSET 1000000</code> forces the database to walk and <em>discard</em> 1,000,000 rows before returning 20 — the cost of page N grows linearly with N. At ~1M rows/s of index traversal, page 50,001 costs ~1 <em>second</em> of DB time per request; page 1 costs microseconds. A cursor query — <code>WHERE (created, id) &lt; (:cursor) ORDER BY created DESC, id DESC LIMIT 20</code> — is a B-tree <em>seek</em>: 3–4 page reads, sub-millisecond, <em>regardless of depth</em> (<a href="https://use-the-index-luke.com/no-offset">Use The Index, Luke: No Offset</a>).</p>
+  <p>Worse than slow: offset is <strong>unstable under writes</strong>. Offsets are positions, not identities — an insert at the head of a newest-first feed pushes every row down one, so page 2 re-shows page 1's last row (duplicate processing) and deletions make rows skip pages entirely (silent loss). Slack rebuilt its API pagination on cursors for exactly these reasons (<a href="https://slack.engineering/evolving-api-pagination-at-slack/">Evolving API Pagination at Slack</a>); Stripe's list endpoints are cursor-based (<code>starting_after</code>) throughout (<a href="https://stripe.com/docs/api/pagination">Stripe pagination docs</a>).</p>
+  <table>
+    <tr><th></th><th>Offset (<code>?offset=100&amp;limit=20</code>)</th><th>Cursor (<code>?starting_after=ord_123</code>)</th></tr>
+    <tr><td>Cost of deep pages</td><td>O(offset) — scans and discards</td><td>O(log N) — index seek</td></tr>
+    <tr><td>Stability under concurrent writes</td><td>Drifts: duplicates and skips</td><td>Stable: position pinned to a row</td></tr>
+    <tr><td>Jump to page 37</td><td>Trivial</td><td>Not supported (usually fine)</td></tr>
+    <tr><td>Cursor contents</td><td>—</td><td><strong>Opaque</strong> token (encode sort keys; clients must not parse it — you want freedom to change it)</td></tr>
+    <tr><td>Who uses it</td><td>Admin UIs, small static lists</td><td>Stripe, Slack, GitHub (<code>Link</code> headers, <a href="https://docs.github.com/en/rest/using-the-rest-api/using-pagination-in-the-rest-api">docs</a>)</td></tr>
+  </table>
+
+  <h2>4 · Idempotency keys: the double-charge problem</h2>
+  <p>The scenario that decides payment-API interviews: client calls <code>POST /payments</code>; the server charges the card; the <em>response is lost</em> (timeout, connection reset). The client cannot distinguish "never happened" from "happened, confirmation lost" — so it retries, and the customer is charged twice. Retrying is correct client behavior; POST is simply not idempotent, so the retry is not safe.</p>
+  <p><strong>Stripe's fix</strong> (<a href="https://stripe.com/docs/api/idempotent_requests">idempotent requests docs</a>, <a href="https://stripe.com/blog/idempotency">idempotency blog post</a>): the client generates a unique <code>Idempotency-Key</code> header (a UUID) per logical operation and reuses it on every retry. The server keeps a key store: first time a key arrives, execute and <em>save the response</em> under the key; any later request with the same key <strong>replays the stored response without re-executing</strong>. Keys expire on a TTL (Stripe prunes after 24 h) — the TTL must exceed the longest plausible retry window, or a late retry finds the key gone and executes again (you will break this yourself in the lab, exercise E2). Result: POST becomes <em>effectively</em> idempotent, and safe retries become a documented client duty.</p>
+  <p><strong>Worked numbers.</strong> 30% response loss, up to 3 retries: expected executions per order = 1 + 0.3 + 0.3² + 0.3³ ≈ 1.42 — a naive endpoint double-charges ~42% of orders under that (admittedly brutal) network. At 100k charges/day that is ~42,000 wrong ledger entries daily. The lab reproduces this: ~90 doubles on 200 orders naive, <strong>0</strong> with keys.</p>
+
+  <h2>5 · Versioning: breaking changes without breaking clients</h2>
+  <p>Non-breaking changes — adding a field, adding an endpoint, adding an optional param — need no version at all, <em>provided</em> clients follow the must-ignore rule (tolerate unknown fields). Breaking changes — removing/renaming fields, changing types or semantics — need a strategy:</p>
+  <table>
+    <tr><th>Strategy</th><th>Shape</th><th>Wins</th><th>Pays</th></tr>
+    <tr><td>URL version</td><td><code>/v1/orders</code> → <code>/v2/orders</code></td><td>Visible, cacheable, trivially routable</td><td>Coarse: one flag for the whole API; "v2 forever" migrations stall</td></tr>
+    <tr><td>Header version</td><td><code>Stripe-Version: 2024-06-20</code></td><td>Fine-grained; URL stays stable</td><td>Invisible in logs/browsers; needs tooling</td></tr>
+    <tr><td>Additive-only</td><td>Never break; only add</td><td>No version machinery at all</td><td>Deprecated fields accumulate forever</td></tr>
+  </table>
+  <p><strong>Stripe's date-based model</strong> is the gold standard (<a href="https://stripe.com/blog/api-versioning">Stripe: APIs as infrastructure</a>): every account is <em>pinned</em> to the API version dated when it first went live; each breaking change ships as a new date with a compatibility layer translating old-pinned requests forward. Integrations written in 2016 still work untouched. Whatever you choose, publish a <strong>deprecation policy</strong>: announce, emit <code>Deprecation</code>/<code>Sunset</code> headers, give a real window (GitHub gives months and emails affected callers), then remove.</p>
+
+  <h2>6 · Webhooks: push, verified, and at-least-once</h2>
+  <p>Polling <code>GET /payments/{id}</code> every 2 s to learn a charge settled wastes both sides; a <strong>webhook</strong> pushes the event to the consumer's URL instead. The contract every serious provider documents (<a href="https://docs.stripe.com/webhooks">Stripe webhooks</a>, <a href="https://docs.github.com/en/webhooks/using-webhooks/validating-webhook-deliveries">GitHub webhook validation</a>):</p>
+  <ul>
+    <li><strong>Signature verification.</strong> The provider signs the payload with a shared secret — HMAC-SHA256 in a header (<code>Stripe-Signature</code>, <code>X-Hub-Signature-256</code>). Consumers must verify with a constant-time compare, or anyone who finds the URL can forge "payment succeeded".</li>
+    <li><strong>At-least-once delivery, retried with backoff.</strong> Non-2xx or timeout → the provider re-delivers, backing off over hours or days. Therefore the consumer <em>will</em> see duplicates and <strong>must dedupe on the event id</strong> — consumer-side idempotency, §4's lesson wearing a different hat.</li>
+    <li><strong>Ordering is not guaranteed.</strong> <code>invoice.paid</code> can arrive before <code>invoice.created</code>. Consumers treat events as triggers to re-fetch current state, not as a replayable log.</li>
+    <li><strong>Respond fast, process async:</strong> ack 2xx immediately, enqueue the real work — slow handlers get timed out and re-delivered, creating their own retry storm.</li>
+  </ul>
+
+  <h2>7 · gRPC vs GraphQL vs REST</h2>
+  <p>The decision table (<a href="https://grpc.io/docs/what-is-grpc/introduction/">grpc.io</a>, <a href="https://graphql.org/learn/">graphql.org</a>, <a href="https://github.com/donnemartin/system-design-primer#communication">Primer §Communication</a>):</p>
+  <table>
+    <tr><th></th><th>REST</th><th>gRPC</th><th>GraphQL</th></tr>
+    <tr><td>Coupling / contract</td><td>Loose; OpenAPI optional</td><td>Tight; protobuf <code>.proto</code> is the contract, codegen both ends</td><td>Schema-first; server publishes a typed graph</td></tr>
+    <tr><td>Transport &amp; streaming</td><td>HTTP/1.1+; SSE for server push</td><td>HTTP/2; unary + client/server/bidi streaming built in</td><td>HTTP POST; subscriptions via WebSocket</td></tr>
+    <tr><td>Browser support</td><td>Native</td><td>Needs grpc-web proxy</td><td>Native</td></tr>
+    <tr><td>HTTP caching</td><td>Excellent (GET + cache headers)</td><td>None (POST-like, binary)</td><td>Poor (single POST endpoint)</td></tr>
+    <tr><td>Over/under-fetching</td><td>Fixed shapes; over-fetch common</td><td>Fixed shapes per RPC</td><td>Client picks fields — solves over-fetch, invites N+1 on the server (dataloader/batching required)</td></tr>
+    <tr><td>Schema evolution</td><td>Additive + versioning (§5)</td><td>Field numbers; renames free, removals reserved</td><td>Field deprecation; additive-friendly</td></tr>
+    <tr><td><strong>Wins when</strong></td><td>Public API, maximum reach and cacheability</td><td>Internal service mesh: low latency, typed contracts, streaming</td><td>Client-facing aggregation over many backends (mobile apps, BFF)</td></tr>
+  </table>
+  <p>Interview shorthand: <em>public surface → REST; service-to-service inside the mesh → gRPC; a flexible read layer for many client shapes → GraphQL.</em> They compose — GitHub ships REST <em>and</em> GraphQL publicly while plenty of shops run gRPC behind both.</p>
+
+  <h2>8 · Rate limits and errors are API surface too</h2>
+  <p>How you fail is part of the promise. Return <strong>429</strong> with <code>Retry-After</code> and quota headers (<code>X-RateLimit-Remaining</code>) so well-behaved clients back off instead of hammering — the limiter algorithms themselves (token bucket et al.) were Lesson 0009's material; here the point is the <em>contract</em> (<a href="https://stripe.com/blog/rate-limiters">Stripe: scaling rate limiters</a>). Error bodies deserve a schema: <a href="https://www.rfc-editor.org/rfc/rfc9457">RFC 9457 problem+json</a> standardizes <code>type</code>, <code>title</code>, <code>detail</code>, plus a machine-readable code and a request id for support. Never leak internals — stack traces, SQL fragments, internal hostnames in a 500 are both a debugging crutch and a security gift.</p>
+
+  <h2>9 · The failure modes that decide interviews</h2>
+  <ul>
+    <li><strong>The silent breaking change.</strong> A field renamed "harmlessly" in a Friday deploy; 10,000 integrations parse <code>null</code> on Monday. No version pin, no deprecation window, no contract tests against real consumer traffic. Fix: consumer-driven contract tests in CI + §5's machinery.</li>
+    <li><strong>Retry storm on a non-idempotent endpoint.</strong> Latency spike → clients time out → all retry POST → each retry does the work again <em>and adds load</em>, deepening the spike. Idempotency keys make retries safe; backoff + jitter and a 429/503 with <code>Retry-After</code> make them polite. You need both.</li>
+    <li><strong>Webhook consumer without dedup.</strong> At-least-once delivery meets a handler that ships an order per event: redelivery after a slow ack → two shipments of one order. Every provider warns about this in the docs nobody reads (<a href="https://docs.stripe.com/webhooks">Stripe webhooks: "handle duplicate events"</a>).</li>
+    <li><strong>Pagination drift double-processing orders.</strong> A nightly batch walks <code>/orders?offset=…</code> while checkout keeps inserting: rows shift, page N re-reads page N−1's tail, and the fulfillment job ships some orders twice while never reaching the oldest ones. The lab makes this happen on your machine — 44 duplicated and 44 missed rows out of 120.</li>
+  </ul>
+
+  <h2>10 · One AI note, then back to fundamentals</h2>
+  <p>An inference API bends REST in three places. <strong>Streaming</strong>: token-by-token output means one request → many response chunks, so the response becomes <a href="https://docs.anthropic.com/en/api/messages-streaming">SSE (server-sent events)</a> — status code and headers commit <em>before</em> generation finishes, so mid-stream failures arrive as in-band error events, not status codes. <strong>Idempotency keys on generation requests</strong>: a retried non-idempotent POST here double-<em>bills</em> GPU-minutes instead of double-charging a card — same §4 fix, pricier mistake. <strong>Token-metered rate limits</strong>: quotas are tokens/min, not requests/min, so 429 handling must read usage headers, not just count calls. Same fundamentals, new units — and that is the whole note.</p>
+
+  <h2>11 · Interview talking points</h2>
+  <p>How to deploy this lesson live, in order:</p>
+  <ol>
+    <li><strong>Sketch the resource model first</strong> — nouns, one nesting level, list endpoints with filter params — and say the conventions out loud (§2). It signals you have shipped a public API before.</li>
+    <li><strong>Volunteer the retry question before it is asked</strong>: "POST /payments isn't idempotent, so timeouts + retries double-charge; I'll require an Idempotency-Key and keep a 24 h key store that replays stored responses" (§4). This is the single highest-value sentence in the lesson.</li>
+    <li><strong>Pick cursor pagination and give the two reasons</strong>: deep-offset cost is O(offset), and offsets drift under concurrent writes (§3). Mention the cursor is opaque.</li>
+    <li><strong>State a versioning + deprecation policy</strong> (§5): "additive changes unversioned; breaking changes behind date-pinned versions, Stripe-style, with Sunset headers and a migration window."</li>
+    <li><strong>If events leave your system, name the webhook contract</strong> (§6): HMAC signatures, at-least-once ⇒ consumer dedup, no ordering guarantee.</li>
+    <li><strong>Justify the protocol per audience</strong> (§7): REST outside, gRPC inside, GraphQL only if many client shapes aggregate many backends.</li>
+    <li><strong>Close with the error surface</strong> (§8): 429 + Retry-After, problem+json bodies, request ids, nothing internal leaked.</li>
+  </ol>
+
+  <h2>12 · Lab — double-charge a customer, then stop yourself</h2>
+  <div class="callout"><span class="label">Hands-on (do this before the quiz)</span>
+    Everything above is now verifiable in <code>labs/lab-0011-idempotency-api/</code>:
+    <code>python3 idempotency_lab.py</code> spins up a real payments API (stdlib http.server in a
+    thread) and runs three experiments — naive retry under 30% response loss (count the double
+    charges in the ledger), the same traffic with an <code>Idempotency-Key</code> header and
+    server key store (zero doubles, plus retried DELETE refunds staying safe), and offset vs
+    cursor pagination while orders keep inserting (watch offset duplicate and miss rows while
+    the cursor stays clean). Then do exercises E1–E4 in the lab README:
+    <em>predict, edit config, re-run, compare.</em> Wrong predictions are the deliverable —
+    bring them to the next session.
+  </div>
+
+  <h2>13 · Project step</h2>
+  <p>Decision time for the <strong>LLM inference gateway</strong>: sketch its public API — three endpoints, the idempotency story, and the pagination choice — and defend it in two sentences. A defensible pick: <em><code>POST /v1/generations</code> (SSE streaming, required Idempotency-Key with a 24 h store so client retries never double-bill GPU time), <code>GET /v1/generations/{id}</code> (poll/refetch after webhook or stream drop), and <code>GET /v1/generations?starting_after=…</code> (opaque cursor, because usage dashboards page deep and generations insert constantly). Date-pinned versioning from day one, token-metered 429s with Retry-After.</em> Write your own sketch — endpoints + idempotency + pagination, two sentences of defense — and bring it to the next session for critique.</p>
+
+  <h2>Check yourself</h2>
+  <div class="quiz" id="quiz"></div>
+
+  <h2>Primary source</h2>
+  <p>Read <a href="https://www.rfc-editor.org/rfc/rfc9110">RFC 9110 §9.2 (methods: safe and idempotent)</a> — it is short, and quoting it precisely is a senior tell — then <a href="https://stripe.com/docs/api/idempotent_requests">Stripe's idempotent requests docs</a> plus the <a href="https://stripe.com/blog/idempotency">idempotency blog post</a>, the cleanest production treatment of exactly-once <em>effects</em> over an at-least-once network. Round out with <a href="https://github.com/donnemartin/system-design-primer#representational-state-transfer-rest">Primer §REST vs RPC</a> for the interview-standard comparison vocabulary.</p>
+
+  <footer class="lesson-footer">
+    <p><strong>Stuck or curious?</strong> Ask your teacher (the agent) anything — "why does Stripe replay the stored response instead of just returning 409 on a duplicate key?" is an excellent follow-up question.</p>
+    <nav class="lesson-nav">
+      <span><a href="0010-monolith-to-microservices.html">◀ Prev: 0010 · Monolith → Microservices</a></span>
+      <span><a href="0012-storage-engine-internals.html">Next: 0012 · Storage Engine Internals ▶</a></span>
+    </nav>
+  </footer>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+renderQuiz(document.getElementById('quiz'), {
+  title: 'Check yourself',
+  questions: [
+    {
+      q: "A client's POST /payments times out and it retries. The customer gets charged twice. What is Stripe's standard fix?",
+      options: [
+        'Exponential backoff and jitter between retry attempts',
+        'Switching the payment endpoint verb to PUT',
+        'Idempotency-Key header with a server-side key store',
+      ],
+      answer: 2,
+      explain: 'The client sends a unique Idempotency-Key and reuses it on retries; the server executes once, stores the response under the key, and replays it for duplicates. Backoff makes retries politer, not safer; PUT changes semantics rather than fixing creation.',
+    },
+    {
+      q: 'A batch job walks a newest-first order feed with offset pagination while new orders keep arriving. What corruption does the lab show?',
+      options: [
+        'Rows skipped because offsets shrink as inserts land',
+        'Rows repeated because inserts push earlier rows down',
+        'Rows unchanged because offsets ignore concurrent insert traffic',
+      ],
+      answer: 1,
+      explain: 'Offsets are positions, not identities: each insert at the head shifts every existing row down one, so the next page re-reads rows already processed — and the fixed page budget never reaches the tail. Cursors seek by key, so inserts cannot move the window.',
+    },
+    {
+      q: 'Per RFC 9110, which HTTP method is defined as both safe and idempotent?',
+      options: [
+        'GET',
+        'PUT',
+        'POST',
+      ],
+      answer: 0,
+      explain: 'GET is safe (no state change) and therefore also idempotent. PUT is idempotent but not safe — it mutates state, just to the same result on repeat. POST is neither, which is why §4 needs idempotency keys.',
+    },
+    {
+      q: 'Stripe pins every account to a dated API version and ships breaking changes only behind new dates. What does this buy?',
+      options: [
+        'New clients get faster responses from edge caches',
+        'All clients upgrade automatically once versions are released',
+        'Old integrations keep working while the API evolves',
+      ],
+      answer: 2,
+      explain: 'Version pinning freezes each integration at the behavior it was built against; compatibility layers translate old-pinned requests forward. A 2016 integration keeps working untouched — the whole point of treating the API as a years-long promise.',
+    },
+    {
+      q: 'Stripe and GitHub both deliver webhooks at-least-once and do not guarantee ordering. What must every consumer therefore implement?',
+      options: [
+        'Deduplication keyed on the delivery event identifier',
+        'Acknowledgement batching keyed on the delivery timestamp',
+        'Compression negotiated based on the payload contents',
+      ],
+      answer: 0,
+      explain: 'At-least-once delivery means duplicates are a certainty, not an edge case: any timeout or slow ack triggers redelivery. The consumer records processed event ids and makes the second delivery a no-op — consumer-side idempotency.',
+    },
+    {
+      q: 'An internal service mesh needs low-latency, strongly typed calls with bidirectional streaming. Which protocol fits, and why?',
+      options: [
+        'GraphQL, because clients shape responses through queries',
+        'gRPC, because protobuf contracts and HTTP/2 streams',
+        'REST, because uniform caching suits public consumers',
+      ],
+      answer: 1,
+      explain: 'gRPC pairs a codegen-enforced protobuf contract with HTTP/2 unary and streaming calls — exactly the internal-mesh profile. GraphQL wins at client-driven aggregation; REST wins on public reach and cacheability, neither of which this scenario asks for.',
+    },
+  ],
+});
+</script>
+</body>
+</html>

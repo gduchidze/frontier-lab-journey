@@ -1,0 +1,238 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lesson 23 · Notification System + Distributed Scheduler</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<div class="lesson">
+  <header class="lesson-header">
+    <p class="kicker">Lesson 0023 · Phase 3 — Classic Design Reps · <a href="0023-notifications-scheduler.ka.html">ქართული ვერსია</a></p>
+    <h1>Notification System + Distributed Scheduler — two designs that share a spine</h1>
+    <p class="dek">"Send 100M pushes/SMS/emails a day, reliably" and "run cron across a fleet, exactly once" look like different prompts. Underneath they are the same machine: durable pending work, workers who must not double-fire, and a flaky thing at the end of the pipe.</p>
+  </header>
+
+  <div class="mission-tie">
+    <strong>Mission tie.</strong> Eval-pipeline orchestration and batch-job scheduling at AI labs are this exact design wearing different clothes — a cron tier firing eval batches into a fanout of judge workers, with a rate-capped model API playing the flaky provider.
+  </div>
+
+  <div class="callout"><span class="label">Rep protocol — do this FIRST</span>
+    Before reading further: run a <strong>40-minute solo timed rep</strong> on ONE of the two prompts —
+    <em>"Design a notification system (push, SMS, email) for 100M notifications/day"</em> or
+    <em>"Design a distributed job scheduler (cron at scale)."</em>
+    Out loud, alone, 4-step framework from lesson 0009. THEN read this lesson and log every
+    delta (missed component, unspent number, unnamed failure mode) as a learning record.
+  </div>
+
+  <h2>1 · Two prompts, one lesson</h2>
+  <p>Both prompts reduce to one sentence: <strong>reliable async fanout with time semantics</strong>. A notification system is "deliver this work item to N endpoints <em>now-ish</em>, survive retries and flaky providers." A scheduler is "deliver this work item to a worker <em>at time T</em>, survive crashes and clock drift." Strip the vocabulary and the organs are identical:</p>
+  <table>
+    <tr><th>Organ</th><th>Notification system</th><th>Distributed scheduler</th></tr>
+    <tr><td>Durable pending work</td><td>Per-channel queues</td><td>Job store ordered by fire time</td></tr>
+    <tr><td>Ownership of one item</td><td>Queue visibility / ack</td><td>Lease + fencing token</td></tr>
+    <tr><td>Honest delivery contract</td><td>At-least-once + dedup key</td><td>At-least-once + idempotent handler</td></tr>
+    <tr><td>The flaky dependency</td><td>APNs / SMS / email provider</td><td>The job's own side effects</td></tr>
+    <tr><td>Safety valve</td><td>DLQ + circuit breaker</td><td>Missed-fire catch-up policy</td></tr>
+  </table>
+  <p>That is why they share a lesson: master one spine, narrate it twice. Interviewers grade the same muscles — durable state, ownership, retries, idempotency — in both.</p>
+
+  <h2>2 · Clarify — buy the right notification problem</h2>
+  <p>Underspecified on purpose. The four question families from lesson 0009, plus channel-specific ones:</p>
+  <table>
+    <tr><th>Requirement</th><th>Typical answer</th><th>Decision it forces</th></tr>
+    <tr><td>Channels</td><td>Push (APNs + FCM), SMS (third-party, e.g. Twilio), email (SES/SendGrid)</td><td>Per-channel queues + provider adapters</td></tr>
+    <tr><td>Preferences / opt-out</td><td>Per-user, per-channel, legally mandatory (CAN-SPAM, GDPR)</td><td>Preference filter <em>before</em> enqueue, not after</td></tr>
+    <tr><td>Priority classes</td><td>OTP &gt; transactional &gt; marketing</td><td>Separate queues or priority lanes; OTP never waits behind a campaign</td></tr>
+    <tr><td>Duplicate guarantee</td><td><strong>Soft</strong> no-duplicate: rare dupes tolerated, floods are not</td><td>At-least-once + dedup window, not exactly-once theater</td></tr>
+    <tr><td>Latency SLO</td><td>OTP p99 &lt; 30 s; marketing = hours are fine</td><td>Per-class SLOs → per-class shedding rules</td></tr>
+  </table>
+  <p>Out of scope worth declaring: composing campaign content, in-app inbox rendering, analytics warehouse.</p>
+
+  <h2>3 · Estimate — numbers you will spend</h2>
+  <pre><code>100M notifications/day ÷ ~100k s/day ≈ 1.2k/s average
+Flash event (breaking news, big sale): ×20 peak ≈ 25k/s for minutes
+Channel split: 70M push · 25M email · 5M SMS per day
+
+Provider rate caps (contractual, not yours to change):
+  push ~10k/s   email ~2k/s   SMS ~200/s
+SMS average = 5M/86,400 ≈ 60/s  → fine
+SMS at flash peak = ×20 ≈ 1.2k/s vs 200/s cap
+  → queue grows ~1k/s; a 10-min spike ≈ 600k backlog
+  → drain time 600k ÷ 200/s = 50 minutes
+
+Storage: 100M/day × ~0.5 KB log row ≈ 50 GB/day → keep 30 days ≈ 1.5 TB</code></pre>
+  <p>Spend every number: the 25k/s peak means the ingestion tier is stateless-horizontal behind an LB. The SMS cap math <em>proves</em> you need per-channel queues (a 50-minute SMS backlog must not delay push OTPs) and priority lanes inside SMS (OTP jumps the campaign backlog). The 1.5 TB log fits one partitioned store — audit is cheap, so keep it.</p>
+
+  <h2>4 · High-level notification design</h2>
+  <pre><code>clients / services
+   → Ingestion API  (validate, auth, assign event_id)
+   → Preference + opt-out filter  (drop before you queue)
+   → Template service  (render per-channel body)
+   → per-channel queues  [push] [email] [sms — priority lanes]
+   → channel workers  (rate-limited to provider caps)
+   → provider adapters  (APNs, FCM, Twilio, SES)
+   → notification log  (every attempt, every outcome)</code></pre>
+  <p>Narrate the one non-obvious ordering: filter <em>before</em> the queue — enqueueing a notification the user opted out of wastes queue capacity and risks a compliance incident if the filter is down at dequeue time. And say the sentence that frames the whole deep dive: <strong>the provider is always the bottleneck and always flaky</strong>. You do not control APNs, Twilio has rate caps and outages, email greylists you. Everything downstream of the queue is designed around that fact.</p>
+
+  <h2>5 · Deep dive: reliability — at-least-once, honestly</h2>
+  <p>The contract is <strong>at-least-once delivery + idempotency</strong>; anyone promising exactly-once across a third-party HTTP API is bluffing. The kit:</p>
+  <ul>
+    <li><strong>Idempotency / dedup key.</strong> Every notification carries an <code>event_id</code> assigned at ingestion. Workers and providers that accept idempotency keys (many do) dedupe on it; your own retry path always does.</li>
+    <li><strong>Retries: exponential backoff + jitter</strong> — lesson 0008's retry storm, verbatim. A provider that just failed for 10k messages will receive all 10k retries in the same instant unless jitter spreads them.</li>
+    <li><strong>DLQ.</strong> After k attempts, park the message with its error history. A poison message (malformed token, dead device) must not consume retry budget forever.</li>
+    <li><strong>Circuit breaker per provider.</strong> When Twilio's error rate spikes, stop hammering — fail fast into the queue, probe with trickle traffic, reopen gradually.</li>
+    <li><strong>Notification log.</strong> Append-only record of every attempt and outcome. It answers "did user X get the OTP?" in support tickets and feeds delivery-rate monitoring.</li>
+  </ul>
+
+  <h2>6 · Deep dive: dedup and collapsing</h2>
+  <p>The soft no-duplicate guarantee is implemented as a <strong>dedup window</strong>: on dequeue, <code>SETNX dedup:{event_id} 1 EX 3600</code> in Redis — if the key already existed, someone else delivered (or is delivering) this event within the window; drop it. It is a window, not a ledger: after TTL a replayed event could slip through, which is exactly what "soft" means, and you say so.</p>
+  <p>Two more per-user controls sit at the same choke point:</p>
+  <ul>
+    <li><strong>Per-user rate limit</strong> (lesson 0018's token bucket, scoped per user per channel): no user gets 40 pushes in a minute no matter what upstream does. This is a product guarantee <em>and</em> a bug firewall.</li>
+    <li><strong>Digest / collapse.</strong> "17 people liked your post" instead of 17 pushes. Implemented with a collapse key (<code>user:post:like</code>) and a short buffering delay: hold, count, emit one. Marketing loves it; batteries love it more.</li>
+  </ul>
+
+  <h2>7 · Distributed scheduler — high-level</h2>
+  <p>Second prompt: cron at scale — thousands of recurring and one-shot jobs, fired within seconds of their schedule, across a fleet where any node can die. Anatomy: a <strong>job store</strong> (definitions + <code>next_fire_at</code>, durable DB), a <strong>due-job index</strong> ordered by fire time, and <strong>scheduler workers</strong> that claim and fire due jobs. Three classic shapes for the index:</p>
+  <table>
+    <tr><th>Shape</th><th>How</th><th>Trade-off</th></tr>
+    <tr><td>Timing wheel</td><td>In-memory ring of time buckets; hand advances per tick</td><td>O(1) insert/fire; memory-bound, needs rebuild on restart</td></tr>
+    <tr><td>Sorted set poll</td><td>Redis <code>ZADD</code> by fire timestamp; workers loop <code>ZRANGEBYSCORE 0 now</code></td><td>Simple, durable-ish, visible; polling adds up to one interval of lag</td></tr>
+    <tr><td>Delay queue</td><td>Broker-native delayed delivery (SQS delay, RabbitMQ TTL+DLX)</td><td>Least code; capped delays, hard to cancel or reschedule</td></tr>
+  </table>
+  <p>At scale, <strong>partition by time-bucket</strong> (e.g. one partition per minute-of-hour, or hash of job_id): each partition is owned by one scheduler at a time, so no single node scans the whole schedule and the "everything fires at 00:00" thundering herd spreads across owners.</p>
+
+  <h2>8 · Deep dive: scheduler correctness</h2>
+  <p>The interview question inside the question: <em>what stops two schedulers firing the same job?</em></p>
+  <ul>
+    <li><strong>Leader per partition.</strong> Each partition has one elected owner, via a lease in a coordination store (etcd/ZooKeeper, or a DB row with expiry). Lease expires → someone else takes over.</li>
+    <li><strong>Fencing tokens</strong> (the Phase-2 idea, inline refresher): every lease grant carries a monotonically increasing token. Downstream state — the job-run record, the side-effect store — <strong>rejects writes carrying an older token than it has already seen</strong>. Why leases alone fail: a leader can stall (GC pause, VM freeze), its lease expires, a new leader fires the job — then the zombie wakes and fires again. The zombie holds a stale token, so the downstream write bounces. Lease = probably one owner; fencing = a dead owner's writes are harmless.</li>
+    <li><strong>Missed-fire catch-up policy.</strong> The scheduler was down 10 minutes; a job should have fired 10 times. Per-job policy: <em>fire-all</em> (billing ticks), <em>fire-once-latest</em> (report generation), or <em>skip</em> (cache warmers). Making this configurable is a senior signal — there is no universally right answer.</li>
+    <li><strong>The honest contract:</strong> at-least-once firing + idempotent job handlers. Fencing plus idempotency keys gives exactly-once <em>effect</em>; exactly-once <em>firing</em> is not promisable through crashes.</li>
+    <li><strong>Clocks.</strong> Workers drift; NTP bounds but doesn't eliminate it. One authority decides "due": the job store's clock, never each worker's watch — a worker 1.5 s fast will steal leases and fire early otherwise (your lab demonstrates exactly this).</li>
+  </ul>
+
+  <h2>9 · Failure modes and monitoring</h2>
+  <table>
+    <tr><th>Failure</th><th>Wrong response</th><th>Right response</th></tr>
+    <tr><td>Provider down 20 min</td><td>Drop or retry-hammer</td><td><strong>Backpressure, not amnesia</strong>: buffer in the channel queue, breaker open, drain within caps after recovery; age-shed only marketing class</td></tr>
+    <tr><td>Scheduler leader dies mid-tick</td><td>Assume the tick happened</td><td>New leader recomputes due jobs from durable <code>next_fire_at</code>; fencing blocks the zombie's late writes</td></tr>
+    <tr><td>Poison message</td><td>Infinite retry loop</td><td>DLQ after k attempts, alert on DLQ depth, replay tooling</td></tr>
+    <tr><td>Flash event spike</td><td>Scale the SMS provider (you can't)</td><td>Queues absorb; priority lanes protect OTP; pre-agreed burst caps</td></tr>
+  </table>
+  <p>The two metrics that page a human: <strong>end-to-end delivery p99 per channel per priority class</strong> (enqueue → provider-accepted) and <strong>scheduler fire-lag</strong> (actual fire time − scheduled time). Supporting cast: DLQ depth, per-provider error rate, dedup-drop rate (a sudden rise means an upstream retry loop).</p>
+
+  <h2>10 · Variants and twists</h2>
+  <ul>
+    <li><strong>Webhooks to third parties</strong> — the mirror image: a notification system where <em>you</em> are the flaky provider. So behave like a good one: sign payloads, include an event id so consumers can dedupe, publish your retry-with-backoff policy, give up into a "failed webhooks" dashboard the customer can replay from.</li>
+    <li><strong>Ordering per user.</strong> "Password changed" must not arrive before "password change requested." Partition queues by <code>user_id</code> so one user's notifications are serialized on one lane — global ordering is never the requirement; per-key ordering usually is.</li>
+    <li><strong>Quiet hours / timezones.</strong> "Don't push at 3 a.m. recipient-local" turns every notification into a <em>scheduled</em> delivery at the next allowed local time — the two designs of this lesson literally merge into one system. Say that sentence in the interview.</li>
+  </ul>
+  <p><strong>AI twist (short).</strong> An eval pipeline is this spine verbatim: the scheduler fires nightly eval batches; the fanout tier delivers work items to judge workers; the model API is the rate-capped, flaky provider; fencing stops a stalled orchestrator double-running an eval; the DLQ holds prompts that crash the judge.</p>
+
+  <h2>11 · Interview talking points</h2>
+  <ul>
+    <li><em>Framing:</em> "Both of these are reliable async fanout with time semantics — let me build the shared spine, then specialize."</li>
+    <li><em>Spending a number:</em> "SMS caps at 200/s and the flash peak needs 1.2k/s — that gap is why the SMS queue is deep, priority-laned, and isolated from push."</li>
+    <li><em>Honest contract:</em> "I'll promise at-least-once plus idempotency and engineer the duplicates down; exactly-once across Twilio's API is not a promise I can keep."</li>
+    <li><em>Unprompted failure mode:</em> "The scary one is the stalled leader that wakes after its lease expired — fencing tokens make its late writes bounce."</li>
+    <li><em>Ops close:</em> "The pager metrics are delivery p99 per class and scheduler fire-lag — not CPU."</li>
+  </ul>
+
+  <h2>12 · Lab + project step</h2>
+  <div class="callout"><span class="label">Hands-on (do this before the quiz)</span>
+    In <code>labs/lab-0023-scheduler/</code>, <code>python3 scheduler_lab.py</code> runs a simulated
+    fleet of scheduler workers against a delayed-job store: a worker crashes mid-fire, another's
+    clock drifts, leases race — and you watch duplicate fires happen <em>without</em> fencing,
+    then vanish with fencing + idempotent handlers. Experiment 3 pushes notifications through a
+    30%-flaky provider with backoff + jitter and a DLQ. Predict before each run — README has E1–E4.
+  </div>
+  <p><strong>Project step.</strong> File your rep deltas (the gap between your 40-minute design and this lesson) as a learning record. Then add one paragraph to your spine-project notes mapping this lesson onto the inference platform: which component is the scheduler (eval cron), which are the channel queues (judge fanout), and which provider cap plays the role of Twilio (model API rate limits).</p>
+
+  <h2>Check yourself</h2>
+  <div class="quiz" id="quiz"></div>
+
+  <h2>Primary source</h2>
+  <p>Read the AWS Builders' Library's <a href="https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/">"Timeouts, retries, and backoff with jitter"</a> — the canonical treatment of the retry mechanics both halves of this lesson depend on. Companion: the <a href="https://github.com/donnemartin/system-design-primer#asynchronism">Primer's asynchronism section</a> for the queue-and-worker patterns underneath the fanout.</p>
+
+  <footer class="lesson-footer">
+    <p><strong>Stuck or curious?</strong> Ask your teacher (the agent) anything — "how would I cancel or reschedule a job that's already inside a broker-native delay queue?" is an excellent follow-up question.</p>
+    <nav class="lesson-nav">
+      <span>◀ <a href="0022-file-sync.html">0022 · File Sync</a></span>
+      <span><a href="0024-web-crawler.html">0024 · Web Crawler</a> ▶</span>
+    </nav>
+  </footer>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+renderQuiz(document.getElementById('quiz'), {
+  title: 'Check yourself',
+  questions: [
+    {
+      q: 'Why do the notification system and the distributed scheduler share one lesson?',
+      options: [
+        'Both are reliable async fanout with time semantics',
+        'Both are simple stateless synchronous request-response web services',
+        'Both are read-heavy caching problems with TTL semantics',
+      ],
+      answer: 0,
+      explain: 'A notification system delivers work items now-ish; a scheduler delivers them at time T. Same organs: durable pending work, ownership of one item, at-least-once plus idempotency, a safety valve.',
+    },
+    {
+      q: 'What is the honest delivery contract for both systems in this lesson?',
+      options: [
+        'Exactly-once delivery guaranteed by the message broker',
+        'At-least-once delivery paired with idempotent downstream handlers',
+        'At-most-once delivery so users never see duplicates',
+      ],
+      answer: 1,
+      explain: 'Exactly-once across a crash or a third-party API is not promisable. At-least-once plus dedup keys and idempotent handlers gives exactly-once EFFECT, which is the claim you can defend.',
+    },
+    {
+      q: 'In the notification pipeline, which component is the persistent bottleneck?',
+      options: [
+        'The ingestion API validating and enqueueing user requests',
+        'The template service rendering per-channel notification message bodies',
+        'The external providers with rate caps and outages',
+      ],
+      answer: 2,
+      explain: 'Ingestion and templating are stateless and scale horizontally. APNs, Twilio, and email providers impose contractual rate caps and fail on their own schedule — everything downstream of the queue is designed around that.',
+    },
+    {
+      q: 'What does a fencing token add that a lease TTL alone cannot?',
+      options: [
+        'Downstream rejection of writes from stale lease holders',
+        'Automatic lease renewal for workers that finish slowly',
+        'Faster leader election whenever the current holder crashes',
+      ],
+      answer: 0,
+      explain: 'A stalled leader can wake after its lease expired and a successor took over. The lease cannot stop its late writes — only the downstream store, rejecting tokens older than the highest seen, can.',
+    },
+    {
+      q: 'An SMS provider goes down for twenty minutes. The correct system response?',
+      options: [
+        'Drop the queued notifications so latency stays low',
+        'Retry every message immediately until the provider recovers',
+        'Buffer with backpressure, then drain within provider caps',
+      ],
+      answer: 2,
+      explain: 'Backpressure, not amnesia: the breaker opens, the channel queue absorbs, and after recovery workers drain at the provider\'s rate cap. Only aged-out marketing-class messages are candidates for shedding.',
+    },
+    {
+      q: 'Why does retry jitter matter after a mass provider failure?',
+      options: [
+        'It shortens every backoff so deliveries complete sooner',
+        'It desynchronizes retries that would otherwise arrive together',
+        'It guarantees ordering of retries across the queue',
+      ],
+      answer: 1,
+      explain: 'Ten thousand messages failing at the same moment schedule ten thousand retries at the same later moment — a synchronized second wave. Jitter spreads each backoff uniformly, flattening the wave into a drizzle.',
+    },
+  ],
+});
+</script>
+</body>
+</html>

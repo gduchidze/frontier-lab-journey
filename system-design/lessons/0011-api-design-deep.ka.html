@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="ka">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>გაკვეთილი 11 · API დიზაინი, სიღრმისეულად</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<div class="lesson">
+  <header class="lesson-header">
+    <p class="kicker">გაკვეთილი 0011 · ფაზა 2 — პროგრამული არქიტექტურა და საიმედოობა · <a href="0011-api-design-deep.html">English version</a></p>
+    <h1>API დიზაინი, სიღრმისეულად</h1>
+    <p class="dek">API დაპირებაა, რომელსაც წლობით ასრულებ. სემანტიკა, versioning (ვერსიონირება), pagination (გვერდებად დაყოფა) და idempotency (იდემპოტენტურობა) — სწორედ აქ განსხვავდებიან senior კანდიდატები, რადგან ზარმაცი არჩევანი აქ ორმაგ ჩამოჭრად ან ორჯერ გაგზავნილ შეკვეთად იქცევა.</p>
+  </header>
+
+  <div class="mission-tie">
+    <strong>მისიასთან კავშირი.</strong> Anthropic-ის ყველა დიზაინ-ამოცანა ადრე თუ გვიან API-მდე მიდის: <em>„დააპროექტე ამ სერვისის საჯარო ინტერფეისი"</em> — და დამატებითი კითხვები ყოველთვის ერთი და იგივეა: <em>„რა ხდება, როცა კლიენტს timeout მოუვა და ის POST-ს გაიმეორებს?"</em> და <em>„როგორ გაუშვებ breaking change-ს 10,000 ინტეგრაციაზე?"</em> კანდიდატები, რომლებიც ასახელებენ idempotency key-ებს, cursor pagination-ს და deprecation (მოძველების) პოლიტიკას, senior სიგნალს იძლევიან. მასალა კლასიკური სისტემებია: Stripe-ის გადახდები, GitHub-ის API, e-commerce checkout. (<a href="https://www.tryexponent.com/blog/anthropic-system-design-interview">Exponent-ის 2026 Anthropic გზამკვლევი</a>)
+  </div>
+
+  <h2>1 · REST-ის სემანტიკა სწორად</h2>
+  <p>REST-ის ნამდვილი შინაარსი „ლამაზი URL-ები" კი არა, HTTP მეთოდების <strong>ერთიანი კონტრაქტია</strong> (<a href="https://www.rfc-editor.org/rfc/rfc9110">RFC 9110</a>). ორი თვისება აკეთებს მთელ საქმეს: <strong>safe</strong> (უსაფრთხო — სერვერის state არ იცვლება, ე.ი. თავისუფლად ქეშირდება) და <strong>idempotent</strong> (იდემპოტენტური — N იდენტური მოთხოვნა ≡ 1, ე.ი. თავისუფლად <em>მეორდება</em>). ინტერნეტის ყველა retry-პოლიტიკა და proxy ამ ცხრილზეა აშენებული:</p>
+  <table>
+    <tr><th>მეთოდი</th><th>Safe</th><th>Idempotent</th><th>კონტრაქტი</th></tr>
+    <tr><td><strong>GET</strong></td><td>კი</td><td>კი</td><td>წაკითხვა; GET-ზე არასდროს შეცვალო state</td></tr>
+    <tr><td><strong>PUT</strong></td><td>არა</td><td>კი</td><td>სრული ჩანაცვლება ცნობილ URI-ზე; გამეორება იმავე state-ს ტოვებს</td></tr>
+    <tr><td><strong>DELETE</strong></td><td>არა</td><td>კი</td><td>წაშლა; მეორე DELETE შეიძლება 404 იყოს, მაგრამ state უცვლელია</td></tr>
+    <tr><td><strong>PATCH</strong></td><td>არა</td><td>არა*</td><td>ნაწილობრივი განახლება; იდემპოტენტურია მხოლოდ თუ თვითონ patch-ია (set და არა increment)</td></tr>
+    <tr><td><strong>POST</strong></td><td>არა</td><td><strong>არა</strong></td><td>შექმნა/დამუშავება; გამეორებამ შეიძლება ორჯერ შექმნას — §3 ამ სტრიქონის გამო არსებობს</td></tr>
+  </table>
+  <p>Status code-ებიც კონტრაქტია: <strong>200/201/202/204</strong> (OK / შეიქმნა / ასინქრონულად მიღებულია / პასუხის გარეშე), და წყვილები, რომლებსაც ინტერვიუერები ამოწმებენ: <strong>400 vs 422</strong> (გაფუჭებული სინტაქსი vs სწორი ფორმის, მაგრამ სემანტიკურად უვარგისი), <strong>401 vs 403</strong> (ვინ ხარ? vs არ გაქვს უფლება), <strong>409</strong> (კონფლიქტი — optimistic locking), <strong>429</strong> (ბევრი მოთხოვნა) და <strong>503 + <code>Retry-After</code></strong> (გადატვირთულია და კლიენტს ეუბნები, <em>როდის</em> დაბრუნდეს). რესურსების მოდელი: <strong>არსებითი სახელები</strong> (<code>POST /orders</code> და არა <code>POST /createOrder</code>), მაქსიმუმ 1–2 დონის nesting, ფილტრები query პარამეტრებით, PATCH ნაწილობრივი განახლებისთვის (<a href="https://stripe.com/blog/payment-api-design">Stripe: payment API design</a>, <a href="https://github.com/microsoft/api-guidelines">Microsoft REST Guidelines</a>).</p>
+
+  <h2>2 · Pagination, სიღრმისეულად: offset vs cursor</h2>
+  <p><strong>არითმეტიკა, რომლის მოსმენაც ინტერვიუერს უნდა.</strong> <code>LIMIT 20 OFFSET 1000000</code> database-ს აიძულებს, ჯერ მილიონი სტრიქონი გაიაროს და <em>გადააგდოს</em> — ღრმა გვერდის ფასი offset-ის პროპორციულია: ~1 <em>წამი</em> DB-დრო თითო მოთხოვნაზე. Cursor-ული query — <code>WHERE (created, id) &lt; (:cursor) … LIMIT 20</code> — B-tree-ში <em>seek</em>-ია: 3–4 გვერდის წაკითხვა, მილიწამზე ნაკლები, სიღრმის მიუხედავად (<a href="https://use-the-index-luke.com/no-offset">Use The Index, Luke: No Offset</a>). და უარესი: offset <strong>არასტაბილურია პარალელური ჩაწერებისას</strong> — Slack-მა API-ის pagination სწორედ ამიტომ გადააშენა cursor-ებზე (<a href="https://slack.engineering/evolving-api-pagination-at-slack/">Evolving API Pagination at Slack</a>), Stripe-ის ყველა list endpoint cursor-ულია (<a href="https://stripe.com/docs/api/pagination">Stripe pagination</a>).</p>
+  <table>
+    <tr><th></th><th>Offset</th><th>Cursor</th></tr>
+    <tr><td>ღრმა გვერდის ფასი</td><td>O(offset) — სკანავს და აგდებს</td><td>O(log N) — index seek</td></tr>
+    <tr><td>სტაბილურობა პარალელურ ჩაწერებზე</td><td>Drift (გადაცურვა): დუბლიკატები და გამოტოვებები</td><td>სტაბილური: პოზიცია სტრიქონზეა მიბმული</td></tr>
+    <tr><td>37-ე გვერდზე გადახტომა</td><td>ტრივიალურია</td><td>არ არის (ხშირად არც სჭირდება)</td></tr>
+    <tr><td>Cursor-ის შიგთავსი</td><td>—</td><td><strong>Opaque</strong> (გაუმჭვირვალე) ტოკენი — კლიენტმა არ უნდა გაარჩიოს</td></tr>
+  </table>
+
+  <h2>3 · Idempotency key-ები: ორმაგი ჩამოჭრის პრობლემა</h2>
+  <p>სცენარი, რომელიც გადახდების ინტერვიუებს წყვეტს: კლიენტი იძახებს <code>POST /payments</code>-ს; სერვერი ბარათს ჩამოაჭრის; <em>პასუხი იკარგება</em>. კლიენტი ვერ არჩევს „არ მომხდარა"-ს „მოხდა, დადასტურება დაიკარგა"-სგან — ამიტომ იმეორებს, და კლიენტს ორჯერ ჩამოეჭრება. გამეორება სწორი ქცევაა; უბრალოდ POST იდემპოტენტური არ არის.</p>
+  <p><strong>Stripe-ის გამოსავალი</strong> (<a href="https://stripe.com/docs/api/idempotent_requests">idempotent requests docs</a>, <a href="https://stripe.com/blog/idempotency">idempotency ბლოგი</a>): კლიენტი თითო ლოგიკურ ოპერაციაზე აგენერირებს უნიკალურ <code>Idempotency-Key</code> header-ს და ყოველ გამეორებაზე ერთსა და იმავეს იყენებს. სერვერს აქვს key store: key პირველად მოვიდა → შეასრულე და <em>პასუხი შეინახე</em>; იგივე key მეორედ → <strong>შენახული პასუხის replay ხელახლა შესრულების გარეშე</strong>. Key-ები TTL-ით იწმინდება (Stripe — 24 საათი): TTL ყველაზე გრძელ სავარაუდო retry-ფანჯარაზე მეტი უნდა იყოს, თორემ დაგვიანებული გამეორება key-ს ვეღარ იპოვის და ისევ შეასრულებს (ლაბის E2-ში ამას შენ თვითონ გატეხავ). <strong>რიცხვები:</strong> 30% პასუხის დაკარგვა + 3 retry → მოსალოდნელი შესრულებები = 1 + 0.3 + 0.3² + 0.3³ ≈ 1.42 თითო შეკვეთაზე — გულუბრყვილო endpoint შეკვეთების ~42%-ს აორმაგებს. ლაბში: ~90 დუბლი 200 შეკვეთაზე key-ის გარეშე, <strong>0</strong> — key-ით.</p>
+
+  <h2>4 · Versioning და webhook-ები</h2>
+  <p><strong>Versioning:</strong> დანამატი ცვლილებები (ველის დამატება) ვერსიას არ საჭიროებს, თუ კლიენტები უცნობ ველებს უგულებელყოფენ. Breaking ცვლილებებს სტრატეგია სჭირდება: URL-ვერსია (<code>/v1/</code> — თვალსაჩინო, მაგრამ უხეში), header-ვერსია (<code>Stripe-Version: 2024-06-20</code> — წვრილმარცვლოვანი) ან additive-only (არასდროს გატეხო). ოქროს სტანდარტი <strong>Stripe-ის თარიღებზე დაფუძნებული მოდელია</strong> (<a href="https://stripe.com/blog/api-versioning">Stripe: APIs as infrastructure</a>): ყოველი ანგარიში თავის თარიღიან ვერსიაზეა <em>მიმაგრებული</em> (pinned), breaking ცვლილება ახალი თარიღით გამოდის, თავსებადობის ფენა კი ძველ მოთხოვნებს წინ თარგმნის — 2016 წლის ინტეგრაცია დღემდე უცვლელად მუშაობს. აუცილებელია გამოქვეყნებული deprecation პოლიტიკა: ანონსი, <code>Sunset</code> header-ები, რეალური ფანჯარა.</p>
+  <p><strong>Webhook-ები</strong> — push, polling-ის ნაცვლად (<a href="https://docs.stripe.com/webhooks">Stripe webhooks</a>, <a href="https://docs.github.com/en/webhooks/using-webhooks/validating-webhook-deliveries">GitHub webhook validation</a>): (1) <strong>ხელმოწერის შემოწმება</strong> — HMAC-SHA256 header-ში, თორემ URL-ის მპოვნელი ნებისმიერი „payment succeeded"-ს გაგიყალბებს; (2) <strong>at-least-once მიწოდება</strong> backoff-იანი გამეორებებით — ე.ი. დუბლიკატები <em>გარანტირებულია</em> და მომხმარებელმა event id-ზე <strong>dedup</strong> უნდა გააკეთოს; (3) <strong>თანმიმდევრობა გარანტირებული არ არის</strong> — event სიგნალია მიმდინარე state-ის გადამოწმებისთვის და არა log; (4) უპასუხე 2xx-ით სწრაფად, რეალური სამუშაო რიგში ჩააგდე.</p>
+
+  <h2>5 · gRPC vs GraphQL vs REST</h2>
+  <table>
+    <tr><th></th><th>REST</th><th>gRPC</th><th>GraphQL</th></tr>
+    <tr><td>კონტრაქტი</td><td>თავისუფალი; OpenAPI არასავალდებულო</td><td>მჭიდრო; protobuf + codegen ორივე მხარეს</td><td>Schema-first ტიპიზებული გრაფი</td></tr>
+    <tr><td>Streaming</td><td>SSE server push-ისთვის</td><td>HTTP/2: unary + ორმხრივი streaming ჩაშენებული</td><td>Subscriptions WebSocket-ით</td></tr>
+    <tr><td>ბრაუზერი / ქეშირება</td><td>ბუნებრივი / შესანიშნავი</td><td>grpc-web proxy სჭირდება / არა</td><td>ბუნებრივი / სუსტი (ერთი POST)</td></tr>
+    <tr><td>Over-fetching</td><td>ფიქსირებული ფორმები — ხშირია</td><td>ფიქსირებული ფორმები თითო RPC-ზე</td><td>კლიენტი ირჩევს ველებს — მაგრამ სერვერზე N+1-ს იწვევს</td></tr>
+    <tr><td><strong>იგებს, როცა</strong></td><td>საჯარო API — მაქსიმალური წვდომა</td><td>შიდა service mesh — დაბალი latency, ტიპიზება, streaming</td><td>მრავალი კლიენტის აგრეგაცია (mobile, BFF)</td></tr>
+  </table>
+  <p>ინტერვიუს ფორმულა: <em>საჯარო ზედაპირი → REST; სერვისებს შორის mesh-ში → gRPC; მოქნილი read-ფენა მრავალი კლიენტისთვის → GraphQL.</em> (<a href="https://grpc.io/docs/what-is-grpc/introduction/">grpc.io</a>, <a href="https://graphql.org/learn/">graphql.org</a>, <a href="https://github.com/donnemartin/system-design-primer#communication">Primer §Communication</a>) შეცდომებიც API-ის ზედაპირია: 429 + <code>Retry-After</code> + კვოტის header-ები, შეცდომის ტანი <a href="https://www.rfc-editor.org/rfc/rfc9457">RFC 9457 problem+json</a>-ით, და შიდა დეტალები (stack trace, SQL) არასდროს გაჟონოს.</p>
+
+  <h2>6 · Failure mode-ები, რომლებიც ინტერვიუებს წყვეტენ</h2>
+  <ul>
+    <li><strong>ჩუმად გაშვებული breaking change.</strong> პარასკევს „უწყინრად" გადარქმეული ველი — ორშაბათს 10,000 ინტეგრაცია <code>null</code>-ს კითხულობს. გამოსავალი: ვერსიის pinning + deprecation ფანჯარა + კონტრაქტ-ტესტები CI-ში.</li>
+    <li><strong>Retry storm არაიდემპოტენტურ endpoint-ზე.</strong> Latency-პიკი → timeout-ები → ყველა იმეორებს POST-ს → ყოველი გამეორება საქმეს ხელახლა აკეთებს <em>და</em> დატვირთვას ამატებს. Idempotency key-ები გამეორებას უსაფრთხოს ხდიან; backoff + jitter — ზრდილობიანს. ორივე გჭირდება.</li>
+    <li><strong>Webhook-მომხმარებელი dedup-ის გარეშე.</strong> At-least-once მიწოდება + handler, რომელიც თითო event-ზე შეკვეთას აგზავნის = ერთი შეკვეთის ორი გზავნილი. Stripe-ის დოკებში წერია, უბრალოდ არავინ კითხულობს.</li>
+    <li><strong>Pagination drift-ით ორჯერ დამუშავებული შეკვეთები.</strong> ღამის batch <code>/orders?offset=…</code>-ს დადის, checkout კი ჩაწერას აგრძელებს: სტრიქონები ინაცვლებენ, გვერდი N წინა გვერდის ბოლოს ხელახლა კითხულობს — ზოგი შეკვეთა ორჯერ იგზავნება, უძველესებამდე კი ვერასდროს აღწევს. ლაბში: 120-დან 44 დუბლირებული და 44 გამოტოვებული სტრიქონი.</li>
+  </ul>
+
+  <div class="callout"><span class="label">LLM შტრიხი</span>
+    Inference API REST-ს სამ ადგილას ღუნავს: <strong>streaming</strong> — token-token პასუხი ნიშნავს <a href="https://docs.anthropic.com/en/api/messages-streaming">SSE-ს</a>, სადაც status code გენერაციის დასრულებამდე ფიქსირდება და შუა-stream შეცდომები in-band event-ებად მოდის; <strong>idempotency key-ები გენერაციის მოთხოვნებზე</strong> — გამეორებული POST აქ GPU-წუთებს <em>აორმაგებს</em> ბარათის ნაცვლად, იგივე §3-ის წამალი, უფრო ძვირი შეცდომა; <strong>token-ებით გაზომილი rate limit-ები</strong> — კვოტა tokens/min-ია და არა requests/min. იგივე ფუნდამენტები, ახალი ერთეულები.
+  </div>
+
+  <h2>7 · ლაბი — ჩამოაჭერი კლიენტს ორჯერ, მერე შეაჩერე საკუთარი თავი</h2>
+  <div class="callout"><span class="label">პრაქტიკა (ქვიზამდე გააკეთე)</span>
+    ყველაფერი ზემოთქმული ახლა შემოწმებადია: <code>labs/lab-0011-idempotency-api/</code>-ში
+    <code>python3 idempotency_lab.py</code> უშვებს ნამდვილ პატარა payments API-ს (stdlib
+    http.server, ცალკე thread-ში) და სამ ექსპერიმენტს — გულუბრყვილო retry 30% პასუხის
+    დაკარგვისას (დათვალე ორმაგი ჩამოჭრები ledger-ში), იგივე ტრაფიკი <code>Idempotency-Key</code>
+    header-ითა და სერვერის key store-ით (ნული დუბლი), და offset vs cursor pagination ცოცხალი
+    ჩაწერების ფონზე (offset დუბლირებს და კარგავს, cursor სუფთა რჩება). შემდეგ README-ს E1–E4:
+    <em>იწინასწარმეტყველე, შეცვალე კონფიგი, გაუშვი თავიდან, შეადარე.</em> მცდარი პროგნოზები
+    დავალების შედეგია — მოიტანე შემდეგ სესიაზე.
+  </div>
+
+  <h2>8 · პროექტის ნაბიჯი</h2>
+  <p>გადაწყვეტილების დროა <strong>LLM inference gateway</strong>-სთვის: დახაზე მისი საჯარო API — სამი endpoint, idempotency-ის ამბავი და pagination-ის არჩევანი — და ორი წინადადებით დაიცავი. დასაცავი მაგალითი: <em><code>POST /v1/generations</code> (SSE streaming, სავალდებულო Idempotency-Key 24-საათიანი store-ით, რომ კლიენტის გამეორებებმა GPU-დრო არასდროს დააორმაგონ), <code>GET /v1/generations/{id}</code> (stream-ის ჩავარდნის შემდეგ გადამოწმება) და <code>GET /v1/generations?starting_after=…</code> (opaque cursor, რადგან დაფები ღრმად კითხულობენ და გენერაციები მუდმივად ემატება). თარიღზე მიმაგრებული ვერსიები პირველივე დღიდან, token-ებით გაზომილი 429-ები Retry-After-ით.</em> დაწერე შენი ესკიზი და მოიტანე შემდეგ სესიაზე გასარჩევად.</p>
+
+  <h2>შეამოწმე შენი თავი</h2>
+  <div class="quiz" id="quiz"></div>
+
+  <h2>ძირითადი წყარო</h2>
+  <p>წაიკითხე <a href="https://www.rfc-editor.org/rfc/rfc9110">RFC 9110 §9.2 (safe და idempotent მეთოდები)</a> — მოკლეა, და მისი ზუსტი ციტირება senior ნიშანია — შემდეგ <a href="https://stripe.com/docs/api/idempotent_requests">Stripe-ის idempotent requests დოკუმენტაცია</a> და <a href="https://stripe.com/blog/idempotency">idempotency ბლოგ-პოსტი</a>: exactly-once <em>ეფექტების</em> ყველაზე სუფთა production-განხილვა at-least-once ქსელზე. დაასრულე <a href="https://github.com/donnemartin/system-design-primer#representational-state-transfer-rest">Primer §REST vs RPC</a>-ით.</p>
+
+  <footer class="lesson-footer">
+    <p><strong>გაიჭედე ან გაინტერესებს?</strong> ჰკითხე მასწავლებელს (აგენტს) ნებისმიერი რამ — „რატომ აკეთებს Stripe შენახული პასუხის replay-ს დუბლიკატ key-ზე 409-ის დაბრუნების ნაცვლად?" შესანიშნავი დამატებითი კითხვაა.</p>
+    <nav class="lesson-nav">
+      <span><a href="0010-monolith-to-microservices.ka.html">◀ წინა: 0010 · მონოლითი → მიკროსერვისები</a></span>
+      <span><a href="0012-storage-engine-internals.ka.html">შემდეგი: 0012 · Storage Engine-ის შიდა მოწყობა ▶</a></span>
+    </nav>
+  </footer>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+renderQuiz(document.getElementById('quiz'), {
+  title: 'შეამოწმე შენი თავი',
+  questions: [
+    {
+      q: 'კლიენტის POST /payments-ს timeout მოუვიდა და გაიმეორა. კლიენტს ორჯერ ჩამოეჭრა თანხა. რა არის Stripe-ის სტანდარტული გამოსავალი?',
+      options: [
+        'Exponential backoff და jitter გამეორების მცდელობებს შორის',
+        'გადახდის endpoint-ის ზმნის POST-დან PUT-ზე გადართვა',
+        'Idempotency-Key header სერვერის მხარეს key store-ით',
+      ],
+      answer: 2,
+      explain: 'კლიენტი უნიკალურ Idempotency-Key-ს აგზავნის და გამეორებებზე იმავეს იყენებს; სერვერი ერთხელ ასრულებს, პასუხს key-ის ქვეშ ინახავს და დუბლიკატებზე მას replay-ს უკეთებს. Backoff გამეორებას აზრდილობიანებს და არა უსაფრთხოს; PUT სემანტიკას ცვლის და შექმნის პრობლემას ვერ ხსნის.',
+    },
+    {
+      q: 'Batch job ახალი-პირველი შეკვეთების ლენტას offset pagination-ით დადის, ახალი შეკვეთები კი ემატება. რა კორუფციას აჩვენებს ლაბი?',
+      options: [
+        'სტრიქონები გამოტოვებულია, რადგან insert-ები offset-ებს ამცირებენ ჯამში',
+        'სტრიქონები გამეორებულია, რადგან insert-ები ძველ სტრიქონებს ქვემოთ სწევენ',
+        'სტრიქონები უცვლელია, რადგან offset-ები პარალელურ insert-ებს უგულებელყოფენ სრულად',
+      ],
+      answer: 1,
+      explain: 'Offset პოზიციაა და არა იდენტობა: ყოველი insert სათავეში ყველა არსებულ სტრიქონს ერთით ქვემოთ სწევს, ამიტომ შემდეგი გვერდი უკვე დამუშავებულ სტრიქონებს ხელახლა კითხულობს — ბოლომდე კი ვერასდროს აღწევს. Cursor key-ით ეძებს და insert-ები ფანჯარას ვერ ამოძრავებენ.',
+    },
+    {
+      q: 'RFC 9110-ის მიხედვით, რომელი HTTP მეთოდია განსაზღვრული როგორც safe და idempotent ერთდროულად?',
+      options: [
+        'GET',
+        'PUT',
+        'POST',
+      ],
+      answer: 0,
+      explain: 'GET უსაფრთხოა (state არ იცვლება) და შესაბამისად იდემპოტენტურიც. PUT იდემპოტენტურია, მაგრამ safe არა — state-ს ცვლის, უბრალოდ გამეორება იმავე შედეგს ტოვებს. POST არც ერთია, სწორედ ამიტომ სჭირდება §3-ს idempotency key-ები.',
+    },
+    {
+      q: 'Stripe ყოველ ანგარიშს თარიღიან API ვერსიაზე ამაგრებს და breaking ცვლილებებს მხოლოდ ახალი თარიღების უკან უშვებს. რას ყიდულობს ეს?',
+      options: [
+        'ახალი კლიენტები edge ქეშებიდან უფრო სწრაფ პასუხებს იღებენ',
+        'ყველა კლიენტი ავტომატურად განახლდება ვერსიების გამოსვლისთანავე მაშინვე',
+        'ძველი ინტეგრაციები მუშაობას აგრძელებენ, სანამ API ვითარდება',
+      ],
+      answer: 2,
+      explain: 'ვერსიის pinning ყოველ ინტეგრაციას იმ ქცევაზე ყინავს, რომელზეც აშენდა; თავსებადობის ფენები ძველ მოთხოვნებს წინ თარგმნიან. 2016 წლის ინტეგრაცია ხელუხლებლად მუშაობს — სწორედ ეს არის API-ის, როგორც მრავალწლიანი დაპირების, აზრი.',
+    },
+    {
+      q: 'Stripe-იც და GitHub-იც webhook-ებს at-least-once აწვდიან და თანმიმდევრობას არ იძლევიან გარანტიით. რა უნდა დანერგოს ყოველმა მომხმარებელმა?',
+      options: [
+        'დედუპლიკაცია მიწოდებული event-ის იდენტიფიკატორზე გასაღებით',
+        'დადასტურებების დაჯგუფება მიწოდების timestamp-ზე გასაღებით მუდმივად',
+        'შეკუმშვის შეთანხმება payload-ის შიგთავსზე დაყრდნობით ყოველთვის',
+      ],
+      answer: 0,
+      explain: 'At-least-once მიწოდება ნიშნავს, რომ დუბლიკატები გარანტიაა და არა კიდური შემთხვევა: ნებისმიერი timeout ან ნელი ack ხელახალ მიწოდებას იწვევს. მომხმარებელი დამუშავებულ event id-ებს ინახავს და მეორე მიწოდებას no-op-ად აქცევს — მომხმარებლის მხარის idempotency.',
+    },
+    {
+      q: 'შიდა service mesh-ს სჭირდება დაბალი latency, მკაცრად ტიპიზებული გამოძახებები და ორმხრივი streaming. რომელი პროტოკოლი ერგება და რატომ?',
+      options: [
+        'GraphQL, რადგან კლიენტები პასუხების ფორმას queries-ით არჩევენ',
+        'gRPC, რადგან protobuf კონტრაქტები და HTTP/2 stream-ები',
+        'REST, რადგან ერთიანი ქეშირება საჯარო მომხმარებლებს ერგება',
+      ],
+      answer: 1,
+      explain: 'gRPC აერთიანებს codegen-ით აღსრულებულ protobuf კონტრაქტს და HTTP/2-ის unary/streaming გამოძახებებს — ზუსტად შიდა mesh-ის პროფილი. GraphQL კლიენტის მხრიდან აგრეგაციაში იგებს; REST — საჯარო წვდომასა და ქეშირებაში, რასაც ეს სცენარი არ ითხოვს.',
+    },
+  ],
+});
+</script>
+</body>
+</html>

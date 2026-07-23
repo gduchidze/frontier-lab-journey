@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lesson 14 · Distributed Transactions &amp; Coordination</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<div class="lesson">
+  <header class="lesson-header">
+    <p class="kicker">Lesson 0014 · Phase 2 — Software Architecture &amp; Reliability · <a href="0014-distributed-transactions.ka.html">ქართული ვერსია</a></p>
+    <h1>Distributed Transactions &amp; Coordination</h1>
+    <p class="dek">Money moves across services without a global transaction — sagas, outbox, and why 2PC lost; plus consensus, leader election, and the fencing token that saves you.</p>
+  </header>
+
+  <div class="mission-tie">
+    <strong>Mission tie.</strong> Anthropic's design prompts love flows where one user action spans several services — <em>"design checkout"</em>, <em>"design a booking system"</em> — because the follow-up is a scalpel: <em>"payment succeeded but inventory reservation failed; now what?"</em> Candidates who say "wrap it in a transaction" reveal they've never shipped one; candidates who name the saga, place the outbox, and explain why the lock needs a fencing token keep going. This lesson is the vocabulary of that follow-up, grounded in DDIA chapters 8–9 (<a href="https://dataintensive.net/">Kleppmann, <em>Designing Data-Intensive Applications</em></a>; <a href="https://www.tryexponent.com/blog/anthropic-system-design-interview">Exponent's Anthropic guide</a>).
+  </div>
+
+  <h2>1 · The problem: one action, N services, no shared ACID</h2>
+  <p>Checkout touches four services: <strong>order</strong>, <strong>payment</strong>, <strong>inventory</strong>, <strong>shipping</strong>. Each has its own database with lovely local ACID transactions — and no transaction spans them. Same with travel booking: flight + hotel + car are three companies' systems. The business action is atomic in the user's head ("I bought it") but physically it is four commits that can each fail independently.</p>
+  <p>DDIA ch8 gives the failure taxonomy (<a href="https://dataintensive.net/">Kleppmann, "The Trouble with Distributed Systems"</a>): a remote call can fail <em>before</em> the work happened, <em>after</em> the work happened but before the reply, or the network can just be slow — and from the caller's side these three are <strong>indistinguishable</strong>. A timeout does not mean "it didn't happen." In distributed systems the default answer to "did my payment go through?" is <strong>"maybe"</strong> — and every pattern in this lesson is a machine for converting "maybe" into a state you can act on.</p>
+  <p><strong>Worked example — the arithmetic interviewers want to hear.</strong> Four sequential service calls, each 99.9% successful: P(all four succeed) = 0.999<sup>4</sup> ≈ 99.6%. So ~0.4% of checkouts stop <em>partway</em>. At 200,000 orders/day that is <strong>~800 orders/day</strong> in a half-finished state — charged but unreserved, reserved but unshipped. That is not an edge case; it is a queue you must design a consumer for. The question is never "will partial failure happen" but "who cleans it up, and how fast."</p>
+
+  <h2>2 · Two-phase commit — and why it lost</h2>
+  <p>The classical answer is <strong>2PC</strong> (DDIA ch9, <a href="https://dataintensive.net/">"Consistency and Consensus"</a>). A <strong>coordinator</strong> runs two rounds: <em>prepare</em> — every participant durably promises "I can commit and will hold my locks until told"; then <em>commit/abort</em> — the coordinator writes its decision to its own log and tells everyone. Atomicity comes from that single decision point.</p>
+  <p>And that decision point is the flaw. If the coordinator crashes <em>after</em> participants prepared but <em>before</em> they hear the verdict, every participant is <strong>in doubt</strong>: it cannot commit (maybe the verdict was abort) and cannot abort (maybe it was commit) — so it sits there <strong>holding row locks</strong>, blocking every other transaction that touches those rows, until the coordinator returns. 2PC is a <em>blocking</em> protocol: it converts one node's failure into everyone's unavailability, which is precisely the coupling microservices exist to avoid. Add the operational reality — heterogeneous services rarely share an <a href="https://en.wikipedia.org/wiki/X/Open_XA">XA</a>-capable transaction manager, and the slowest participant sets the pace for all — and you see why cross-<em>service</em> 2PC is effectively dead. It survives <em>inside</em> systems: XA in legacy Java estates, and internally in databases that must commit across their own partitions atomically.</p>
+
+  <h2>3 · Sagas: a transaction rebuilt from local pieces</h2>
+  <p>The replacement is the <strong>saga</strong> (<a href="https://www.cs.cornell.edu/andru/cs711/2002fa/reading/sagas.pdf">Garcia-Molina &amp; Salem, 1987</a>; <a href="https://microservices.io/patterns/data/saga.html">microservices.io</a>): a sequence of <em>local</em> transactions T1…Tn, where each Ti has a <strong>compensating action</strong> Ci that semantically undoes it. If T3 fails, run C2, C1 in reverse order. No locks held across services, no coordinator freezing anyone — atomicity is traded for <em>eventual</em> all-or-nothing.</p>
+  <p><strong>Checkout as a saga:</strong> create order → charge payment → reserve inventory → create shipment. If inventory reservation fails after payment charged: <em>refund payment</em>, <em>cancel order</em>. If shipment fails: <em>release inventory</em>, <em>refund</em>, <em>cancel</em>. Note the word <em>semantic</em>: a refund is not a rollback — the charge happened, the customer's statement shows both lines. And some steps have no undo at all: the confirmation email <strong>cannot be unsent</strong>; you send a correction. Design compensations as first-class business operations, not as database magic.</p>
+  <p>Two ways to run a saga:</p>
+  <table>
+    <tr><th></th><th>Choreography</th><th>Orchestration</th></tr>
+    <tr><td>Who decides next step</td><td>No one — each service reacts to the previous service's events</td><td>A central orchestrator sends commands, awaits replies</td></tr>
+    <tr><td>Coupling</td><td>Low — services only know event names</td><td>Orchestrator knows the whole flow</td></tr>
+    <tr><td>Visibility of flow</td><td>Smeared across N subscriptions — reconstructed from traces</td><td>One state machine you can read and query</td></tr>
+    <tr><td>Failure handling</td><td>Every service must subscribe to every failure it must compensate for</td><td>Orchestrator drives compensations in order</td></tr>
+    <tr><td>Risk profile</td><td>Cyclic event dependencies; "who compensates?" ambiguity</td><td>Orchestrator is a smart single point (make it stateless + replicated)</td></tr>
+    <tr><td>Sweet spot</td><td>2–3 steps, simple flows</td><td>4+ steps, money-shaped flows — <em>checkout belongs here</em></td></tr>
+  </table>
+
+  <h2>4 · The outbox pattern: killing the dual write</h2>
+  <p>Sagas (and event-driven anything) hide a trap: a service must <em>commit to its DB</em> and <em>publish an event</em> — two systems, no shared transaction. Commit-then-publish loses events when you crash in between (order exists, nobody ever hears); publish-then-commit invents events for orders that never committed. This is the <strong>dual-write problem</strong>, and no retry loop fixes a dead process.</p>
+  <p>The fix is the <strong>transactional outbox</strong> (<a href="https://microservices.io/patterns/data/transactional-outbox.html">microservices.io</a>): write the event into an <code>outbox</code> table <em>in the same local transaction</em> as the order row — one commit, atomically both or neither. A separate <strong>relay</strong> then delivers: either polling the table or, better, tailing the DB's change stream via CDC — <a href="https://debezium.io/blog/2019/02/19/reliable-microservices-data-exchange-with-the-outbox-pattern/">Debezium's outbox event router</a> is the canonical implementation. The relay is <em>at-least-once</em> (it can crash after publishing, before marking the row sent, and republish) — so consumers must be <strong>idempotent</strong>, deduplicating on the event id. At-least-once delivery + idempotent consumers = <strong>effectively-once</strong> processing, the honest version of the "exactly-once" everyone asks for.</p>
+  <table>
+    <tr><th>Approach</th><th>Lost events</th><th>Duplicates</th><th>Cost</th></tr>
+    <tr><td>Dual write (commit, then publish)</td><td><strong>Yes</strong> — crash in the gap</td><td>Possible</td><td>None — that's the trap</td></tr>
+    <tr><td>2PC across DB + broker</td><td>No</td><td>No</td><td>Blocking, XA-capable broker required, availability coupling</td></tr>
+    <tr><td>Outbox + relay/CDC</td><td><strong>No</strong> — event rides the commit</td><td>Yes — dedup at consumer</td><td>Extra table, relay to operate, relay lag</td></tr>
+  </table>
+  <p><strong>Worked numbers.</strong> In the lab, a 2% crash rate in the commit-to-publish gap over 10,000 orders silently lost <strong>201 events</strong> — 201 paid orders no downstream service ever heard about. The outbox version lost <strong>0</strong> and produced 100 duplicates, which consumer dedup reduced to exactly 10,000 applied. That trade — duplicates you can dedupe instead of losses you can't detect — is the whole pattern in one sentence.</p>
+
+  <h2>5 · Isolation lost: sagas are not serializable</h2>
+  <p>ACID gave you isolation; sagas give it up. Each Ti commits immediately, so other requests <strong>see intermediate states</strong>: the order exists but isn't paid; two concurrent sagas read the same stock level and both reserve it (a lost update); a saga later compensated was briefly visible as real (a dirty read that someone acted on). The countermeasures are application-level (<a href="https://microservices.io/patterns/data/saga.html">microservices.io lists them as saga "countermeasures"</a>):</p>
+  <ul>
+    <li><strong>Semantic lock:</strong> mark in-flight rows with a state — <code>order: PENDING_PAYMENT</code>, stock: <code>RESERVED</code> not <code>SOLD</code> — and make other transactions treat pending as "hands off." This is a lock encoded in data, visible and queryable.</li>
+    <li><strong>Commutative operations:</strong> design steps so order doesn't matter — <code>reserve(3)</code> and <code>reserve(2)</code> as decrements commute; "set stock = 7" does not.</li>
+    <li><strong>Reread / version check:</strong> before the pivotal step, re-verify the assumption (price, stock) that was read earlier — optimistic concurrency across the saga.</li>
+  </ul>
+  <p>Interview habit: whenever you propose a saga, name the intermediate state a user might see and the flag that guards it. "The order shows as PENDING_PAYMENT until the saga completes" is the sentence that proves you know isolation was traded away.</p>
+
+  <h2>6 · Consensus, at working altitude</h2>
+  <p>Some facts must be agreed on by machines that can crash: who is the leader, what is the config, who holds the lock. That is <strong>consensus</strong>, and the reason quorums are majorities is arithmetic: <strong>any two majorities of the same cluster overlap</strong> in at least one node, so two conflicting decisions cannot both be ratified, and a decision survives any minority of failures (DDIA ch9).</p>
+  <p><strong>Raft in five sentences</strong> (<a href="https://raft.github.io/">raft.github.io</a>, <a href="https://raft.github.io/raft.pdf">Ongaro &amp; Ousterhout</a>): Time is divided into numbered <em>terms</em>, each with at most one leader. A node that stops hearing heartbeats becomes a candidate and wins an election by collecting a majority of votes for the new term. All writes flow through the leader, which appends them to its log and replicates to followers. An entry is <em>committed</em> once a majority holds it — the <em>commit index</em> — and committed entries are guaranteed to survive leader changes. Elections are constrained so only a candidate with an up-to-date log can win, which is how the guarantee holds.</p>
+  <p><strong>What you actually use it for:</strong> the control plane — configuration, service membership, distributed locks, leader election — via <a href="https://etcd.io/docs/">etcd</a> (Raft) or <a href="https://zookeeper.apache.org/doc/current/recipes.html">ZooKeeper</a> (ZAB). You do <em>not</em> put your order data through consensus: a majority round-trip per write is the wrong price for the data path. Consensus stores hold megabytes that must never be wrong, not terabytes that must be fast.</p>
+
+  <h2>7 · Distributed locks and the fencing token</h2>
+  <p>"Only one worker may process this order at a time" — so you take a lock in Redis or etcd with a <strong>TTL</strong> (so a crashed holder can't lock forever). Now the famous failure (<a href="https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html">Kleppmann, "How to do distributed locking"</a>): worker A acquires the lock, then stalls — GC pause, page fault, network hiccup — past the TTL. The lock expires; worker B acquires it and writes. Then A wakes up, <em>still believing it holds the lock</em>, and writes too. Two writers, corrupted resource, and no amount of TTL tuning fixes it, because a paused process cannot know it is paused.</p>
+  <p>Kleppmann's fix: the lock service hands out a <strong>fencing token</strong> — a number that increases monotonically with every grant (A gets 33, B gets 34) — and the <em>resource</em> (storage, DB, file server) records the highest token it has seen and <strong>rejects writes with a smaller one</strong>. A's stale write arrives carrying 33 &lt; 34 → rejected. The safety check moves from the client (which can be arbitrarily delayed) to the resource (which observes actual write order). In the lab: with a 10 s TTL and pauses averaging 4 s, ~8% of trials outlived the lease — 799 corrupted writes without fencing, <strong>0 with</strong>.</p>
+  <p><strong>Redlock, one paragraph.</strong> Redis documents a multi-node locking algorithm, <a href="https://redis.io/docs/latest/develop/use/patterns/distributed-locks/">Redlock</a>. Kleppmann argued it depends on timing assumptions (bounded clock drift and pauses) that real systems violate, and issues no fencing tokens — so it is fine for <em>efficiency</em> locks (avoiding duplicate work) but not for <em>correctness</em> locks; <a href="http://antirez.com/news/101">antirez disputed the analysis</a>. The interview-safe position: state which of the two you need — if a stale holder can corrupt data, you need fencing at the resource regardless of which lock service you pick.</p>
+
+  <h2>8 · Leader election: leases, split-brain, and humility</h2>
+  <p>Leader election is the same lock, renewed: a candidate acquires a <strong>lease</strong> in etcd/ZooKeeper and must keep renewing it; if it dies, the lease lapses and someone else takes over — this is how Kubernetes controllers elect (<a href="https://kubernetes.io/docs/concepts/architecture/leases/">K8s Leases</a>), following the design of Google's <a href="https://research.google/pubs/the-chubby-lock-service-for-loosely-coupled-distributed-systems/">Chubby lock service</a>. The danger is <strong>split-brain</strong>: during the gap between a leader's last real heartbeat and its lease expiry, the old leader may still be acting while the new one starts — two leaders, briefly, is the <em>normal</em> failure mode of lease-based leadership, not an exotic one.</p>
+  <p>So the honest posture: <strong>leadership is an optimization, not a correctness guarantee.</strong> Use the leader to avoid duplicate work (one scheduler assigning jobs, one node compacting), but protect every externally visible effect the same way as §7 — fencing tokens, idempotent writes, or a consensus-backed commit. If your design is only correct when there is exactly one leader at all times, it is incorrect.</p>
+
+  <h2>9 · Failure modes that decide interviews</h2>
+  <ul>
+    <li><strong>Compensation that fails.</strong> The refund call itself times out — now the saga is <em>stuck</em> half-undone. Compensations must be idempotent and retried until success; whatever still won't succeed lands in a <strong>human task queue</strong> (in the lab: 10% compensation failure left 159 of 10,000 sagas stuck without retries, 0 with). Design that queue; it is part of the system.</li>
+    <li><strong>Outbox relay lag.</strong> Events are never lost but arrive late — downstream sees the order minutes after payment. Monitor relay lag like replication lag; it is your freshness bound.</li>
+    <li><strong>Duplicated compensations.</strong> An at-least-once command channel retries a refund whose ack was lost → double refund, unless the refund is keyed by an idempotency key. Same effectively-once rule as §4, applied to the undo path.</li>
+    <li><strong>Two leaders during lease expiry.</strong> The paused old leader fires the same batch job as the new one; both write. Fencing tokens make the stale one bounce (§7); without them you get silently doubled side effects.</li>
+    <li><strong>2PC coordinator crash.</strong> If you did use 2PC in the checkout path, a coordinator crash leaves participants in-doubt holding locks — checkout freezes globally. This is the concrete story to tell when asked "why not 2PC."</li>
+  </ul>
+
+  <h2>10 · One AI note, then back to fundamentals</h2>
+  <p>The LLM inference platform needs exactly two of these tools. Its <strong>batch-job scheduler</strong> runs as multiple replicas with etcd lease-based leader election — one leader assigns jobs to GPU workers, and because leadership is only an optimization (§8), job assignments carry fencing tokens so a paused ex-leader's stale assignment is rejected. And <strong>usage billing</strong> is a dual-write in disguise: the gateway commits a request log and must emit a billing event — outbox table in the gateway DB, CDC relay, idempotent billing consumer, because "maybe we billed them" is not a state a business survives. Same patterns, GPU-priced stakes. That's the note; §1–§9 are what the interview grades.</p>
+
+  <h2>11 · Interview talking points</h2>
+  <ol>
+    <li><strong>Open with the partial-failure math:</strong> "four services at 99.9% each means ~0.4% of checkouts half-finish — hundreds a day at scale — so the design question is who cleans up, not whether."</li>
+    <li><strong>Dismiss 2PC with the right reason:</strong> not "it's slow" but "it blocks — a crashed coordinator leaves participants in-doubt holding locks."</li>
+    <li><strong>Name the saga and its style:</strong> "orchestrated saga: order → payment → inventory → shipment, compensations in reverse; orchestration over choreography because this flow is money-shaped and I want one queryable state machine."</li>
+    <li><strong>Place the outbox unprompted:</strong> "each step's event rides the local commit via an outbox table; the relay is at-least-once, so consumers dedupe on event id — effectively-once."</li>
+    <li><strong>Admit the isolation loss:</strong> "orders sit in PENDING_PAYMENT while the saga runs; nothing downstream treats pending as sold." Unprompted intermediate states are a strong-hire signal.</li>
+    <li><strong>When locks come up, say fencing before they do:</strong> "TTL locks fail under pauses, so the store checks a monotonic fencing token — the resource, not the client, is the last line of defense."</li>
+    <li><strong>Scope consensus correctly:</strong> "etcd for leader election and config — control plane only; consensus never sits on the order data path."</li>
+  </ol>
+
+  <h2>12 · Lab — lose money, then stop losing it</h2>
+  <div class="callout"><span class="label">Hands-on (do this before the quiz)</span>
+    Everything above is now verifiable in <code>labs/lab-0014-sagas-and-fencing/</code>:
+    <code>python3 saga_lab.py</code> runs three experiments — the naive dual write losing 201 of
+    10,000 paid orders vs the outbox losing zero (with dedup turning duplicates into
+    effectively-once), a checkout saga with crash injection at every step (watch the stuck-saga
+    queue appear when compensations also fail, and vanish with retry), and a TTL lock corrupted
+    by GC pauses until a fencing token stops it. Then do exercises E1–E4 in the lab README:
+    <em>predict, edit config, re-run, compare.</em> Wrong predictions are the deliverable —
+    bring them to the next session.
+  </div>
+
+  <h2>13 · Project step</h2>
+  <p>Design the <strong>"provision fine-tune job"</strong> flow for the LLM platform as a checkout-shaped saga: list the steps, each step's compensation, and where the outbox sits — then defend it in two sentences. A defensible pick: <em>orchestrated saga — create job record → reserve GPU quota → charge billing hold → enqueue to scheduler, compensating with release-quota / void-hold / mark-job-failed in reverse, every step's event written through an outbox in that service's DB. Orchestration because the flow touches money and quota, and the outbox because a job that exists but was never announced to billing is the exact dual-write hole the lab priced.</em> Write your own two sentences — steps + compensations + outbox placement — and bring them to the next session for critique.</p>
+
+  <h2>Check yourself</h2>
+  <div class="quiz" id="quiz"></div>
+
+  <h2>Primary source</h2>
+  <p>Read <strong>DDIA chapter 9 — "Consistency and Consensus"</strong> (<a href="https://dataintensive.net/">dataintensive.net</a>): the 2PC walkthrough, in-doubt transactions, and the derivation of consensus are the exact depth interviews reward, with ch8's partial-failure taxonomy as the warm-up. Then read <a href="https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html">Kleppmann's "How to do distributed locking"</a> end to end — the fencing-token argument is the single most quotable essay in distributed systems. For pattern reference, keep <a href="https://microservices.io/patterns/data/saga.html">microservices.io's saga</a> and <a href="https://microservices.io/patterns/data/transactional-outbox.html">transactional outbox</a> pages open, and skim the <a href="https://raft.github.io/raft.pdf">Raft paper</a> §5 — it was written to be understandable and it is.</p>
+
+  <footer class="lesson-footer">
+    <p><strong>Stuck or curious?</strong> Ask your teacher (the agent) anything — "why can't the client just check the wall clock before writing, instead of a fencing token?" is an excellent follow-up question.</p>
+    <nav class="lesson-nav">
+      <span><a href="0013-streams-and-events.html">◀ Prev: 0013 · Streams &amp; Events</a></span>
+      <span><a href="0015-reliability-patterns.html">Next: 0015 · Reliability Patterns ▶</a></span>
+    </nav>
+  </footer>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+renderQuiz(document.getElementById('quiz'), {
+  title: 'Check yourself',
+  questions: [
+    {
+      q: 'The order service commits its database row, then crashes before publishing OrderCreated to the broker. Which design removes this lost-event window entirely?',
+      options: [
+        'Publish the event before committing the row',
+        'Write the event into a transactional outbox',
+        'Retry publishing until the broker finally acknowledges',
+      ],
+      answer: 1,
+      explain: 'The outbox rides the same local transaction as the order row — one commit produces both or neither, and the relay publishes afterward. Publishing first just flips the failure (an event for an order that never committed), and a dead process cannot retry anything.',
+    },
+    {
+      q: 'Why do microservice teams avoid two-phase commit for a checkout spanning order, payment, and inventory services?',
+      options: [
+        'A crashed coordinator leaves participants blocked holding locks',
+        'Prepare messages grow too large for modern brokers',
+        'Relational databases cannot participate in any prepare phase',
+      ],
+      answer: 0,
+      explain: '2PC is a blocking protocol: participants that have prepared are in-doubt until the coordinator returns, holding locks the whole time — one node’s crash becomes everyone’s unavailability. Message size is irrelevant, and relational databases support prepare via XA just fine.',
+    },
+    {
+      q: 'In a checkout saga, payment charged successfully but the inventory reservation step failed. What does the orchestrator do next?',
+      options: [
+        'Retries the inventory reservation forever until success',
+        'Marks the order paid and ships anyway',
+        'Runs compensations backwards, starting with the refund',
+      ],
+      answer: 2,
+      explain: 'A saga undoes completed steps with compensating actions in reverse order: refund the payment, then cancel the order. Retrying forward forever can be valid for retriable steps, but a business rejection (out of stock) needs the undo path — and shipping unreserved stock violates the invariant outright.',
+    },
+    {
+      q: 'A lock holder pauses past its lease TTL, wakes, and writes to shared storage. What rejects that stale write?',
+      options: [
+        'The resource comparing monotonically increasing fencing tokens',
+        'The lock service extending the expired lease',
+        'The client re-checking its clock before writing',
+      ],
+      answer: 0,
+      explain: 'Kleppmann’s argument: a paused client cannot know it is paused, so the check must live at the resource — it records the highest fencing token seen and rejects anything smaller. The lease already expired and was granted to someone else, and a client-side clock check can itself be followed by a pause.',
+    },
+    {
+      q: 'Sagas commit every local step immediately instead of holding one global transaction. What anomaly can other requests observe between steps?',
+      options: [
+        'Serializable snapshots covering every incomplete saga step',
+        'Dirty reads of half-finished intermediate saga state',
+        'Phantom locks held forever across service boundaries',
+      ],
+      answer: 1,
+      explain: 'Each local commit is instantly visible, so other requests can read state a later compensation will undo — the saga equivalent of a dirty read, plus lost updates between concurrent sagas. The countermeasures are semantic locks (PENDING states), commutative operations, and version rechecks.',
+    },
+    {
+      q: 'Why does Raft require a majority quorum before an entry counts as committed?',
+      options: [
+        'Majorities replicate log entries faster than leaders',
+        'Odd cluster sizes stop clocks from drifting',
+        'Any two majorities overlap, so commits survive',
+      ],
+      answer: 2,
+      explain: 'Two majorities of the same cluster always share at least one node, so a committed entry is guaranteed to be seen by any future election winner, and two conflicting decisions can never both be ratified. Speed is not the point, and quorums have nothing to do with clock behavior.',
+    },
+  ],
+});
+</script>
+</body>
+</html>

@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lesson 25 · Distributed Key-Value Store — a mini-Dynamo</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<div class="lesson">
+  <header class="lesson-header">
+    <p class="kicker">Lesson 0025 · Phase 3 — Classic Design Reps · <a href="0025-distributed-kv.ka.html">ქართული ვერსია</a></p>
+    <h1>Distributed Key-Value Store — a mini-Dynamo</h1>
+    <p class="dek">Get and put over 100 TB, on hardware that fails daily. This rep assembles consistent hashing, quorums, vector clocks, and anti-entropy into one machine — the design behind Dynamo, Cassandra, and Riak.</p>
+  </header>
+
+  <div class="mission-tie">
+    <strong>Mission tie.</strong> "Design a distributed KV store" is a classic Anthropic warm-up prompt — and the KV-cache manager in your spine-project inference platform is literally a distributed KV problem: route a prefix hash to the worker holding its cache blocks, replicate hot prefixes, evict cold ones.
+  </div>
+
+  <div class="callout"><span class="label">REP PROTOCOL</span>
+    Do the <strong>40-minute solo timed rep FIRST</strong> — out loud, whiteboard or paper, no peeking. Then read this reference, compare, and log every delta (missed component, wrong number, unnamed failure mode) as a learning record. The deltas are the lesson; the text below is just the answer key.
+  </div>
+
+  <h2>1 · The prompt, and what it tests</h2>
+  <p><em>"Design a distributed key-value store: <code>get(key)</code> and <code>put(key, value)</code> over a dataset far larger than one machine, highly available, with tunable consistency."</em> One sentence, and it is the rep where CAP (lesson 0004) stops being theory: every component you draw is a concrete answer to "what happens during a partition?" The interviewer is scoring four things: how you <strong>partition</strong> data across nodes, how you <strong>replicate</strong> for durability and availability, how you make the consistency trade-off <strong>explicit and tunable</strong>, and how the system <strong>heals itself</strong> when nodes die — because at this scale they always are dying. The API is trivially small; the whole interview lives underneath it. Budget the standard rep shape: clarify 5, estimate 5, high-level 10, deep dives 20.</p>
+
+  <h2>2 · Clarify (5 min): decide AP, and say it's a decision</h2>
+  <table>
+    <tr><th>Requirement</th><th>Target</th><th>Consequence</th></tr>
+    <tr><td>Functional</td><td><code>get(key)</code>, <code>put(key, value)</code>; values ≤ ~10 KB, opaque blobs</td><td>No queries, no transactions → no SQL machinery needed</td></tr>
+    <tr><td>Consistency</td><td>Tunable per request</td><td>Client chooses read-fast vs read-safe → quorum knobs</td></tr>
+    <tr><td>Availability</td><td>99.99% — writes must succeed during node failures</td><td>AP-leaning: accept conflicts, resolve later</td></tr>
+    <tr><td>Latency SLO</td><td>p99 &lt; 10 ms in-region for get and put</td><td>Memory/SSD path, no cross-region hop on the hot path</td></tr>
+    <tr><td>Scale</td><td>100 TB, growing — dataset ≫ any single node</td><td>Partitioning is mandatory, not optional</td></tr>
+  </table>
+  <p>Then say the sentence that frames the whole rep: <em>"I'm choosing availability over strong consistency — an AP system like Dynamo — because the requirement says writes must never be refused. That is a choice: if this were a ledger, I'd flip to a CP design and pay availability during partitions."</em> Naming the fork before designing is the senior move; the interviewer now knows every later decision is deliberate.</p>
+
+  <h2>3 · Estimate (5 min): numbers you will spend</h2>
+  <pre><code>Dataset:      100 TB ÷ 10 KB/value  ≈ 10^10 = 10 billion keys
+Replicated:   100 TB × 3 (N=3)      = 300 TB raw
+Nodes:        300 TB ÷ 2 TB usable  = 150 nodes
+Traffic:      1M ops/s peak ÷ 150   ≈ 7k ops/s per node (×3 for write fan-out)</code></pre>
+  <p>Now <em>spend</em> each number. <strong>150 nodes</strong> → with commodity hardware, a node failure is a daily event, not an incident: failure handling (gossip, hinted handoff) must be automatic, and rebalancing must not stampede. <strong>10 billion keys</strong> → no node can hold an index of everything; placement must be computable from the key itself — that is why consistent hashing, not a lookup table. <strong>7k ops/s per node</strong> → CPU is comfortable; the binding constraints are storage and recovery bandwidth, so the deep dives go to replication and healing, not to compute.</p>
+
+  <h2>4 · High-level: the ring</h2>
+  <p>There is no master. A client sends <code>get</code>/<code>put</code> to any node (or a thin coordinator tier); that node becomes the <strong>coordinator</strong> for the request. Placement is <strong>consistent hashing</strong> — lesson 0006's tool, verified in <code>lab-0006</code>: hash node IDs and keys onto one circular space; a key belongs to the first node clockwise. Adding or removing a node moves only ~1/N of the keys, not everything — the property that makes 150-node membership churn survivable. Each physical node projects <strong>~100–200 virtual nodes</strong> onto the ring, so when a node dies its load scatters in small slices across <em>many</em> survivors instead of dumping wholesale onto one clockwise neighbor — vnodes are what make rebalancing smooth rather than lumpy, and they let a beefy node take proportionally more vnodes.</p>
+  <p><strong>Replication:</strong> the key's home node plus the next N−1 <em>distinct physical</em> successors on the ring form its <strong>preference list</strong> — with N=3, every key lives on 3 nodes. The coordinator forwards writes to all N and answers according to the quorum rules below. Everything else in this design — quorums, hinted handoff, Merkle repair — is machinery for keeping those 3 copies honest.</p>
+
+  <h2>5 · Deep dive: quorums — N, R, W</h2>
+  <p>Three knobs: <strong>N</strong> replicas per key, a write is acknowledged after <strong>W</strong> replicas confirm, a read consults <strong>R</strong> replicas and returns the freshest version seen. The load-bearing theorem: <strong>if R + W &gt; N, every read set intersects every write set.</strong> The argument, drawn out: the write landed on some W-subset of the N replicas; the read consults some R-subset; two subsets of an N-element set with |R| + |W| &gt; N cannot be disjoint — pigeonhole — so at least one node in the read set holds the acknowledged write, and taking the freshest version surfaces it. Set R + W ≤ N and the sets can miss each other entirely: the read may consult only replicas the write never reached. Your lab measures exactly this gap.</p>
+  <table>
+    <tr><th>Config (N=3)</th><th>Optimizes</th><th>Cost</th></tr>
+    <tr><td>R=1, W=3</td><td>Fast reads (one replica answers)</td><td>Slow, fragile writes — one dead replica blocks puts</td></tr>
+    <tr><td>R=3, W=1</td><td>Fast writes</td><td>Slow reads; a lone-replica write risks loss if it dies</td></tr>
+    <tr><td>R=2, W=2</td><td>Balanced — the common default</td><td>Both paths tolerate exactly one dead replica</td></tr>
+  </table>
+  <p><strong>Sloppy quorum:</strong> a strict quorum refuses writes when fewer than W preference-list replicas are alive. Dynamo instead writes to the next healthy nodes <em>past</em> the preference list; the stand-in stores the value with a <strong>hint</strong> ("this belongs to node D") and hands it back when D recovers — <strong>hinted handoff</strong>. Availability preserved; the price is that quorum overlap is no longer guaranteed during failures.</p>
+
+  <h2>6 · Deep dive: conflict resolution — LWW vs vector clocks</h2>
+  <p>An AP system accepts writes on both sides of a partition, so conflicting versions <em>will</em> exist. <strong>Last-write-wins (LWW)</strong> resolves by timestamp: highest wall-clock wins, the other write silently vanishes. Cheap, and Cassandra defaults to it — but clocks skew, and "concurrent" has no true order, so LWW is a policy for <em>losing data quietly</em>. Acceptable for a cache; unacceptable for a shopping cart.</p>
+  <p><strong>Vector clocks</strong> keep causality instead. Worked example, Dynamo's own: a cart is written via node A → version <code>[A:1]</code>. The client updates it via A again → <code>[A:2]</code>. Now a partition: one client adds a book via A → <code>[A:3]</code>; concurrently another adds a lamp via node B, descending from <code>[A:2]</code> → <code>[A:2, B:1]</code>. Compare: <code>[A:3]</code> and <code>[A:2, B:1]</code> — neither dominates the other componentwise, so the system knows these are <em>concurrent</em>, not ordered. It keeps both as <strong>siblings</strong> and returns both on the next read; the client merges (union the carts — book <em>and</em> lamp survive) and writes back <code>[A:4, B:1]</code>, collapsing the siblings. The trade: LWW loses updates invisibly; vector clocks push merge complexity to the reader. Say which your use case tolerates.</p>
+
+  <h2>7 · Deep dive: anti-entropy — repair without a master</h2>
+  <p>Replicas drift — dropped messages, dead nodes, sloppy quorums. Three healing mechanisms, cheapest first:</p>
+  <ul>
+    <li><strong>Read repair.</strong> The coordinator reads R replicas, notices one returned a stale version, and pushes the freshest version to it in the background. Free healing — but only for keys that get read.</li>
+    <li><strong>Merkle trees.</strong> For cold keys, replicas periodically compare a hash tree of their key range: leaves hash buckets of keys, parents hash their children. If two roots match, the ranges are identical — one comparison. If not, recurse only into the differing child: divergent keys are found in O(log n) hash exchanges instead of shipping 10 billion entries. This is how Dynamo and Cassandra sync replicas without drowning the network.</li>
+    <li><strong>Gossip.</strong> Membership and failure detection with no master: every second each node exchanges its view (who's alive, who owns what) with a random peer; information spreads epidemically in O(log n) rounds. A node missing heartbeats gets marked suspect → dead, triggering hinted handoff for its writes.</li>
+  </ul>
+
+  <h2>8 · Deep dive: the storage engine on each node</h2>
+  <p>Each node persists its key range with an <strong>LSM-tree</strong> — three-sentence recap of lesson 0012: writes land in an in-memory <em>memtable</em>, which flushes to immutable sorted <em>SSTable</em> files when full; reads check memtable then SSTables newest-first; background <em>compaction</em> merges SSTables and drops overwritten versions. LSM buys the sequential-write throughput a write-heavy KV node needs (full treatment: lesson 0012). Two companions: a <strong>WAL</strong> — every write appends to a write-ahead log <em>before</em> the memtable ack, so a crash replays the log and loses nothing; and a <strong>bloom filter</strong> per SSTable — a probabilistic "definitely not here / maybe here" bitmap that lets a get skip most SSTables without touching disk, which at 10 billion keys is the difference between one disk seek and ten.</p>
+
+  <h2>9 · Failure modes + monitoring</h2>
+  <table>
+    <tr><th>Failure</th><th>Symptom / metric</th><th>Response</th></tr>
+    <tr><td>Node down</td><td><strong>Hinted-handoff queue depth growing</strong> on neighbors</td><td>Sloppy quorum covers writes; alert if hints outlive the recovery SLA</td></tr>
+    <tr><td>Network partition</td><td>Split-brain writes → <strong>sibling count spikes</strong> after heal</td><td>Vector-clock merge on read; watch sibling-per-key p99</td></tr>
+    <tr><td>Hot key</td><td>One preference list saturated while cluster idles</td><td>Request-side cache (lesson 0007), or split the key client-side</td></tr>
+    <tr><td>Slow replica</td><td>p99 up only at R=quorum, fine at R=1</td><td>Per-op <strong>latency by consistency level</strong> is the diagnostic metric</td></tr>
+    <tr><td>Silent drift</td><td><strong>Replica divergence</strong>: Merkle diff rate &gt; 0 steadily</td><td>Anti-entropy repair; alert on divergence trend, not single diffs</td></tr>
+  </table>
+  <p>The dashboard that matters: per-operation latency <em>broken down by R/W level</em>, hint queue depth, divergence rate, and ring balance (load per node ÷ mean). Each one maps to a failure above — monitoring you can't tie to a failure mode is decoration.</p>
+
+  <h2>10 · Variants and twists</h2>
+  <p><strong>The cache variant</strong> — the Primer's "query cache for a search engine" question — is this same design with durability deleted: same ring, same vnodes, same replication if you want hit-rate resilience, but no WAL, no SSTables, values carry <strong>TTLs</strong>, and each node evicts with <strong>LRU</strong> — exactly the policy you built in <code>lab-0007</code>. Memcached is this design with N=1; Redis Cluster is this design with async replication. If the interviewer says "cache", drop section 8 and spend the minutes on eviction and TTL-vs-invalidation instead.</p>
+  <p><strong>The CP twist:</strong> "what if we need strong consistency?" Swap quorum replication for consensus — each shard runs Raft (lesson 0014), writes commit through a leader, partitioned minorities refuse writes. That is etcd or Spanner territory: linearizable, and unavailable on the minority side — say the price out loud.</p>
+  <h3>AI note</h3>
+  <p>An inference platform's prefix-cache router is this lesson wearing GPU clothes: consistent-hash prompt prefixes across workers so repeated prefixes hit the worker already holding their KV blocks, evict cold prefixes LRU-style, and accept staleness — it's the cache variant, not the durable one.</p>
+
+  <h2>11 · Interview talking points</h2>
+  <ul>
+    <li><em>Framing:</em> "Requirement says never refuse writes → I'm building AP, Dynamo-style. If this were payments I'd build CP — want me to design that instead?"</li>
+    <li><em>Spending a number:</em> "150 nodes means failure is a Tuesday, so recovery must be automatic — that's why gossip and hinted handoff, not an ops runbook."</li>
+    <li><em>The theorem:</em> "R=2, W=2, N=3: read and write sets of 2 can't be disjoint in a set of 3, so reads see acknowledged writes — unless a sloppy quorum stretched the ring, which is the availability price."</li>
+    <li><em>Conflicts:</em> "LWW is fine for the cache variant; for carts I keep siblings with vector clocks and let the client merge — Dynamo's actual choice, losing no adds."</li>
+    <li><em>Unprompted failure mode:</em> "Before you ask: a partition creates split-brain writes; after healing, my sibling-count metric spikes and read repair converges the replicas."</li>
+    <li><em>Closing:</em> "I'd page on hint-queue depth and divergence rate; with more time — cross-region replication and compaction scheduling."</li>
+  </ul>
+
+  <h2>12 · Lab + project step</h2>
+  <div class="callout"><span class="label">Hands-on (do this before the quiz)</span>
+    In <code>labs/lab-0025-quorum-kv/</code>, <code>python3 quorum_kv_lab.py --r 2 --w 2</code> runs a seeded
+    6-node ring with N=3 and injected failures + delays. It measures the stale-read rate across
+    R/W combos (the overlap theorem, empirically), strict-vs-sloppy availability when 2 nodes die
+    (watch the hint queue drain on recovery), and divergence healed by read repair.
+    Predict before every run — E1–E4 in the README.
+  </div>
+  <p><strong>Project step.</strong> In your spine-project notes, sketch the KV-cache manager as this lesson's cache variant: what is the key (prefix hash), what is the value (block locations), what N/R/W would you pick, and which conflict policy — then log your 40-min rep deltas as a learning record. Bring both to the next session.</p>
+
+  <h2>Check yourself</h2>
+  <div class="quiz" id="quiz"></div>
+
+  <h2>Primary source</h2>
+  <p>Read the <strong><a href="https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf">Dynamo paper</a></strong> (SOSP 2007) — sections 4–5 are this entire lesson in primary-source form: preference lists, sloppy quorums, vector clocks, Merkle trees. Companion: the <a href="https://github.com/donnemartin/system-design-primer">System Design Primer</a>'s key-value cache material for the cache variant.</p>
+
+  <footer class="lesson-footer">
+    <p><strong>Stuck or curious?</strong> Ask your teacher (the agent) anything — "when would I pick LWW on purpose, knowing it loses updates?" is an excellent follow-up question.</p>
+    <nav class="lesson-nav">
+      <span>◀ <a href="0024-web-crawler.html">0024 · Web Crawler</a></span>
+      <span><a href="0026-distributed-search.html">0026 · Distributed Search</a> ▶</span>
+    </nav>
+  </footer>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+renderQuiz(document.getElementById('quiz'), {
+  title: 'Check yourself',
+  questions: [
+    {
+      q: 'N=3. Which R/W setting guarantees a read sees the latest acknowledged write?',
+      options: [
+        'R=1 and W=1 for speed',
+        'R=2 and W=2 by overlap',
+        'R=1 and W=2 for balance',
+      ],
+      answer: 1,
+      explain: 'R+W>N forces the read set and write set to intersect (pigeonhole over 3 replicas), so at least one consulted replica holds the acknowledged write. 1+1 and 1+2 can miss it.',
+    },
+    {
+      q: 'A partition heals, and one replica holds a value the others never saw. Which mechanism fixes this even if no client ever reads that key?',
+      options: [
+        'Merkle-tree anti-entropy comparing replica hash trees',
+        'Read repair triggered during every read',
+        'Gossip protocol broadcasting every stored value',
+      ],
+      answer: 0,
+      explain: 'Read repair only heals keys that get read; gossip carries membership, not data. Merkle-tree comparison finds divergent cold keys in O(log n) hash exchanges and syncs them.',
+    },
+    {
+      q: 'Under LWW with wall-clock timestamps, two concurrent shopping-cart writes land on different replicas. What ultimately happens?',
+      options: [
+        'Both writes survive as sibling versions',
+        'Both writes merge automatically without loss',
+        'One write silently vanishes after reconciliation',
+      ],
+      answer: 2,
+      explain: 'LWW picks the higher timestamp and discards the other — a lost update, invisible to the client. Siblings and client merge are the vector-clock behavior, not LWW.',
+    },
+    {
+      q: 'What do virtual nodes add on top of plain consistent hashing?',
+      options: [
+        'Consistency guarantees strengthen across many replicas automatically',
+        'Rebalancing load spreads across many nodes evenly',
+        'Failure detection happens across many nodes instantly',
+      ],
+      answer: 1,
+      explain: 'When a node with many vnodes dies, its key ranges scatter in small slices across many survivors instead of dumping onto one clockwise neighbor. Vnodes change load distribution, not consistency or detection.',
+    },
+    {
+      q: 'During a failure, a sloppy quorum with hinted handoff accepts a write that a strict quorum would refuse. What was traded away?',
+      options: [
+        'The guarantee that quorums always intersect',
+        'The durability of every acknowledged write',
+        'The availability of every future read',
+      ],
+      answer: 0,
+      explain: 'The stand-in node is outside the preference list, so a later read of R preference-list replicas may not overlap the write set — R+W>N no longer guarantees intersection. The write is still durable on the stand-in.',
+    },
+    {
+      q: 'Your dashboard shows the hinted-handoff queue growing steadily on several nodes. What is the most likely cause?',
+      options: [
+        'Compaction is running behind on SSTables',
+        'Clients are issuing malformed write requests',
+        'Some replica nodes are currently unreachable',
+      ],
+      answer: 2,
+      explain: 'Hints accumulate exactly when writes destined for a preference-list node are parked on stand-ins — i.e., that node is down or partitioned. Queue drain on recovery confirms it; compaction and bad clients leave other fingerprints.',
+    },
+  ],
+});
+</script>
+</body>
+</html>

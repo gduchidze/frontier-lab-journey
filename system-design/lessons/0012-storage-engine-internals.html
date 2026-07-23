@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lesson 12 · Storage Engine Internals</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<div class="lesson">
+  <header class="lesson-header">
+    <p class="kicker">Lesson 0012 · Phase 2 — Software Architecture &amp; Reliability · <a href="0012-storage-engine-internals.ka.html">ქართული ვერსია</a></p>
+    <h1>Storage Engine Internals</h1>
+    <p class="dek">B-tree vs LSM is the read-vs-write-amplification decision — the one database-internals topic interviews actually reward. Know why MySQL and Cassandra disagree about disks, and you can defend any datastore pick with mechanisms instead of brand names.</p>
+  </header>
+
+  <div class="mission-tie">
+    <strong>Mission tie.</strong> When an Anthropic prompt asks you to store something — usage events at 100k writes/s, order history, an inbox — "I'll use Postgres" is a brand, not a design. The follow-up is always <em>"why that store, and what breaks under this write rate?"</em> Candidates who can say "this is append-heavy, so an LSM engine trades read amplification for sequential-write throughput, and here's the compaction risk" are reasoning from internals — exactly the skill Chapter 3 of <a href="https://dataintensive.net/">Designing Data-Intensive Applications</a> exists to teach, and this lesson compresses.
+  </div>
+
+  <h2>1 · The log is the database</h2>
+  <p>The simplest possible database is an append-only file: every write is <code>append(key, value)</code>, and it is nearly unbeatable at writing — because appending is the one thing disks do at full speed. The <a href="../reference/0002-estimation-kit.html">Estimation Kit</a> numbers: a spinning disk pays ~10 ms per random seek (~100 random IOPS) but streams sequentially at 100–200 MB/s — a gap of several thousand×. SSDs shrink the gap but keep it: random 4 KB I/O still costs a controller round trip per op, and small random writes trigger internal erase-block churn (<a href="https://queue.acm.org/detail.cfm?id=1563874">ACM Queue, "The Pathologies of Big Data"</a>). Sequential beats random on every storage medium you will ever be offered.</p>
+  <p>That is why <strong>every serious engine writes twice</strong>. The first write goes to a <strong>write-ahead log (WAL)</strong> — a pure append, forced to disk before the client is acknowledged; the second updates the engine's real data structure, possibly much later. Crash mid-update? Recovery replays the log from the last checkpoint and reconstructs the structure — the log is the truth, the structure is a cache of it (<a href="https://www.postgresql.org/docs/current/wal-intro.html">Postgres WAL docs</a>; <a href="https://dataintensive.net/">DDIA ch. 3</a>). Hold onto this: both engine families below are just different answers to "the log is fast but unsearchable — how do we add search?"</p>
+
+  <h2>2 · Indexes: pay at write time to save at read time</h2>
+  <p>A raw log gives O(1) writes and O(N) reads — a full scan per lookup. An <strong>index</strong> is an additional structure, derived from the data, that makes some reads fast. DDIA ch. 3 states the law of the land: <em>well-chosen indexes speed up reads, but every index slows down writes</em> — each write must now also maintain every index. There is no free index; there is only a chosen trade. Storage engines differ exactly in <em>which</em> structure they maintain and <em>when</em> they pay the maintenance bill: B-trees pay at write time, in place; LSM-trees defer the bill and pay it in the background, in bulk. Everything else in this lesson is a consequence of that one sentence.</p>
+
+  <h2>3 · B-trees: read-optimized order</h2>
+  <p>The B-tree — standard since the 1970s and the engine inside Postgres, MySQL/InnoDB, Oracle, SQL Server — breaks the database into fixed-size <strong>pages</strong> (traditionally 4 KB; InnoDB uses 16 KB) and arranges them as a tree: each internal page holds several hundred sorted keys with child-page references, leaves hold the rows (<a href="https://www.postgresql.org/docs/current/btree-implementation.html">Postgres B-tree internals</a>; <a href="https://dataintensive.net/">DDIA ch. 3</a>).</p>
+  <p><strong>Worked depth example.</strong> With a branching factor of 500, depth grows as log<sub>500</sub>(N): one page addresses 500 children, two levels 250,000, three levels 125 million, and a <strong>four-level tree of 4 KB pages addresses ~500<sup>4</sup> ≈ 62 billion leaf references — roughly 256 TB of data</strong>. Four page reads for any key in a quarter-petabyte, and the top levels are always cached. That is why B-tree read latency is famously flat and predictable.</p>
+  <p>Writes go <strong>in place</strong>: find the leaf, overwrite it. A full leaf <strong>splits</strong> into two, updating the parent — and because a crash between those multi-page steps would corrupt the tree, B-trees keep their own WAL (§1) and coordinate concurrent access with <strong>latches</strong> (short-lived page locks). Where B-trees win: point reads, <strong>range scans</strong> (leaves are in key order — <em>"orders for customer 4711, newest 50"</em> walks sibling pages), read-heavy mixes, and decades-mature transaction machinery built on top. E-commerce order history is the archetype: read far more than written, queried by ranges, wrapped in transactions.</p>
+
+  <h2>4 · LSM-trees: write-optimized order</h2>
+  <p>The <strong>log-structured merge-tree</strong> (<a href="https://www.cs.umb.edu/~poneil/lsmtree.pdf">O'Neil et al., 1996</a>) refuses to do random writes at all. The path: writes go to an in-memory sorted <strong>memtable</strong> (plus WAL for crash safety); when it reaches a threshold, it is flushed — one sequential write — as an immutable sorted file, an <strong>SSTable</strong>; background <strong>compaction</strong> merges SSTables into fewer, bigger, sorted ones and drops overwritten values. Nothing is ever updated in place; the disk sees only appends and streaming merges.</p>
+  <p>Reads pay for this: a lookup checks the memtable, then SSTables newest-to-oldest, until the key appears. What rescues point reads is a <strong>Bloom filter</strong> per table — a tiny probabilistic set that answers "definitely not here" without touching the table, so absent tables cost one probe instead of a search (<a href="https://github.com/facebook/rocksdb/wiki/RocksDB-Bloom-Filter">RocksDB wiki: Bloom Filter</a>). The lineage runs from the 1996 paper through Google's <a href="https://static.googleusercontent.com/media/research.google.com/en//archive/bigtable-osdi06.pdf">Bigtable (OSDI '06)</a> to HBase, Cassandra, LevelDB, and RocksDB (<a href="https://github.com/facebook/rocksdb/wiki">RocksDB wiki</a>). Where LSMs win: sustained write-heavy ingest. A messaging inbox is the archetype — every message is a write, reads mostly touch the recent end, and Cassandra's LSM engine soaks the firehose that would grind a B-tree's random-I/O write path to dust.</p>
+
+  <h2>5 · The amplification triangle</h2>
+  <p>The engines are compared on three amplifications — and the <a href="http://daslab.seas.harvard.edu/rum-conjecture/">RUM conjecture</a> (Harvard DASlab) says you can optimize any two of Read, Update, and Memory/space cost only by sacrificing the third:</p>
+  <ul>
+    <li><strong>Read amplification</strong> — pieces of storage consulted per logical read (SSTables probed, pages descended).</li>
+    <li><strong>Write amplification</strong> — bytes physically written per byte logically written.</li>
+    <li><strong>Space amplification</strong> — bytes stored per byte of live data.</li>
+  </ul>
+  <p><strong>The arithmetic interviewers want to hear.</strong> A B-tree updating a 100-byte row must rewrite its whole 4 KB page — <strong>40× write amplification</strong> before counting the WAL copy and any splits. An LSM with <em>leveled</em> compaction (fanout 10) rewrites each entry roughly 10× per level it descends; with 3–4 levels that is <strong>~30–40× write amplification</strong> — but every one of those bytes moves in large sequential merges, which is why the LSM still wins the ingest race on real disks (<a href="https://github.com/facebook/rocksdb/wiki/Compaction">RocksDB wiki: Compaction</a>). In the lab's <em>size-tiered</em> mini-LSM, 100k inserts cost 292k entry-writes — write amp 2.92×, one rewrite per tier merge.</p>
+  <table>
+    <tr><th>Compaction strategy</th><th>Write amp</th><th>Read amp</th><th>Space amp</th><th>Home</th></tr>
+    <tr><td><strong>Leveled</strong> — one sorted run per level, each ~10× larger</td><td>High (~10 per level)</td><td>Low (≤ 1 table per level)</td><td>Low (~1.1×)</td><td>LevelDB, RocksDB default</td></tr>
+    <tr><td><strong>Size-tiered</strong> — merge similar-sized tables when a tier fills</td><td>Low (~1 per tier merge)</td><td>High (many overlapping tables)</td><td>High (up to ~2× until merges)</td><td>Cassandra STCS default</td></tr>
+  </table>
+  <p>Compaction is a <strong>background tax</strong> that shares disk and CPU with foreground traffic. If ingest bursts faster than compaction can merge, tables pile up, reads slow, and engines eventually throttle or stall writes to let compaction catch up (<a href="https://github.com/facebook/rocksdb/wiki/Write-Stalls">RocksDB wiki: Write Stalls</a>). An LSM's write throughput number is only honest if quoted <em>with</em> its compaction debt at steady state.</p>
+
+  <h2>6 · Head-to-head: which engine when</h2>
+  <p>The decision table to reproduce on a whiteboard (<a href="https://dataintensive.net/">DDIA ch. 3</a>, "Comparing B-Trees and LSM-Trees"):</p>
+  <table>
+    <tr><th>Dimension</th><th>B-tree (Postgres, MySQL/InnoDB)</th><th>LSM (Cassandra, RocksDB, LevelDB)</th></tr>
+    <tr><td>Point reads</td><td>Flat, predictable — one short descent</td><td>Good <em>with</em> Bloom filters; degrades as tables accumulate</td></tr>
+    <tr><td>Range scans</td><td>Excellent — leaves in key order, walk siblings</td><td>Weaker — must merge every table; Blooms can't help ranges</td></tr>
+    <tr><td>Write throughput</td><td>Limited by random in-place page I/O</td><td>Excellent — sequential flushes and merges only</td></tr>
+    <tr><td>Space</td><td>Fragmentation: pages run ~⅔ full</td><td>Tighter — compaction rewrites densely, compresses runs well</td></tr>
+    <tr><td>Latency predictability</td><td>High — no background rewrites of note</td><td>Compaction bursts cause p99 spikes and write stalls</td></tr>
+    <tr><td>Transactions maturity</td><td>Decades of MVCC, locking, constraint machinery</td><td>Thinner — typically per-key atomicity, app-level everything else</td></tr>
+  </table>
+  <p>Rule of thumb: <strong>read-mostly, relational, transactional → B-tree</strong> (orders, accounts, catalog). <strong>Write-heavy, append-mostly, huge ingest → LSM</strong> (events, messages, time series, logs). Say the workload shape first; the engine follows.</p>
+
+  <h2>7 · Object vs block vs file storage</h2>
+  <p>Engines need somewhere to put bytes; interviews increasingly probe the three storage models beneath them:</p>
+  <table>
+    <tr><th>Model</th><th>Unit &amp; API</th><th>Partial update?</th><th>Classic home</th></tr>
+    <tr><td><strong>Block</strong></td><td>Fixed-size blocks; read/write by offset (EBS, SAN)</td><td>Yes — the whole point</td><td>Under databases and filesystems</td></tr>
+    <tr><td><strong>File</strong></td><td>Hierarchical paths, POSIX open/seek/write (NFS, EFS)</td><td>Yes — in-place ranges</td><td>Shared app directories, legacy software</td></tr>
+    <tr><td><strong>Object</strong></td><td>Flat keyspace of immutable blobs + metadata over HTTP (S3, GCS)</td><td><strong>No — replace the whole object</strong></td><td>Media, backups, data lakes, SSTables</td></tr>
+  </table>
+  <p>The S3 model in one breath: objects are written whole and replaced whole — appending 200 bytes to a 1 GB object means uploading a new 1 GB object (or multipart-composing a new one); each object carries user metadata; <code>LIST</code> and reads are <strong>strongly consistent</strong> after every write since December 2020 (<a href="https://aws.amazon.com/s3/consistency/">AWS S3 consistency</a>); and durability is designed for <strong>eleven nines</strong> — 99.999999999%, i.e. store 10 million objects and expect to lose one every ~10,000 years, achieved by erasure-coding across devices and zones (<a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/DataDurability.html">AWS S3 durability docs</a>). Object storage replaces a filesystem exactly when data is <strong>write-once, read-many, large</strong> — which is why modern LSM engines increasingly tier their immutable SSTables straight into S3: the storage model and the file format finally agree (<a href="https://dataintensive.net/">DDIA ch. 3</a> covers the immutable-segment idea these designs build on).</p>
+
+  <h2>8 · The failure modes that decide interviews</h2>
+  <ul>
+    <li><strong>Compaction debt spiral.</strong> A sustained write burst outruns compaction; SSTables accumulate; every read now consults more tables, so read latency climbs <em>while</em> compaction competes for the same disk; the engine finally imposes <strong>write stalls</strong> — your "write-optimized" store rate-limits writes (<a href="https://github.com/facebook/rocksdb/wiki/Write-Stalls">RocksDB wiki: Write Stalls</a>). Mitigations: provision compaction headroom (ingest ≤ ~½ of merge throughput), rate-limit ingest upstream, watch pending-compaction bytes as a first-class alert.</li>
+    <li><strong>Unbounded tombstones.</strong> In an LSM, a delete is a <em>write</em> — a <strong>tombstone</strong> marker that must persist until compaction has provably merged it past every older copy. Delete-heavy workloads (queues-in-Cassandra, purged inboxes) build tombstone fields that reads must scan through before finding live data: Cassandra aborts queries past 100k tombstones by default, and slicing through tens of thousands of them is a classic production fire (<a href="https://thelastpickle.com/blog/2016/07/27/about-deletes-and-tombstones.html">The Last Pickle: About Deletes and Tombstones</a>; Discord hit exactly this reading messages in heavily-deleted channels — <a href="https://discord.com/blog/how-discord-stores-billions-of-messages">How Discord Stores Billions of Messages</a>). Fix the data model: don't build queues on deletes; bucket by time and drop whole partitions/tables instead.</li>
+    <li><strong>Random keys vs B-tree pages.</strong> Insert with random UUIDv4 primary keys and every insert lands on a <em>random</em> leaf page: the buffer pool thrashes, pages split constantly and sit half-full, and write amplification explodes — <a href="https://www.percona.com/blog/uuids-are-popular-but-bad-for-performance-lets-discuss/">Percona measured InnoDB falling off a cliff once the index outgrows RAM</a>. Sequential-ish keys (auto-increment, <strong>ULID</strong>, UUIDv7) keep all inserts on the rightmost leaf — which is why Shopify's payments team uses ULIDs for idempotency keys and cut an INSERT's latency substantially by doing so (<a href="https://shopify.engineering/building-resilient-payment-systems">Shopify: Building Resilient Payment Systems</a>). In the lab: switching insert order from sequential to random takes the mini-B-tree's write amp from ~2× to ~44×.</li>
+  </ul>
+
+  <h2>9 · One AI note, then back to fundamentals</h2>
+  <p>The KV-cache manager in our LLM inference platform <em>is</em> a storage engine wearing a GPU costume: token generation is an append-heavy workload; <a href="https://arxiv.org/abs/2309.06180">PagedAttention (vLLM)</a> allocates the cache in fixed-size blocks with an indirection table — literally the page-and-pointer trick from §3, applied to attention state to kill fragmentation; eviction and defragmentation of finished sequences are compaction's cousins, background work that reclaims space while racing foreground traffic; and prefix sharing is deduplication. Same trade triangle, same vocabulary, pricier bytes. That is the whole note — §1–§8 are what the interview is grading.</p>
+
+  <h2>10 · Interview talking points</h2>
+  <p>How to deploy this lesson live, in order:</p>
+  <ol>
+    <li><strong>Classify the workload before naming a store:</strong> read/write ratio, point vs range reads, delete rate, transaction needs. The engine falls out of the shape.</li>
+    <li><strong>Anchor on the disk:</strong> "sequential I/O is thousands of times cheaper than random — B-trees pay random writes for cheap reads, LSMs pay deferred merges for sequential writes."</li>
+    <li><strong>Quote the depth math</strong> (§3): "branching 500, four levels, ~256 TB — B-tree point reads are flat," and the write-amp math (§5): "4 KB page per 100 B row is 40×."</li>
+    <li><strong>Name the three amplifications</strong> and say which one your choice sacrifices — that single sentence signals you know RUM is a trade, not a defect.</li>
+    <li><strong>Raise the failure mode before the interviewer does</strong> (§8): compaction debt for LSM picks, random-key page splits for B-tree picks, tombstones for delete-heavy designs.</li>
+    <li><strong>Push immutable blobs to object storage</strong> (§7) and say the constraint out loud: "no partial updates — whole-object replace — so it only fits write-once data."</li>
+    <li><strong>Close with the operational tell:</strong> "I'd alert on pending compaction bytes / buffer-pool miss rate" — engine choices come with engine-specific pager duty.</li>
+  </ol>
+
+  <h2>11 · Lab — race an LSM against a B-tree</h2>
+  <div class="callout"><span class="label">Hands-on (do this before the quiz)</span>
+    Both engines from this lesson are built from scratch in <code>labs/lab-0012-lsm-vs-btree/</code>:
+    <code>python3 lsm_btree_lab.py</code> runs three experiments — write cost &amp; write amplification
+    for 100k inserts (size-tiered compaction vs buffer-pool page flushes), point reads on hot / cold /
+    missing keys with and without Bloom filters, and range scans that force the LSM to merge every table.
+    Then do exercises E1–E4 in the lab README: <em>predict, edit CONFIG, re-run, compare</em> —
+    halve the memtable, kill the blooms, randomize the keys, switch off compaction.
+    Wrong predictions are the deliverable — bring them to the next session.
+  </div>
+
+  <h2>12 · Project step</h2>
+  <p>Two decisions for the <strong>LLM inference platform</strong>: pick the storage engine for (a) the <strong>request/usage log</strong> (every request appended, billed, rarely re-read) and (b) the <strong>metadata store</strong> (users, API keys, quotas, model configs), and defend each in two sentences. A defensible pick: <em>(a) an LSM engine (RocksDB-backed, or Kafka-then-object-storage) because the log is pure append-heavy ingest that never updates in place, accepting read amplification we rarely pay; (b) Postgres, because metadata is small, read-mostly, and needs transactions and constraints — B-tree territory, and its write volume will never stress the page-update path.</em> Write your own two-sentence pair — workload shape first, engine second — and bring it to the next session for critique.</p>
+
+  <h2>Check yourself</h2>
+  <div class="quiz" id="quiz"></div>
+
+  <h2>Primary source</h2>
+  <p>Read <strong>DDIA Chapter 3, "Storage and Retrieval"</strong> (<a href="https://dataintensive.net/">dataintensive.net</a>) — the hash-index warm-up, SSTables and LSM-trees, B-trees, and the "Comparing B-Trees and LSM-Trees" section are this lesson in its canonical long form, and interviewers quote it almost verbatim. Then skim the <a href="https://github.com/facebook/rocksdb/wiki">RocksDB wiki</a> — especially <a href="https://github.com/facebook/rocksdb/wiki/Compaction">Compaction</a> and <a href="https://github.com/facebook/rocksdb/wiki/RocksDB-Bloom-Filter">Bloom Filter</a> — for what a production LSM's dials actually look like.</p>
+
+  <footer class="lesson-footer">
+    <p><strong>Stuck or curious?</strong> Ask your teacher (the agent) anything — "why can't Bloom filters accelerate range scans?" is an excellent follow-up question.</p>
+    <nav class="lesson-nav">
+      <span><a href="0011-api-design-deep.html">◀ Prev: 0011 · API Design, Deeply</a></span>
+      <span><a href="0013-streams-and-events.html">Next: 0013 · Streams &amp; Events ▶</a></span>
+    </nav>
+  </footer>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+renderQuiz(document.getElementById('quiz'), {
+  title: 'Check yourself',
+  questions: [
+    {
+      q: 'An LSM-tree engine sustains far higher write throughput than a B-tree on the same disk. What is the core mechanism?',
+      options: [
+        'It compresses every write before storing',
+        'It batches writes into sequential appends',
+        'It skips the write-ahead log entirely',
+      ],
+      answer: 1,
+      explain: 'Writes land in a memtable and reach disk only as sequential flushes and merges — the fastest thing any disk does. LSMs still keep a WAL for crash safety, and compression helps space, not the write path itself.',
+    },
+    {
+      q: 'A point read on an LSM-tree may have to consult many SSTables. What keeps this cheap in practice?',
+      options: [
+        'Bloom filters skip tables lacking the key',
+        'Memtables duplicate every key of every table',
+        'Compaction always merges everything into one table',
+      ],
+      answer: 0,
+      explain: 'A per-table Bloom filter answers "definitely not here" in one probe, so absent tables cost almost nothing — in the lab, missing-key reads went from cost ~68 to ~6. The memtable holds only recent writes, and compaction reduces but never guarantees a single table.',
+    },
+    {
+      q: 'DDIA\'s worked example: a B-tree of 4 KB pages with branching factor 500. Roughly how many levels cover ~256 TB of data?',
+      options: [
+        'Fourteen levels reach that scale roughly',
+        'Forty levels reach that scale barely',
+        'Four levels reach that scale comfortably',
+      ],
+      answer: 2,
+      explain: 'Depth grows as log base 500: each level multiplies reach by 500, so 500^4 ≈ 62 billion leaf references ≈ 256 TB in just four levels. This is why B-tree point-read latency stays flat — a handful of page reads, top levels cached.',
+    },
+    {
+      q: 'Under leveled compaction with fanout 10 across three levels, roughly what write amplification should you quote?',
+      options: [
+        'Around three total, one per level',
+        'Around thirty total, ten per level',
+        'Around three hundred, hundred per level',
+      ],
+      answer: 1,
+      explain: 'Leveled compaction rewrites an entry roughly fanout (~10) times as it merges into each level, so three levels give ~30x. The consolation: all those bytes move in large sequential merges, which is why the LSM still wins the ingest race.',
+    },
+    {
+      q: 'Deleting a key in Cassandra writes a tombstone marker. Why can heavy deletes make reads dramatically slower?',
+      options: [
+        'Reads must scan tombstones until compaction removes them',
+        'Tombstones lock the memtable until compaction removes them',
+        'Tombstones force full table rewrites before every read',
+      ],
+      answer: 0,
+      explain: 'A tombstone must survive until compaction merges it past every older copy of the key, so delete-heavy partitions become fields of markers a read slices through before reaching live data — the classic Cassandra queue anti-pattern, and the problem Discord hit in heavily-deleted channels.',
+    },
+    {
+      q: 'Your service must append 200 bytes to a 1 GB log object stored in S3. What does the object storage model force?',
+      options: [
+        'Appending bytes in place with range writes',
+        'Locking the object then editing it directly',
+        'Rewriting and uploading the entire object again',
+      ],
+      answer: 2,
+      explain: 'Objects are immutable: no partial update exists, so a change means writing a whole new object (or composing a new one via multipart). That is why object storage fits write-once, read-many blobs — like flushed SSTables — and not actively-appended files.',
+    },
+  ],
+});
+</script>
+</body>
+</html>

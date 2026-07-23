@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lesson p0-04 · Networking — Where Latency Comes From</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<div class="lesson">
+  <header class="lesson-header">
+    <p class="kicker">Lesson p0-04 · Phase 0 Track A — Programming/CS · <a href="p0-04-networking.ka.html">ქართული ვერსია</a></p>
+    <h1>Networking — Where Latency Comes From</h1>
+    <p class="dek">TCP, TLS, HTTP/1.1→3, sockets, and connection pooling — a request's latency is mostly round trips you chose to pay.</p>
+  </header>
+
+  <div class="mission-tie">
+    <strong>Mission tie.</strong> Every token your inference gateway streams to a user crosses this stack: socket → TCP → TLS → HTTP. When an interviewer asks why TTFT is 800 ms while the model's prefill takes 200 ms, the answer usually lives in this lesson — handshakes, cold connections, and head-of-line blocking. High Performance Browser Networking calls this out bluntly: most web latency is round trips, not bandwidth. (<a href="https://hpbn.co/primer-on-latency-and-bandwidth/">HPBN — latency vs bandwidth primer</a>)
+  </div>
+
+  <div class="callout"><span class="label">Lab first (ADHD-friendly order)</span>
+    Open <code>labs/lab-p0-04-latency-anatomy/</code> and run <code>python3 latency_anatomy_lab.py</code> <em>before</em> reading on. It measures connection reuse on real sockets and computes every table in this lesson. Read the lesson with the output next to you.
+  </div>
+
+  <h2>1 · The bill for one HTTPS request</h2>
+  <p>Type a URL, press enter. Before the first response byte arrives, you pay, in sequence: <strong>DNS lookup</strong> (find the IP), <strong>TCP handshake</strong> (1 round trip), <strong>TLS handshake</strong> (1–2 round trips), <strong>the request itself</strong> (1 round trip), then transfer time for the bytes. The unit of account is the <strong>RTT</strong> — round-trip time. Same city ≈ 1–10 ms, cross-continent ≈ 50 ms, cross-ocean ≈ 150 ms; physics (speed of light in fiber) sets the floor, and no hardware upgrade lowers it. (<a href="https://hpbn.co/primer-on-latency-and-bandwidth/">HPBN ch. 1</a>)</p>
+  <p>Bandwidth, by contrast, keeps improving and is rarely the bottleneck for small API payloads. A 10 KB JSON response at 100 Mbps costs ~1 ms of transfer — but 3 RTTs of setup at 50 ms each cost 150 ms. <strong>Latency dominates; count round trips first.</strong></p>
+
+  <h2>2 · TCP — reliability costs a round trip</h2>
+  <p>TCP gives you an ordered, reliable byte stream over an unreliable network. The price of that contract starts with the <strong>three-way handshake</strong>: SYN → SYN-ACK → ACK. The client can send data after one full round trip — so <em>every new TCP connection costs 1 RTT before byte one</em>. (<a href="https://hpbn.co/building-blocks-of-tcp/">HPBN — Building Blocks of TCP</a>)</p>
+  <p>Two throttles then govern how fast bytes flow:</p>
+  <ul>
+    <li><strong>Flow control</strong> — the receiver advertises a window (<code>rwnd</code>): "I can buffer this much." Protects the <em>receiver</em>.</li>
+    <li><strong>Congestion control</strong> — the sender maintains a congestion window (<code>cwnd</code>) that starts small and grows each RTT (<strong>slow start</strong>: roughly doubling until loss or threshold). Protects the <em>network</em>. A new connection cannot use your full bandwidth for the first several RTTs — one more reason cold connections hurt.</li>
+  </ul>
+  <div class="callout"><span class="label">Vocabulary</span>
+    <strong>Head-of-line (HOL) blocking</strong>: when one lost or slow item stalls everything queued behind it. TCP guarantees ordering, so one lost packet stalls delivery of all later packets on that connection — remember this for HTTP/2 vs HTTP/3.
+  </div>
+
+  <h2>3 · TLS — identity, keys, and more round trips</h2>
+  <p>TLS adds two things on top of TCP: <strong>authentication</strong> (the certificate proves you're talking to the real server) and <strong>encryption</strong> (a symmetric key negotiated per connection). The negotiation costs round trips: <strong>TLS 1.2</strong> needs <strong>2 RTTs</strong>; <strong>TLS 1.3</strong> compressed the handshake into <strong>1 RTT</strong> by sending the client's key share in the first flight, and offers <strong>0-RTT resumption</strong> for repeat connections (with replay-attack caveats). (<a href="https://hpbn.co/transport-layer-security-tls/">HPBN — TLS</a>)</p>
+  <p>So a cold HTTPS connection costs 1 (TCP) + 1–2 (TLS) = <strong>2–3 RTTs before the HTTP request even leaves</strong>. The per-byte encryption cost (AES with hardware support) is nearly free by comparison — the handshake is where the money goes.</p>
+
+  <h2>4 · Worked example — the time-to-first-byte ladder</h2>
+  <p>One small request, one fresh connection, RTT = 50 ms, server processing ≈ 0. Count round trips to first response byte:</p>
+  <pre><code>TCP + TLS 1.2 :  1 (TCP) + 2 (TLS) + 1 (request)  =  4 RTT  =  200 ms
+TCP + TLS 1.3 :  1 (TCP) + 1 (TLS) + 1 (request)  =  3 RTT  =  150 ms
+QUIC (HTTP/3) :  1 (transport+TLS)  + 1 (request)  =  2 RTT  =  100 ms
+QUIC 0-RTT    :  0 (resumed)        + 1 (request)  =  1 RTT  =   50 ms
+pooled conn   :  0 (already open)   + 1 (request)  =  1 RTT  =   50 ms
+
+Same wire, same server, same bytes: 4x spread — purely protocol choices.</code></pre>
+  <p>This ladder is experiment 3 of the lab, computed for RTT = 10/50/150 ms. Nothing here is about bandwidth.</p>
+
+  <h2>5 · HTTP/1.1 → HTTP/2 → HTTP/3</h2>
+  <p>HTTP evolution is one long war on round trips and head-of-line blocking:</p>
+  <table>
+    <tr><th>Version</th><th>Transport</th><th>Concurrency model</th><th>HOL blocking</th></tr>
+    <tr><td>HTTP/1.1</td><td>TCP</td><td>1 request at a time per connection; browsers open ~6 parallel connections; keep-alive reuses them</td><td>At HTTP level: one slow response blocks the connection</td></tr>
+    <tr><td>HTTP/2</td><td>TCP + TLS</td><td>Many <strong>streams multiplexed</strong> on one connection; header compression (HPACK)</td><td>Fixed at HTTP level, but <strong>still present at TCP level</strong>: one lost packet stalls all streams</td></tr>
+    <tr><td>HTTP/3</td><td><strong>QUIC</strong> (over UDP, TLS 1.3 built in)</td><td>Streams multiplexed with <strong>independent delivery</strong>; 1-RTT setup, 0-RTT resumption; connections survive IP changes</td><td>Gone at transport level: a lost packet stalls only its own stream</td></tr>
+  </table>
+  <p>QUIC moved reliability, ordering, and encryption into user space on top of UDP precisely so a lost packet in stream A cannot stall stream B — TCP's in-order contract made that impossible to fix. (<a href="https://www.rfc-editor.org/rfc/rfc9000">RFC 9000 — QUIC</a>, <a href="https://www.rfc-editor.org/rfc/rfc9114">RFC 9114 — HTTP/3</a>, <a href="https://hpbn.co/http2/">HPBN — HTTP/2</a>)</p>
+
+  <h2>6 · Sockets and connection pooling</h2>
+  <p>To your code, all of this appears as a <strong>socket</strong>: a file-descriptor handle on one endpoint of a connection, identified by the 4-tuple (src IP, src port, dst IP, dst port). Servers <code>listen()</code> and <code>accept()</code>; clients <code>connect()</code>. Lesson p0-03's event loops exist largely to juggle thousands of these without a thread each.</p>
+  <p><strong>Connection pooling</strong> is the systems answer to sections 2–4: pay the TCP + TLS setup once, keep the connection open, and reuse it for many requests. Every serious client does this (browsers, <code>requests.Session</code>, gRPC channels, database drivers). Pools bring their own knobs — size, idle timeout, health checks — and their own failure modes (§7). (<a href="https://github.com/donnemartin/system-design-primer">Primer</a>)</p>
+  <div class="callout"><span class="label">Rule of thumb</span>
+    If a client talks to the same host more than once, an unpooled connection is a bug. The lab's experiment 1 shows even localhost paying ~8x for fresh connections; over a WAN the multiple is worse because each setup burns real RTTs.
+  </div>
+
+  <h2>7 · Sharp edges — where latency hides in production</h2>
+  <ul>
+    <li><strong>Nagle's algorithm + delayed ACK</strong> — two well-meaning batching features that interact to add up to ~200 ms stalls on small writes. Latency-sensitive services set <code>TCP_NODELAY</code>. (<a href="https://hpbn.co/building-blocks-of-tcp/">HPBN</a>)</li>
+    <li><strong>Ephemeral port exhaustion</strong> — closing thousands of client connections leaves them in <code>TIME_WAIT</code>; open-connect-close loops at high QPS run out of ports. Pooling fixes the cause, not just the symptom.</li>
+    <li><strong>Slow start after idle</strong> — an idle pooled connection's congestion window can reset; the first burst after idle crawls. Long-lived does not mean always-warm.</li>
+    <li><strong>Pool exhaustion</strong> — all pooled connections busy → requests queue at the client. Looks like "the upstream is slow"; it's your own pool size. Classic misdiagnosis.</li>
+    <li><strong>TCP HOL blocking on HTTP/2</strong> — on lossy networks (mobile), HTTP/2 can be <em>slower</em> than HTTP/1.1 with 6 connections, because one loss stalls every stream. HTTP/3's whole reason to exist.</li>
+    <li><strong>SYN backlog overflow</strong> — connection storms (retry storms, thundering herds) fill the server's accept queue; clients see timeouts on <em>connect</em>, not on requests — a distinct signature worth recognizing.</li>
+  </ul>
+
+  <h2>8 · Lab — measure the handshake tax</h2>
+  <div class="callout"><span class="label">Hands-on (do this before the quiz)</span>
+    In <code>labs/lab-p0-04-latency-anatomy/</code>: <code>python3 latency_anatomy_lab.py</code> runs three experiments — real-socket connect-vs-reuse timing, the 24-resource page-load table for HTTP/1.1-close / keep-alive / HTTP/2 / HTTP/3 at three RTTs, and the TTFB ladder from §4. Then do exercises E1–E4 in the README: <em>predict, edit CONFIG, re-run, compare.</em> E2 and E3 are exact arithmetic — your hand math must match the program to the millisecond.
+  </div>
+
+  <h2>9 · Project step</h2>
+  <p>Apply this to the <strong>LLM inference gateway</strong>. Decisions to write down (one line each): (1) gateway ↔ model workers use <strong>pooled, long-lived connections</strong> (gRPC/HTTP2 channels) — never per-request connects; (2) client-facing token streaming runs over <strong>SSE or HTTP/2 streams</strong>, so one TCP+TLS setup amortizes over hundreds of token frames; (3) your <strong>TTFT SLO includes connection setup</strong> — a cold TLS 1.2 connection at 150 ms RTT spends 600 ms before the model is even asked (§4), which can exceed prefill itself; (4) retry storms multiply <em>handshakes</em>, not just requests — backoff protects the SYN queue too. The vLLM anatomy post is a good picture of what sits behind the socket you're feeding. (<a href="https://blog.vllm.ai/2025/09/05/anatomy-of-vllm.html">Inside vLLM</a>)</p>
+
+  <h2>Interview talking points</h2>
+  <ul>
+    <li>"For small payloads, latency is round trips, not bandwidth — so I count RTTs first: TCP costs 1, TLS 1.2 costs 2 more, TLS 1.3 costs 1, QUIC folds transport and TLS into 1."</li>
+    <li>"A cold HTTPS request at 50 ms RTT pays 150–200 ms before the server even sees it — that's why connection pooling and keep-alive are the first latency optimization, not caching."</li>
+    <li>"HTTP/2 fixed head-of-line blocking at the HTTP layer but not the TCP layer; HTTP/3 runs streams over QUIC so a lost packet only stalls its own stream — that's the whole point of QUIC."</li>
+    <li>"Slow start means a new — or long-idle — connection can't use full bandwidth for several RTTs, so 'we reuse connections' isn't automatically 'we're warm.'"</li>
+    <li>"Pool exhaustion looks exactly like a slow upstream; I check client-side queue time before blaming the service."</li>
+    <li>"In LLM serving, TTFT includes DNS, TCP, and TLS — streaming over one long-lived connection amortizes that setup across every token."</li>
+  </ul>
+
+  <h2>Check yourself</h2>
+  <div class="quiz" id="quiz"></div>
+
+  <h2>Primary source</h2>
+  <p>Read <strong>High Performance Browser Networking</strong>, chapters 1–2 and the TLS chapter (<a href="https://hpbn.co/">hpbn.co — free online</a>). Deeper, course-shaped alternative: <strong>Kurose &amp; Ross, <em>Computer Networking: A Top-Down Approach</em></strong> — the recommended networking text on <a href="https://teachyourselfcs.com/#networking">teachyourselfcs.com</a>, with free lecture materials at <a href="https://gaia.cs.umass.edu/kurose_ross/">gaia.cs.umass.edu/kurose_ross</a>.</p>
+
+  <footer class="lesson-footer">
+    <p><strong>Stuck or curious?</strong> Ask your teacher (the agent) anything — "why can't TCP just deliver packets out of order to fix HOL blocking?" is an excellent follow-up question.</p>
+    <nav class="lesson-nav">
+      <span>◀ Prev: p0-03 · Concurrency</span>
+      <span>Next: p0-05 · Senior Code Craft ▶</span>
+    </nav>
+  </footer>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+renderQuiz(document.getElementById('quiz'), {
+  title: 'Check yourself',
+  questions: [
+    {
+      q: 'A page needs 24 resources over a lossy mobile network. Which protocol change removes head-of-line blocking at the transport (TCP) layer?',
+      options: [
+        'HTTP/2, which multiplexes streams over one TCP connection',
+        'HTTP/3, which carries each stream independently over QUIC',
+        'HTTP/1.1, with pipelining of many requests per connection',
+      ],
+      answer: 1,
+      explain: 'HTTP/2 fixes HOL blocking at the HTTP layer only — one lost TCP packet still stalls every stream. QUIC delivers streams independently, so a loss stalls only its own stream.',
+    },
+    {
+      q: 'Before any application byte flows, a brand-new TCP connection costs at minimum how much time?',
+      options: [
+        'One full round trip between peers',
+        'Two full round trips between peers',
+        'Half a round trip between peers',
+      ],
+      answer: 0,
+      explain: 'SYN → SYN-ACK → ACK: the client may send data with the final ACK, one full RTT after starting. TLS then adds 1–2 more RTTs on top.',
+    },
+    {
+      q: 'Your gateway makes many requests to the same upstream service. What does a connection pool mainly save?',
+      options: [
+        'Bandwidth, by compressing repeated headers across many requests',
+        'CPU, by encrypting each request only one time',
+        'Latency, by skipping TCP and TLS handshakes repeatedly',
+      ],
+      answer: 2,
+      explain: 'A pooled connection has already paid the 2–3 setup RTTs, so each request costs only its own round trip. Header compression is HPACK’s job, and per-request encryption CPU is minor.',
+    },
+    {
+      q: 'A long-lived pooled connection sits idle for minutes, then gets a burst of traffic. Why can its first responses be slow again?',
+      options: [
+        'DNS entries expire and must be resolved once more',
+        'Congestion windows reset, so slow start ramps up again',
+        'Receive buffers shrink to zero whenever connections go idle',
+      ],
+      answer: 1,
+      explain: 'Many stacks reset cwnd after idle, so the sender re-enters slow start and needs several RTTs to reach full rate. DNS and receive windows are unrelated to the idle connection itself.',
+    },
+    {
+      q: 'For a small API response over a 150 ms transcontinental link, what usually dominates total response time?',
+      options: [
+        'Server CPU time spent generating the response',
+        'Bytes on the wire limited by bandwidth',
+        'Round trips required by handshakes and requests',
+      ],
+      answer: 2,
+      explain: 'A few KB transfers in ~1 ms at modern bandwidth, but each RTT costs 150 ms — a cold HTTPS connection burns 3–4 of them before the first byte. Count round trips first.',
+    },
+  ],
+});
+</script>
+</body>
+</html>

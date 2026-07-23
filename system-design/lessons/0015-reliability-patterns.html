@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lesson 15 · Reliability Patterns</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<div class="lesson">
+  <header class="lesson-header">
+    <p class="kicker">Lesson 0015 · Phase 2 — Software Architecture &amp; Reliability · <a href="0015-reliability-patterns.ka.html">ქართული ვერსია</a></p>
+    <h1>Reliability Patterns</h1>
+    <p class="dek">Systems rarely die from the failure itself — they die from their own defenses. Timeouts, retries, breakers, bulkheads, and shedding, plus the ways each one, misused, becomes the outage.</p>
+  </header>
+
+  <div class="mission-tie">
+    <strong>Mission tie.</strong> Anthropic's design prompts always reach the same follow-up: <em>"and what happens when that dependency slows down?"</em> Candidates who say "add retries" have just designed a retry storm; candidates who name the timeout budget, the retry budget, the breaker thresholds, and the shed policy — with numbers — are describing a system that survives its own Tuesday. This lesson is the vocabulary of <a href="https://pragprog.com/titles/mnee2/release-it-second-edition/">Release It!</a> (Nygard) and the <a href="https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/">AWS Builders' Library</a>, with the classic incidents (payments brownouts, flash sales) where each pattern earned its name. (<a href="https://www.tryexponent.com/blog/anthropic-system-design-interview">Exponent's 2026 Anthropic guide</a>)
+  </div>
+
+  <h2>1 · Anatomy of a cascading failure</h2>
+  <p>Reliability is a design discipline because the default behavior of a distributed system under partial failure is to convert one slow dependency into a total outage. The canonical sequence, straight out of <a href="https://pragprog.com/titles/mnee2/release-it-second-edition/">Release It!</a>: your checkout service calls a payments provider whose p99 quietly goes from 200 ms to 10 s. Nothing "fails" — every call eventually returns. But by <a href="0014-distributed-transactions.html">Little's law</a>, at 100 RPS × 10 s latency you now hold <strong>1,000 concurrent requests</strong> against a thread pool of 200. The pool fills in seconds; requests that never touch payments queue behind the ones that do; the whole service — browse, search, cart — is now as slow as its slowest dependency. <strong>Latency is contagious.</strong></p>
+  <p>Two consequences frame everything below. First, <em>slow is worse than down</em>: a dead dependency fails fast and frees your threads; a slow one holds them hostage. Second, the defenses interact — a retry is extra load, a fallback is untested code, a queue is deferred latency — so each pattern here has a failure-modes section of its own (§9). Google's SRE book calls the end state a <a href="https://sre.google/sre-book/addressing-cascading-failures/">cascading failure</a>: overload → server death → more overload on the survivors; AWS goes further and argues you should distrust even your recovery paths (<a href="https://aws.amazon.com/builders-library/avoiding-fallback-in-distributed-systems/">Avoiding fallback in distributed systems</a>).</p>
+
+  <h2>2 · Timeouts — every remote call has one</h2>
+  <p>The non-negotiable rule: <strong>every remote call has a timeout, always</strong> — a call without one is a thread you have donated to someone else's incident (<a href="https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/">AWS Builders' Library: Timeouts, retries and backoff with jitter</a>). Two numbers, not one: a <strong>connect timeout</strong> (short — establishing a TCP connection to a healthy peer is fast, so a few hundred ms is generous) and a <strong>request timeout</strong> (how long you will wait for the answer). Pick the request timeout from the dependency's <em>measured p99</em> plus headroom — not from vibes. Set it near the p50 and you time out healthy requests; set it at 30 s "to be safe" and you have rebuilt the hostage scenario of §1.</p>
+  <p><strong>Timeout budgets.</strong> Timeouts must decompose down the call chain: each hop's timeout fits inside what its caller has left, or the deeper timeout is decorative — the caller gives up first and the "protection" protects nobody.</p>
+  <table>
+    <tr><th>Hop</th><th>Timeout</th><th>Why this number</th></tr>
+    <tr><td>Client → edge</td><td>2,000 ms</td><td>The product promise: checkout answers in 2 s or apologizes</td></tr>
+    <tr><td>Edge → checkout service</td><td>1,500 ms</td><td>Leaves the edge 500 ms for one retry or a clean error page</td></tr>
+    <tr><td>Checkout → payments provider</td><td>800 ms</td><td>Provider p99 is 250 ms; 3× headroom, still inside the budget</td></tr>
+    <tr><td>Checkout → inventory DB</td><td>300 ms</td><td>p99 is 40 ms; anything slower is already an anomaly</td></tr>
+  </table>
+  <p>Say the invariant out loud in an interview: <em>child timeout &lt; parent's remaining budget, at every level.</em> A 5 s timeout below a 2 s timeout is a bug you can spot in an architecture diagram.</p>
+
+  <h2>3 · Retries done right</h2>
+  <p>A retry is a bet that the failure was transient — and it is <strong>extra load offered to a system that just told you it is struggling</strong>. Three rules make the bet safe (<a href="https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/">Builders' Library</a>):</p>
+  <ul>
+    <li><strong>Only retry idempotent operations, and only transient errors.</strong> Retrying a non-idempotent payment capture is how customers get charged twice (lesson <a href="0014-distributed-transactions.html">0014</a>'s idempotency keys exist for exactly this). A 400 will fail identically forever; don't retry it.</li>
+    <li><strong>Exponential backoff with full jitter.</strong> Plain exponential backoff (100, 200, 400 ms…) keeps clients that failed together retrying together — synchronized waves hammering the recovering service at exactly the same instants. Full jitter — sleep a <em>random</em> time in [0, min(cap, base·2ⁿ)] — decorrelates them. The <a href="https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/">AWS Architecture Blog's simulation</a> of contending clients found full jitter roughly <em>halves</em> total calls versus plain exponential backoff while finishing the work sooner: same retries, spread instead of stacked. You will reproduce the spread-vs-stack effect in the lab (E3).</li>
+    <li><strong>Retry budgets.</strong> Cap retries as a fraction of base traffic — e.g. retries ≤ 10% of requests. When the budget is spent, fail instead of retrying: a burst of failures then costs at most 1.1× load, not a multiple of it.</li>
+  </ul>
+  <p><strong>Worked example — the arithmetic interviewers want to hear.</strong> Retries compound <em>multiplicatively</em> across layers. Edge retries 3×, service retries 3×, data layer retries 3×: during a full outage of the bottom dependency, one client request becomes up to <strong>3 × 3 × 3 = 27 attempts</strong> at the bottom. At 1,000 RPS of client demand, the dying dependency receives 27,000 attempts/s — a 27× self-inflicted DDoS, delivered at the worst possible moment, and it persists until the retries drain. In the lab, even 2 layers × 3 attempts at only 50% failure pushes offered load to <strong>3.3×</strong> — and the storm outlives the failure window by 3 seconds, because the dependency has to dig out from under the backlog the retries created. The fixes stack: retry at <em>one</em> layer (usually the edge), budget it, and put a circuit breaker in front so retrying stops entirely when the dependency is truly down.</p>
+
+  <h2>4 · Circuit breakers — fail fast, probe gently</h2>
+  <p>A circuit breaker wraps calls to a dependency and tracks recent outcomes; when the failure rate crosses a threshold, it <em>trips</em> and subsequent calls fail immediately without touching the dependency (<a href="https://martinfowler.com/bliki/CircuitBreaker.html">Fowler: CircuitBreaker</a>; the pattern was canonized in <a href="https://pragprog.com/titles/mnee2/release-it-second-edition/">Release It!</a>). The state machine you must be able to draw:</p>
+  <table>
+    <tr><th>State</th><th>Behavior on each call</th><th>Transitions when</th></tr>
+    <tr><td><strong>Closed</strong> (normal)</td><td>Pass the call through; record success/failure in a rolling window</td><td>Failure rate ≥ threshold (e.g. 50% over 20 calls) → <strong>Open</strong></td></tr>
+    <tr><td><strong>Open</strong> (tripped)</td><td>Reject instantly — no network, fail in microseconds</td><td>Cooldown elapses (e.g. 2 s) → <strong>Half-open</strong></td></tr>
+    <tr><td><strong>Half-open</strong> (probing)</td><td>Let a limited probe through; reject the rest</td><td>Probe succeeds → <strong>Closed</strong>; probe fails → <strong>Open</strong></td></tr>
+  </table>
+  <p><strong>What fail-fast buys.</strong> Without a breaker, every call during an outage eats the full timeout: in the lab, 10 s of outage at 50 calls/s with a 1 s timeout costs the caller <strong>500 caller-seconds</strong> of blocked thread time — the §1 cascade in miniature. With the breaker, one window of calls pays the timeout, the trip converts every later failure to microseconds (lab: 14 caller-seconds total, a 36× reduction), and — just as important — the dependency gets silence in which to recover instead of a timeout-paced battering. The half-open probe is the elegance: the system discovers recovery by spending one request, not a stampede.</p>
+
+  <h2>5 · Bulkheads — partition so damage stays local</h2>
+  <p>Nygard named this after ship compartments: one flooded compartment must not sink the vessel. In software: <strong>give each dependency (or tenant) its own bounded pool</strong> — threads, connections, semaphore permits — so the §1 scenario becomes "the payments pool of 30 threads is exhausted; browse and search, running on their own pools, don't notice." The math of §1 reverses: 100 RPS × 10 s still wants 1,000 threads, but it can only ever take the 30 you allocated it. Payments degrade; the site survives. The same partitioning applies per-tenant: one customer sending pathological traffic exhausts <em>their</em> pool, not yours.</p>
+  <p>Zoom out and the bulkhead becomes architecture. <strong>Cell-based architecture</strong> partitions the entire stack into independent cells, each serving a slice of customers, so a poison request or bad deploy takes out one cell, not the service. <strong>Shuffle sharding</strong> refines it: assign each customer a random small subset of nodes, and two customers are unlikely to share their full subset — a noisy customer degrades a combination, and almost nobody else shares that exact combination (<a href="https://aws.amazon.com/builders-library/workload-isolation-using-shuffle-sharding/">AWS Builders' Library: Workload isolation using shuffle sharding</a>). This is how AWS keeps one poisoned Route 53 customer from being everyone's outage. Blast radius is a design input, not a post-incident metric.</p>
+
+  <h2>6 · Load shedding &amp; graceful degradation</h2>
+  <p>When offered load exceeds capacity, you will fail to serve someone. The only choice is <em>who and how</em>. The wrong answer is implicit: queue everything, let latency climb until every response arrives after its caller stopped waiting — 100% effort, 0% goodput. The right answer is explicit: <strong>reject at admission</strong>, cheaply and early, with a <code>503</code> and <code>Retry-After</code>, keeping accepted requests fast (<a href="https://aws.amazon.com/builders-library/using-load-shedding-to-avoid-overload/">AWS Builders' Library: Using load shedding to avoid overload</a>; <a href="https://sre.google/sre-book/handling-overload/">SRE book: Handling overload</a>). Recall the utilization–latency curve from lesson 0001: past ~80–90% utilization, waiting time goes vertical — admission control at ~0.9C is how you refuse to climb the cliff. In the lab, a ramp to 2× capacity gives the unshed queue a p99 of <strong>5.8 s and growing</strong>; admission control rejects 816 requests and holds survivors flat.</p>
+  <p>Not all requests are equal — shed by priority:</p>
+  <table>
+    <tr><th>Class</th><th>Examples</th><th>Under overload</th></tr>
+    <tr><td>Critical</td><td>Checkout, payment capture, <em>health checks</em></td><td>Shed last — dropping health checks makes the LB remove healthy servers and worsen the overload</td></tr>
+    <tr><td>Standard</td><td>Product pages, search, cart reads</td><td>Shed after degradables; serve stale cache where possible</td></tr>
+    <tr><td>Degradable</td><td>Recommendations, analytics beacons, prefetch</td><td>Shed first — or turn the feature off entirely</td></tr>
+  </table>
+  <p><strong>Graceful degradation is shedding features instead of users</strong>: during a flash sale, drop recommendations, serve yesterday's bestseller list from cache, and keep checkout pristine. A browned-out site that sells things beats a beautiful error page. <em>Brownout &gt; blackout.</em></p>
+
+  <h2>7 · Backpressure recap — bounded queues everywhere</h2>
+  <p>Shedding is backpressure at the front door; the same law applies to every queue inside the system. An <strong>unbounded queue is a latency bomb</strong>: it converts overload into unbounded delay, hides the problem from producers, and — when the consumer restarts — greets it with hours of backlog of mostly-expired work (<a href="https://aws.amazon.com/builders-library/avoiding-insurmountable-queue-backlogs/">AWS Builders' Library: Avoiding insurmountable queue backlogs</a>). You measured this in <a href="0008-async-and-communication.html">lesson 0008</a>'s lab: bound every queue, and decide <em>at enqueue time</em> what happens when it is full — block the producer, drop oldest, or reject. "The queue will absorb it" is only true until the queue <em>is</em> the outage.</p>
+
+  <h2>8 · Chaos engineering — rehearse the failure</h2>
+  <p>Every pattern above is code that runs only on a bad day — which means, untested, it runs for the first time in production during an incident. Chaos engineering is the discipline of running that code on purpose: form a hypothesis ("if the payments provider times out, checkout degrades to async capture and p99 stays under 2 s"), inject the fault with a controlled <strong>blast radius</strong> (one cell, 1% of traffic, business hours, hand on the abort switch), and compare against steady state (<a href="https://principlesofchaos.org/">principlesofchaos.org</a>). The lineage is Netflix's Chaos Monkey, which randomly kills production instances precisely so that surviving instance death is a daily non-event instead of an annual crisis (<a href="https://netflixtechblog.com/the-netflix-simian-army-16e57fbab116">Netflix Tech Blog: The Simian Army</a>). The socialized version is the <strong>game day</strong>: a scheduled exercise where the team injects a scripted failure and practices the response — testing the humans and runbooks, not just the code.</p>
+
+  <h2>9 · Failure modes — when the defenses attack</h2>
+  <p>The lesson's thesis, cashed out. Each pattern misused <em>is</em> an outage pattern:</p>
+  <ul>
+    <li><strong>The flapping breaker.</strong> A too-small sample window (5 calls) or hair-trigger threshold makes the breaker trip on noise, reclose on a lucky probe, and trip again — callers see errors arriving in confusing bursts and the dependency never gets clean recovery silence. You will produce a flap in the lab (E2). Size the window for statistical significance; make the cooldown generous.</li>
+    <li><strong>The globally shared retry budget.</strong> One retry budget for all tenants means one bad tenant's failures burn the entire budget, and now <em>nobody</em> gets retries — a noisy-neighbor attack on your own defense. Budgets need bulkheads too: per-tenant, per-dependency.</li>
+    <li><strong>The fallback that fails on the day.</strong> The fallback path runs rarely, so it is untested, under-provisioned, and drifting — and it is invoked exactly when the system is already degraded. That is the core of AWS's argument for <a href="https://aws.amazon.com/builders-library/avoiding-fallback-in-distributed-systems/">avoiding fallback</a>: prefer defenses that are always exercised (shedding, throttling, static stability) over a second code path that must work, cold, during a fire.</li>
+    <li><strong>The decorative timeout.</strong> A downstream timeout longer than the caller's remaining budget (§2) protects nothing: the caller has already hung up. Audit the chain end-to-end.</li>
+    <li><strong>Shedding the cheap requests.</strong> A shedder that drops by arrival order or at random sheds $0 analytics beacons and $400 checkouts with equal enthusiasm — or worse, sheds health checks, so the load balancer amputates healthy servers mid-overload. Priority is the whole point of shedding (§6).</li>
+  </ul>
+
+  <h2>10 · One AI note, then back to fundamentals</h2>
+  <p>Everything above transfers to GPU serving with the prices raised: a GPU worker's "thread pool" is its batch queue, so <strong>admission control sits in front of the queue</strong> (reject or route away when queue depth × service time exceeds the latency SLO — the §6 math with seconds-long service times); <strong>per-tenant bulkheads</strong> keep one customer's 100k-token jobs from starving everyone's chat traffic; and the brownout move is <strong>degrading to a smaller model</strong> — under overload, route standard-tier requests to the cheap model and keep the flagship for premium traffic. Same patterns, pricier misses. That is the whole note; §1–§9 are what the interview is grading.</p>
+
+  <h2>11 · Interview talking points</h2>
+  <p>How to deploy this lesson live, in order:</p>
+  <ol>
+    <li><strong>Open with the cascade</strong> (§1): "my first concern is a slow dependency exhausting the caller's concurrency — slow is worse than down." This frames everything else as deliberate.</li>
+    <li><strong>Timeouts with a budget</strong> (§2): state the edge promise (2 s) and decompose it per hop. Child &lt; parent's remainder, always.</li>
+    <li><strong>Retries with three qualifiers</strong> (§3): idempotent only, backoff with full jitter, budget ≤ 10% — then the 27× multiplication story for why retries live at one layer.</li>
+    <li><strong>Breaker with numbers</strong> (§4): "50% failures over 20 calls trips it; 2 s cooldown; half-open probe recloses." Naming thresholds is what separates the pattern from the buzzword.</li>
+    <li><strong>Bulkheads and blast radius</strong> (§5): per-dependency pools first, then "at platform scale I'd cell-partition and shuffle-shard tenants."</li>
+    <li><strong>Shed by priority, degrade features</strong> (§6): 503 + Retry-After at 0.9C, health checks and checkout protected, recommendations dropped first. Brownout &gt; blackout.</li>
+    <li><strong>Close with verification</strong> (§8): "none of this counts until a game day has exercised it — untested fallback is the outage."</li>
+  </ol>
+
+  <h2>12 · Lab — trip a breaker yourself</h2>
+  <div class="callout"><span class="label">Hands-on (do this before the quiz)</span>
+    Everything above is now verifiable in <code>labs/lab-0015-circuit-breaker/</code>:
+    <code>python3 reliability_lab.py</code> runs three experiments — retry amplification
+    (naive layered retries vs a 10% retry budget against a 50%-failing dependency, with the
+    storm that outlives its outage), a full closed/open/half-open circuit breaker run through
+    a 10 s outage (watch fail-fast turn 500 wasted caller-seconds into 14), and load shedding
+    at 2× capacity (unshed queue vs admission control, Little's law doing the pricing).
+    Then do exercises E1–E4 in the lab README: <em>predict, edit config, re-run, compare.</em>
+    Wrong predictions are the deliverable — bring them to the next session.
+  </div>
+
+  <h2>13 · Project step</h2>
+  <p>Write the <strong>reliability policy for gateway→worker calls</strong> in the LLM inference platform: timeout, retry budget, breaker thresholds, shed policy — and defend it in two sentences. A defensible pick: <em>request timeout = 1.2× the p99 decode time for the requested max-tokens, one retry only for idempotent-safe failures under a 10% per-tenant retry budget, breaker at 50% failures over 20 calls with a 5 s cooldown per worker, and admission control ahead of the batch queue that sheds free-tier traffic first with 503 + Retry-After.</em> Write your own — all four numbers, two sentences of defense — and bring it to the next session for critique.</p>
+
+  <h2>Check yourself</h2>
+  <div class="quiz" id="quiz"></div>
+
+  <h2>Primary source</h2>
+  <p>Read the <strong>AWS Builders' Library</strong> pair that anchors this lesson: <a href="https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/">Timeouts, retries and backoff with jitter</a>, then <a href="https://aws.amazon.com/builders-library/using-load-shedding-to-avoid-overload/">Using load shedding to avoid overload</a> — both written by the engineers who operate these systems, both dense with the numbers interviewers probe for. For the book-length treatment, <a href="https://pragprog.com/titles/mnee2/release-it-second-edition/">Release It! (2nd ed.)</a> chapters on stability antipatterns and patterns are the origin of circuit breakers and bulkheads as software vocabulary — the incident narratives alone are worth the read.</p>
+
+  <footer class="lesson-footer">
+    <p><strong>Stuck or curious?</strong> Ask your teacher (the agent) anything — "why does AWS argue *against* fallback but *for* load shedding, when both are degraded modes?" is an excellent follow-up question.</p>
+    <nav class="lesson-nav">
+      <span><a href="0014-distributed-transactions.html">◀ Prev: 0014 · Distributed Transactions &amp; Coordination</a></span>
+      <span><a href="0016-observability-and-ops.html">Next: 0016 · Observability &amp; Ops ▶</a></span>
+    </nav>
+  </footer>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+renderQuiz(document.getElementById('quiz'), {
+  title: 'Check yourself',
+  questions: [
+    {
+      q: "A request passes through three service layers, and during a full outage each layer makes up to three attempts. How many attempts can one client request generate at the bottom dependency?",
+      options: [
+        'Nine attempts, since retries only add together across layers',
+        'Twenty-seven attempts, since per-layer retries multiply down the chain',
+        'Three attempts, since only the top layer ever retries',
+      ],
+      answer: 1,
+      explain: 'Each of the top layer’s 3 attempts triggers up to 3 middle-layer attempts, each of which triggers up to 3 bottom attempts: 3 × 3 × 3 = 27. Retries multiply across layers — which is why retries should live at one layer, under a budget.',
+    },
+    {
+      q: 'A circuit breaker’s open cooldown elapses and it moves to half-open. What does it do in that state?',
+      options: [
+        'Allows a limited probe request through to test the dependency',
+        'Rejects every request instantly until an operator resets it manually',
+        'Forwards all traffic normally while recording the observed failure rate',
+      ],
+      answer: 0,
+      explain: 'Half-open spends one (or a few) real requests to discover whether the dependency has recovered: probe succeeds → close, probe fails → reopen. Recovery is detected with a single request instead of a stampede of full traffic.',
+    },
+    {
+      q: 'Many clients fail together and back off exponentially with identical delays. Why does adding full jitter to the backoff help?',
+      options: [
+        'It makes each individual retry finish faster than exponential backoff',
+        'It spreads retries randomly in time so spikes stop synchronizing',
+        'It reduces the total number of retries any client sends',
+      ],
+      answer: 1,
+      explain: 'Plain exponential backoff keeps the cohort synchronized — waves of retries land at the same instants. Full jitter randomizes each sleep over [0, cap], decorrelating the herd; AWS’s simulation showed it roughly halves total work versus un-jittered backoff under contention.',
+    },
+    {
+      q: 'Your server is saturated and requests keep arriving. Why is rejecting the excess at admission better than queueing everything?',
+      options: [
+        'A growing queue raises latency until every answer arrives uselessly late',
+        'Rejection frees network bandwidth, which is the genuinely scarce resource here',
+        'Queued requests consume database transactions that rejected ones would still need',
+      ],
+      answer: 0,
+      explain: 'An unbounded queue converts overload into unbounded delay: by Little’s law the wait grows with the backlog, until the server is doing 100% work for responses whose callers already gave up. Early rejection keeps accepted requests fast — goodput over throughput.',
+    },
+    {
+      q: 'One downstream dependency turns slow and soon your whole service is unresponsive, even endpoints that never call it. Which missing pattern explains this?',
+      options: [
+        'Retries: extra attempts would let slow calls eventually complete successfully',
+        'Caching: stored responses would answer requests the slow dependency cannot',
+        'Bulkheads: isolated pools would stop one dependency draining every thread',
+      ],
+      answer: 2,
+      explain: 'With one shared thread pool, calls to the slow dependency park until they hold every thread, and unrelated endpoints starve behind them. A bulkhead — a bounded pool per dependency — caps the damage at that pool’s size. Retries would add load, not capacity.',
+    },
+    {
+      q: 'The AWS Builders’ Library argues against complex fallback paths in distributed systems. What is the core of that argument?',
+      options: [
+        'Fallback paths always cost roughly double the infrastructure of the primary',
+        'Fallback logic belongs only inside the client library, never the server',
+        'Fallback code runs rarely, so it is untested exactly when needed',
+      ],
+      answer: 2,
+      explain: 'A fallback path executes only during rare bad days, so it rots: untested, under-provisioned, and first exercised for real mid-incident. AWS prefers always-exercised mechanisms — shedding, throttling, static stability — over a second code path that must work cold.',
+    },
+  ],
+});
+</script>
+</body>
+</html>

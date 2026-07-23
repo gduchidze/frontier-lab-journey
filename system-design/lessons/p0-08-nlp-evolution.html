@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lesson p0-08 · NLP Evolution: From Characters to Attention</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<div class="lesson">
+  <header class="lesson-header">
+    <p class="kicker">Lesson p0-08 · Phase 0 Track B — ML/DL/NLP · <a href="p0-08-nlp-evolution.ka.html">ქართული ვერსია</a></p>
+    <h1>NLP Evolution: From Characters to Attention</h1>
+    <p class="dek">Four ideas — subwords, embeddings, seq2seq, attention — that turned text into something a GPU can serve.</p>
+  </header>
+
+  <div class="mission-tie">
+    <strong>Mission tie.</strong> Every capacity number in the Anthropic loop — tokens/sec throughput, context-window limits, KV-cache sizing, the bill itself — is denominated in <em>tokens</em>, and the tokenizer defines what a token is. Karpathy's rule of thumb: a surprising fraction of everything weird about LLMs traces back to tokenization. This lesson builds the unit your entire spine project is priced in. (<a href="https://www.youtube.com/watch?v=zduSFxRajkE">Karpathy — Let's build the GPT Tokenizer</a>)
+  </div>
+
+  <h2>1 · The model never sees text</h2>
+  <p>A neural net consumes integers, not strings. So the first design decision in any language model is the <strong>tokenizer</strong>: the mapping from text to a sequence of IDs from a fixed <strong>vocabulary</strong>. Three obvious choices, three different failure modes:</p>
+  <table>
+    <tr><th>Granularity</th><th class="num">Vocab size</th><th>Sequence length</th><th>Unseen words</th></tr>
+    <tr><td>Characters/bytes</td><td class="num">~100–256</td><td>Very long (1 char = 1 token)</td><td>Always covered</td></tr>
+    <tr><td>Words</td><td class="num">100k–1M+</td><td>Short</td><td><strong>OOV</strong> → <code>&lt;UNK&gt;</code>, information lost</td></tr>
+    <tr><td>Subwords (BPE)</td><td class="num">32k–128k</td><td>Medium (~3–4 chars/token)</td><td>Falls back to smaller pieces</td></tr>
+  </table>
+  <p>Word-level dies on morphology, typos, names, and other languages (the out-of-vocabulary problem). Character-level covers everything but makes sequences 3–4× longer — and sequence length is what attention, memory, and latency are all priced in. Subwords are the engineered compromise, introduced for machine translation by <a href="https://arxiv.org/abs/1508.07909">Sennrich et al. 2015</a>.</p>
+
+  <h2>2 · BPE in four lines</h2>
+  <p><strong>Byte-pair encoding</strong> is a compression algorithm from 1994 repurposed as a tokenizer trainer: start from characters, then repeatedly <em>merge the most frequent adjacent pair</em> into a new vocabulary token, until you hit a vocab budget. Encoding new text = replay the merges in training order. Decoding = concatenate. Watch it run on the classic example:</p>
+  <pre><code>text: a a a b d a a a b a c            (11 tokens)
+pairs: (a,a)=4  (a,b)=2  (b,d)=1  (d,a)=1  (b,a)=1  (a,c)=1
+
+merge 1: (a,a) -> "aa"    ->  aa a b d aa a b a c    (9 tokens)
+merge 2: (aa,a) -> "aaa"  ->  aaa b d aaa b a c      (7 tokens)
+merge 3: (aaa,b) -> "aaab" -> aaab d aaab a c        (5 tokens)
+
+3 merges: vocab grows by 3, sequence shrinks 11 -> 5 (2.2x)</code></pre>
+  <p>That is the entire trick. Frequent words end up as single tokens; rare words shatter into familiar fragments; <em>nothing</em> is ever out of vocabulary because the worst case is falling back to characters. Karpathy's <a href="https://github.com/karpathy/minbpe">minbpe</a> is the cleanest reference implementation — ~100 lines.</p>
+
+  <h2>3 · Lab — build the tokenizer first</h2>
+  <div class="callout"><span class="label">Hands-on (ADHD rule: lab first, prose second)</span>
+    Run the lab <em>now</em>, before reading further, and keep its output open next to the remaining sections:
+    <code>labs/lab-p0-08-build-bpe/</code> → <code>python3 bpe_lab.py</code>. It trains a real BPE tokenizer
+    on a paragraph, prints the merges it learns, round-trips unseen text losslessly, compares
+    char/word/BPE granularities, and measures the vocab-vs-sequence-length trade — including how much
+    extra a Georgian sentence costs on an English-trained tokenizer. Then do exercises E1–E4 in the
+    README: <em>predict, edit CONFIG, re-run, compare.</em> Wrong predictions are the deliverable.
+  </div>
+
+  <h2>4 · Real tokenizers ship differently</h2>
+  <p>Production tokenizers refine the toy in three ways. First, they operate on <strong>bytes</strong>, not characters, so all of Unicode is covered by a 256-symbol base alphabet (GPT-2's move). Second, a regex <strong>pre-splits</strong> text so merges never cross word boundaries or mix letters with punctuation. Third, they are trained on terabytes, not paragraphs. (<a href="https://github.com/openai/tiktoken">tiktoken</a>, <a href="https://github.com/google/sentencepiece">SentencePiece</a> — the latter treats text as a raw stream, no pre-tokenization, which is why Llama handles whitespace differently.)</p>
+  <table>
+    <tr><th>Tokenizer</th><th class="num">Vocab</th><th>Notes</th></tr>
+    <tr><td>GPT-2 (byte-level BPE)</td><td class="num">50,257</td><td>256 bytes + 50k merges + <code>&lt;|endoftext|&gt;</code></td></tr>
+    <tr><td>GPT-4 (cl100k_base)</td><td class="num">~100k</td><td>Better digits/whitespace handling; ~fewer tokens per text</td></tr>
+    <tr><td>Llama 2 (SentencePiece)</td><td class="num">32,000</td><td>Small vocab → longer sequences</td></tr>
+    <tr><td>Llama 3</td><td class="num">128,256</td><td>4× bigger vocab bought ~15% shorter sequences</td></tr>
+  </table>
+  <p>Read that last row as a systems decision, not an ML one: a bigger vocabulary means shorter sequences (cheaper attention, smaller KV cache, more text per context window) at the price of a bigger embedding + unembedding matrix and rarer, worse-trained tail tokens.</p>
+
+  <h2>5 · Embeddings: meaning becomes geometry</h2>
+  <p>A token ID is arbitrary. The <strong>embedding table</strong> maps each ID to a learned vector, and <a href="https://arxiv.org/abs/1301.3781">word2vec (2013)</a> was the demonstration that shocked everyone: train a tiny model to predict neighboring words, and the vectors arrange themselves so that <em>direction encodes meaning</em> — the famous <code>king − man + woman ≈ queen</code>. Similar words cluster; relationships become directions. (Geometric intuition: <a href="https://www.3blue1brown.com/">3Blue1Brown</a>'s neural-network series.)</p>
+  <p>The catch: word2vec assigns <strong>one static vector per word</strong>. "Bank" gets the same vector in "river bank" and "bank run". Meaning depends on context, and a lookup table cannot see context. Holding that thought is the fastest way to understand why the next two sections had to happen.</p>
+
+  <h2>6 · Seq2seq and the bottleneck</h2>
+  <p><a href="https://arxiv.org/abs/1409.3215">Sutskever et al. 2014</a> made translation neural: an encoder RNN reads the source sentence and compresses it into <em>one fixed-size vector</em>; a decoder RNN unrolls the translation from that vector, token by token. It worked — and it had an obvious flaw the authors saw immediately: quality collapsed on long sentences. A 60-word sentence and a 6-word sentence both squeeze through the same few-thousand-float bottleneck. Compression loss, made architectural.</p>
+  <div class="callout"><span class="label">Vocabulary</span>
+    <strong>Autoregressive decoding</strong> — generate one token, feed it back in, generate the next — enters the story here and never leaves. It is why LLM inference is sequential per request, why decode is memory-bound, and why batching exists (Lesson 0001). Seq2seq is the direct ancestor of every chat model you will serve.
+  </div>
+
+  <h2>7 · Attention: the breakthrough</h2>
+  <p><a href="https://arxiv.org/abs/1409.0473">Bahdanau et al. 2014</a> removed the bottleneck with one move: keep <em>all</em> encoder states, and at every decoding step let the decoder compute a <strong>soft, learned weighted average</strong> over them — attending to whichever source words matter right now. No fixed vector; alignment is learned, not annotated. Three years later, <a href="https://arxiv.org/abs/1706.03762">"Attention Is All You Need" (2017)</a> asked the radical question — if attention is doing the real work, why keep the RNN at all? — and the Transformer was born: attention layers only, fully parallel across the sequence during training. Contextual embeddings (<a href="https://arxiv.org/abs/1802.05365">ELMo</a>, <a href="https://arxiv.org/abs/1810.04805">BERT</a>) then fixed word2vec's static-vector problem: the same word now gets a different vector in every sentence.</p>
+  <table>
+    <tr><th class="num">Year</th><th>Idea</th><th>What it fixed</th></tr>
+    <tr><td class="num">2013</td><td>word2vec</td><td>Meaning as geometry — but one static vector per word</td></tr>
+    <tr><td class="num">2014</td><td>seq2seq</td><td>End-to-end generation — but a fixed-vector bottleneck</td></tr>
+    <tr><td class="num">2014</td><td>Bahdanau attention</td><td>Decoder looks back at the whole input, softly</td></tr>
+    <tr><td class="num">2017</td><td>Transformer</td><td>Drop recurrence; attention only; parallel training</td></tr>
+    <tr><td class="num">2018</td><td>ELMo / BERT / GPT</td><td>Contextual vectors; pretrain once, adapt everywhere</td></tr>
+  </table>
+  <p>The attention math itself — Q, K, V, and why the K/V part becomes the cache you will spend Phase 4 managing — is the whole of <a href="p0-09-transformer-anatomy.html">Lesson p0-09</a>. (Deeper treatment: <a href="https://stanford-cs336.github.io">Stanford CS336</a>, <a href="https://www.youtube.com/watch?v=kCc8FmEb1nY">Karpathy's "Let's build GPT"</a>.)</p>
+
+  <h2>8 · Sharp edges: when tokenization bites</h2>
+  <p>Failure modes worth knowing cold, because they surface as production incidents, not ML curiosities (all demonstrated in the <a href="https://www.youtube.com/watch?v=zduSFxRajkE">tokenizer video</a>):</p>
+  <ul>
+    <li><strong>Glitch tokens.</strong> Tokens frequent in tokenizer-training data but near-absent from model-training data (the "SolidGoldMagikarp" family) have untrained embeddings — feeding them in produces bizarre outputs. Tokenizer and model were trained on <em>different corpora</em>; the mismatch is the bug.</li>
+    <li><strong>Arithmetic and spelling.</strong> "2437" may be one token or three depending on context, and "strawberry" is ~2 tokens — the model never sees letters, which is why letter-counting and digit manipulation are unreasonably hard.</li>
+    <li><strong>Multilingual fertility.</strong> An English-heavy tokenizer spends 2–5× more tokens per character on underrepresented languages. Same prompt, same model — more latency, less effective context, bigger bill. Your lab measures this for Georgian.</li>
+    <li><strong>Whitespace and code.</strong> Indentation is tokens; cl100k merged runs of spaces specifically to stop Python from wasting the context window.</li>
+    <li><strong>Tokenizer/model mismatch in serving.</strong> Deploy a model with the wrong tokenizer files and you get fluent garbage — every ID maps to the wrong string. Classic infra incident; version tokenizers like model weights.</li>
+  </ul>
+
+  <h2>9 · Project step: tokens are the capacity unit</h2>
+  <p>Your spine project's gateway will enforce SLOs in tokens/sec, meter cost per token, and size its KV cache per token. Tokenizer fertility therefore feeds capacity planning directly:</p>
+  <pre><code>Same 500-char prompt through an English-centric tokenizer:
+  English  : 500 chars ÷ ~4.0 chars/token ≈ 125 tokens
+  Georgian : 500 chars ÷ ~1.4 chars/token ≈ 357 tokens   (~2.9x)
+
+Consequences per request, same model, same hardware:
+  prefill compute  ~2.9x    KV-cache bytes  ~2.9x
+  effective context ÷2.9    per-request bill ~2.9x</code></pre>
+  <p>Action: run lab experiment 4, note the measured Georgian/English fertility ratio, and write one sentence in your scratch notes on how a token-metered rate limiter should treat mixed-language traffic. You will reuse this number in the KV-cache sizing math of p0-09 and the batching-scheduler design in Phase 4.</p>
+
+  <h2>Interview talking points</h2>
+  <ul>
+    <li>"BPE is greedy compression: repeatedly merge the most frequent adjacent pair until a vocab budget; encoding just replays the merges in order."</li>
+    <li>"Byte-level BPE has no out-of-vocabulary case — worst case, a string falls back to raw bytes."</li>
+    <li>"Vocab size is a systems trade: bigger vocab → shorter sequences, cheaper attention, smaller KV cache — but a bigger embedding table and worse-trained tail tokens."</li>
+    <li>"Seq2seq's flaw was one fixed vector for the whole input; Bahdanau attention let the decoder softly look back at every encoder state, and the Transformer made that the entire architecture."</li>
+    <li>"word2vec gives one static vector per word; ELMo/BERT made vectors contextual — that's the line between embeddings and representations."</li>
+    <li>"Tokenizer fertility varies by language, so capacity planning in tokens/sec must model the tokens-per-character rate of the actual traffic mix."</li>
+  </ul>
+
+  <h2>Check yourself</h2>
+  <div class="quiz" id="quiz"></div>
+
+  <h2>Primary source</h2>
+  <p>Watch <strong>Karpathy — "Let's build the GPT Tokenizer"</strong> (<a href="https://www.youtube.com/watch?v=zduSFxRajkE">YouTube</a>, free): builds byte-level BPE from zero and demos every failure mode in section 8. Free alternative in text form: the <a href="https://github.com/karpathy/minbpe">minbpe repo</a> (readable reference code + exercise list) plus the original <a href="https://arxiv.org/abs/1508.07909">Sennrich BPE paper</a>.</p>
+
+  <footer class="lesson-footer">
+    <p><strong>Stuck or curious?</strong> Ask your teacher (the agent) anything — "why not just use bytes directly and skip BPE entirely?" is an excellent follow-up question.</p>
+    <nav class="lesson-nav">
+      <span>◀ Prev: <a href="p0-07-dl-foundations.html">p0-07 · DL Foundations</a></span>
+      <span>Next: <a href="p0-09-transformer-anatomy.html">p0-09 · Transformer Anatomy</a> ▶</span>
+    </nav>
+  </footer>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+renderQuiz(document.getElementById('quiz'), {
+  title: 'Check yourself',
+  questions: [
+    {
+      q: 'Why did subword tokenization (BPE) beat word-level vocabularies in modern LLMs?',
+      options: [
+        'It guarantees every word maps to one token',
+        'It keeps vocabulary bounded while covering unseen words',
+        'It removes the need for an embedding table',
+      ],
+      answer: 1,
+      explain: 'Word-level vocabularies explode in size and still hit out-of-vocabulary words. BPE caps the vocab at a budget and covers any string by falling back to smaller pieces.',
+    },
+    {
+      q: 'During BPE training, what does one merge step do?',
+      options: [
+        'Replaces the most frequent adjacent pair everywhere',
+        'Splits the longest token into two halves',
+        'Deletes the rarest symbol from the vocabulary',
+      ],
+      answer: 0,
+      explain: 'Each step counts all adjacent pairs, fuses the most frequent one into a new vocabulary token, and rewrites the corpus. Encoding later replays these merges in the same order.',
+    },
+    {
+      q: 'What limitation of word2vec did contextual embeddings (ELMo, BERT) fix?',
+      options: [
+        'Vectors were too large to fit in memory',
+        'Training needed labeled data for every single word',
+        'Each word got one vector regardless of context',
+      ],
+      answer: 2,
+      explain: 'word2vec is a static lookup table: "bank" has the same vector in "river bank" and "bank run". Contextual models compute a fresh vector for each occurrence from its sentence.',
+    },
+    {
+      q: 'In 2014-era seq2seq translation, what exact problem did attention solve?',
+      options: [
+        'The decoder generated output tokens too slowly for long sentences',
+        'The entire input sentence was squeezed into one fixed-size vector',
+        'The encoder required labeled alignment data for every training pair',
+      ],
+      answer: 1,
+      explain: 'The encoder compressed any sentence into one fixed vector, so long inputs lost information. Attention keeps all encoder states and lets the decoder take a learned weighted look at them each step.',
+    },
+    {
+      q: 'You grow a BPE vocabulary from 32k to 100k tokens. What happens to a typical tokenized sequence?',
+      options: [
+        'It gets longer and costs more',
+        'It stays identical but trains faster',
+        'It gets shorter but embeddings grow',
+      ],
+      answer: 2,
+      explain: 'More merges mean more text per token, so sequences shrink (cheaper attention, smaller KV cache) — the price is a larger embedding/unembedding matrix and rarer tail tokens. Llama 2→3 made exactly this trade.',
+    },
+  ],
+});
+</script>
+</body>
+</html>

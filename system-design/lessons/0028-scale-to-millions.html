@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lesson 28 · Scaling to Millions of Users — the Evolution Rep</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<div class="lesson">
+  <header class="lesson-header">
+    <p class="kicker">Lesson 0028 · Phase 3 — Classic Design Reps · Capstone · <a href="0028-scale-to-millions.ka.html">ქართული ვერსია</a></p>
+    <h1>Scaling to Millions of Users — the Evolution Rep</h1>
+    <p class="dek">Every rep so far designed one system at one scale. The capstone rehearses the other axis: one system, every scale — the canonical single-box-to-multi-region evolution that underlies every scaling story you will ever tell.</p>
+  </header>
+
+  <div class="mission-tie">
+    <strong>Mission tie.</strong> This capstone rehearses the SHAPE of every scaling narrative — an inference platform evolves through exactly the same stages with GPUs in place of app servers: one GPU box → LB + replica pool → KV-cache tier → sharded model workers → multi-region serving.
+  </div>
+
+  <div class="callout"><span class="label">Rep protocol — this rep is different</span>
+    Instead of one 40-minute design, narrate the EVOLUTION aloud stage by stage <em>before</em> reading: start from "everything on one box" and repeatedly ask <em>"what breaks first at 10× load?"</em> — name the broken component, the fix, and the new problem the fix introduces, until you reach multi-region. Only then read the lesson, and log every stage where your narration diverged as deltas.
+  </div>
+
+  <h2>1 · The rep, and why interviewers love it</h2>
+  <p>"Scale this site from zero to millions of users" is the interviewer's cheapest X-ray of your judgment. It does not test whether you know microservices, Kafka, or Kubernetes — it tests whether you scale <strong>by need, not by fashion</strong>. The candidate who deploys sixteen services and a service mesh for 200 QPS fails the same way the candidate who keeps everything on one Postgres at 50k writes/s does: both ignored the load numbers. <em>Premature microservices</em> is a named smell (lesson 0010); so is premature sharding, premature multi-region, and premature anything.</p>
+  <p>The winning shape is a ladder: at each stage, name (a) what breaks first at the next 10×, (b) the minimal fix, and (c) the new problem the fix introduces — because every fix introduces one. That three-beat rhythm, repeated six times, <em>is</em> the answer. The Primer's <a href="https://github.com/donnemartin/system-design-primer/blob/master/solutions/system_design/scaling_aws/README.md">Scaling on AWS solution</a> walks this exact ladder; this lesson compresses it into interview-ready form.</p>
+
+  <h2>2 · Stage 0 — a single server, and why it is correct</h2>
+  <p>Everything on one box: web server, application code, database, cron jobs, files on local disk. One vertical scaling lever — buy a bigger machine: more cores, more RAM, faster disks. This is not a naïve starting point; it is the <strong>correct</strong> one. One box means no network hops between tiers, no distributed failure modes, no consistency questions, trivial deploys, and total system comprehension in one head. YAGNI applied to infrastructure.</p>
+  <p>Its real ceiling: a dynamic page costs milliseconds of CPU, so one well-tuned box serves on the order of <em>hundreds</em> of QPS — and, more fatally, it is a single point of failure and vertical scaling has a hard top (the biggest rentable machine) with cost rising faster than capacity. The interview line: <em>"I start on one box and I stay there until a measured number forces me off — the first crack is usually the DB and the web server fighting for the same CPU and memory."</em></p>
+
+  <h2>3 · Stage 1 — split web and DB tiers; the load numbers</h2>
+  <p>First crack, first fix: move the database to its own machine, put DNS in front of the web box. Now each tier scales and fails independently — web CPU spikes no longer evict DB pages from memory. New problem introduced: a network hop between app and DB (add ~1 ms and a new failure mode: the link itself), and now there are <em>two</em> single points of failure instead of one.</p>
+  <p>Estimate checkpoints — the loads at which each stage cracks. Assumptions stated: a dynamic page costs ~5–10 ms of CPU on one core, so an 8-core box serves a few hundred QPS; ~90% of traffic is reads.</p>
+  <pre><code>Stage 0 cracks  ~200 QPS      one box does web + DB + everything
+Stage 1 cracks  ~500 QPS      DB box saturates while web box idles
+Stage 2 cracks  ~2–5k QPS     single DB primary is the wall behind N web servers
+Stage 3 cracks  ~20–50k QPS   writes outgrow one primary despite cache + replicas
+Stage 5 target  100k+ QPS     sharded writes, NoSQL hot paths
+Stage 6 target  ~1M QPS       multiple regions, each a full stack</code></pre>
+  <p>These are powers-of-ten guardrails, not facts — say your assumptions aloud and adjust. The point is that <strong>each stage has a number</strong>, and you transition when the number arrives, not before.</p>
+
+  <h2>4 · Stage 2 — load balancer + N stateless web servers</h2>
+  <p>The web tier saturates next. Fix: a load balancer (L4 or L7 — lesson 0003) in front of N identical web servers, spread across availability zones, with health checks so a dead server is ejected in seconds. But horizontal scaling has a precondition: <strong>statelessness</strong>. If user sessions live in web-server memory, the LB must pin users to servers (sticky sessions), which breaks the whole model — a server death logs users out, and load skews.</p>
+  <p>So sessions move out: externalize them to Redis (callback 0003). Any server can now serve any request, servers become cattle, and deploys become rolling restarts. New problems introduced: the LB is itself a component that can fail (run a pair), Redis is a new dependency on the hot path, and you now operate N machines instead of two — health checks, config drift, and fleet-wide deploys become real work. This stage buys you roughly 10× on the web tier and exposes the next wall: every one of those N servers hammers the <em>same single database</em>.</p>
+
+  <h2>5 · Stage 3 — DB replication, cache, CDN</h2>
+  <p>The single DB cracks under read load first (reads dominate ~10:1). Three fixes land together:</p>
+  <ul>
+    <li><strong>Replication</strong> — one primary takes writes, read replicas take reads (lesson 0005). The old friend that returns: <strong>replication lag</strong> (lesson 0004) — a user writes to the primary and reads their own missing comment from a replica. Read-your-writes routing or bounded-staleness rules come back with it.</li>
+    <li><strong>Cache-aside layer</strong> — Redis/Memcached between web and DB (lesson 0007): check cache, on miss read DB and fill. Kills most residual read traffic; introduces invalidation, staleness windows, and thundering herds on hot-key expiry.</li>
+    <li><strong>CDN</strong> — static assets (images, JS, CSS) leave your servers entirely and get served from edge locations (lesson 0003). Often the single biggest bandwidth win of the whole evolution.</li>
+  </ul>
+  <p>New problems introduced: three kinds of staleness (lag, TTL, CDN cache) now coexist, and "which copy did this read come from?" becomes a debugging question. The write path, meanwhile, is untouched — one primary still absorbs every write. Remember that; it is the stage-5 wall.</p>
+
+  <h2>6 · Stage 4 — autoscaling, queues, object storage</h2>
+  <p>Traffic is no longer flat — daily peaks are 3–10× the trough, and paying for peak 24/7 is waste. Fix: <strong>autoscaling groups</strong> — the web fleet grows and shrinks against a utilization target. Precondition: the stateless-everything discipline from stage 2, now absolute — any server must be killable at any second without a user noticing.</p>
+  <p>Two companions arrive with it:</p>
+  <ul>
+    <li><strong>Queues decouple slow work</strong> (lesson 0008): video transcoding, email, report generation move behind a message queue with their own worker pool. The web tier answers in milliseconds and the queue absorbs spikes — with backpressure and bounded queues, or the lesson-0008 hockey stick returns.</li>
+    <li><strong>Object storage for user uploads</strong>: files leave local disks for an S3-style store — infinitely scalable, replicated, and reachable from every server; local disk was quietly a statefulness violation all along.</li>
+  </ul>
+  <p>New problems introduced: autoscaling lag (instances take a minute to boot — spikes faster than that still need headroom or shedding), queue-consumer failure semantics (at-least-once → idempotent workers), and cost that now <em>moves</em> — a bug can autoscale your bill.</p>
+
+  <h2>7 · Stage 5 — shard the writes, NoSQL the hot paths</h2>
+  <p>Now the wall deferred since stage 3: <strong>write volume outgrows the single primary</strong>. Replicas do not help — every replica replays every write. The fix is sharding (lesson 0005): partition data across N primaries by key (user ID, tenant ID), each shard taking 1/N of writes. Costs arrive immediately: cross-shard queries and joins get hard, transactions stop at shard boundaries, resharding is a live-surgery project, and a bad shard key creates <strong>hot shards</strong> — the celebrity problem from the Twitter rep (lesson 0020): one famous user's data melts one shard while fifteen idle.</p>
+  <p>In parallel, hot non-relational paths migrate to purpose-built NoSQL stores (lesson 0006): session-like key-value data, activity feeds, counters — workloads that never needed joins pay relational overhead for nothing. The decision table from 0006 applies: relational where transactions and joins earn their cost, NoSQL where access patterns are simple and scale is the constraint. New problems: two (or more) storage systems to operate, and data consistency <em>between</em> them becomes application logic.</p>
+
+  <h2>8 · Stage 6 — multi-region</h2>
+  <p>Last ladder rung, driven by two forces: latency (light takes ~70 ms one way across an ocean — no server tuning fixes physics) and survival (a whole-region outage should degrade you, not erase you). Fix: full stacks in multiple regions, with <strong>geoDNS</strong> routing users to the nearest one, and <strong>data-residency</strong> rules sometimes pinning a user's data to a legal jurisdiction regardless of latency.</p>
+  <p>The pain concentrates in <strong>cross-region replication</strong>: 70–150 ms of lag is physics, so synchronous replication across regions is off the table for the hot path — you are choosing an asynchronous, eventually-consistent world (lesson 0004) and every consistency question from Phase 1 returns at continental scale. The central choice:</p>
+  <ul>
+    <li><strong>Active-passive</strong> — one region serves, one warm-standby replicates and waits. Simpler; failover loses the async tail (RPO &gt; 0) and the passive region is paid-for idle capacity.</li>
+    <li><strong>Active-active</strong> — all regions serve. Full capacity utilization and instant failover, but writes can now conflict across regions — conflict resolution (last-write-wins, CRDTs, or per-user home-region pinning) becomes your problem.</li>
+  </ul>
+  <p>Failover itself must be <em>drilled</em>, not assumed — an untested failover path is a rumor (lesson 0004).</p>
+
+  <h2>9 · The cost curve — scale is bought with complexity</h2>
+  <table>
+    <tr><th>Stage</th><th class="num">QPS ceiling ~</th><th class="num">Monthly cost ~</th><th>Ops burden</th></tr>
+    <tr><td>0 · single box</td><td class="num">200</td><td class="num">$100</td><td>Trivial — one pet machine</td></tr>
+    <tr><td>1 · web/DB split</td><td class="num">500</td><td class="num">$300</td><td>Low — two boxes, one link</td></tr>
+    <tr><td>2 · LB + fleet</td><td class="num">2–5k</td><td class="num">$2k</td><td>Medium — health checks, fleet deploys</td></tr>
+    <tr><td>3 · replicas + cache + CDN</td><td class="num">20k</td><td class="num">$10k</td><td>High — lag, invalidation, 3 staleness kinds</td></tr>
+    <tr><td>4 · autoscale + queues</td><td class="num">50k</td><td class="num">$30k</td><td>High — async failure semantics, moving cost</td></tr>
+    <tr><td>5 · shards + NoSQL</td><td class="num">100k+</td><td class="num">$100k</td><td>Very high — resharding, hot shards, N stores</td></tr>
+    <tr><td>6 · multi-region</td><td class="num">1M</td><td class="num">$1M</td><td>Extreme — conflicts, failover drills, residency</td></tr>
+  </table>
+  <p>Read the table diagonally: each 10× of ceiling costs roughly 10× in dollars <em>and</em> a qualitative jump in operational complexity. That is the thesis — <strong>scale is bought with complexity</strong>, which is why jumping stages early is a smell, not ambition. And every jump has a prerequisite the ladder hides: <strong>monitoring and alerting</strong> (lesson 0016). You cannot autoscale on metrics you don't collect, detect a hot shard you don't graph, or fail over on an outage you notice from Twitter. Instrumentation precedes each rung.</p>
+
+  <h2>10 · The meta-lesson — Phase 3 was this ladder all along</h2>
+  <p>Every rep in Phase 3 lives at a specific rung of this ladder:</p>
+  <table>
+    <tr><th>Rep</th><th>Stage where its pattern appears</th></tr>
+    <tr><td>0018 · Rate limiter</td><td>Stage 2 — externalized counters in Redis guard the fleet's front door</td></tr>
+    <tr><td>0019 · Pastebin/TinyURL</td><td>Stage 3 — read-heavy cache-aside; ID generation across N servers</td></tr>
+    <tr><td>0020 · News feed</td><td>Stage 5 — fanout writes, celebrity hot shards</td></tr>
+    <tr><td>0021 · Chat</td><td>Stages 2/4 — the stateful exception (sticky connections), offline queues</td></tr>
+    <tr><td>0022 · File sync</td><td>Stage 4 — object storage, async chunk workers</td></tr>
+    <tr><td>0023 · Notifications/scheduler</td><td>Stage 4 — queue fanout, dedup, idempotent consumers</td></tr>
+    <tr><td>0024 · Web crawler</td><td>Stages 4/5 — the queue as frontier; per-host politeness = rate limiting</td></tr>
+    <tr><td>0025 · Distributed KV store</td><td>Stage 5 — consistent hashing IS the sharding machinery</td></tr>
+    <tr><td>0026 · Search, 1B docs</td><td>Stages 5/6 — sharded indexes, scatter-gather merge</td></tr>
+    <tr><td>0027 · Payments</td><td>Stage 2 onward — retries exist the moment an LB does; idempotency or double-charges</td></tr>
+  </table>
+  <p>The smells interviewers probe are all <em>premature rungs</em>: microservices at stage 1 traffic, sharding before one primary is actually full, Cassandra "for scale" on relational data, multi-region for a single-country product, Kubernetes for three containers. The counter-move is always the same sentence: <em>"at our load numbers, that stage isn't earned yet."</em></p>
+
+  <h2>11 · Interview talking points</h2>
+  <ul>
+    <li><em>The one-breath evolution (30 seconds):</em> "One box until ~hundreds of QPS; split web from DB; then LB plus stateless web servers with sessions in Redis; then read replicas, cache-aside, and a CDN as reads grow; autoscaling, queues for slow work, object storage for files; shard the primary when writes outgrow it, NoSQL for hot simple paths; finally multi-region with geoDNS — active-passive first, active-active if the business pays for conflict resolution. Each step is bought with complexity, so I take it only when a measured number forces me."</li>
+    <li><em>Opening a scaling question:</em> "Before picking components, let me find which stage of the ladder this load actually lives at."</li>
+    <li><em>The three-beat per stage:</em> "What breaks first, the minimal fix, and the new problem the fix introduces — every fix introduces one."</li>
+    <li><em>Anti-fashion signal:</em> "I'd stay on the monolith here — at 300 QPS, microservices buy me network hops and distributed debugging, not capacity."</li>
+    <li><em>Monitoring as gate:</em> "Before each jump, the prerequisite is observability — you can't autoscale on metrics you don't collect."</li>
+    <li><em>Unprompted failure mode:</em> "The stage-3 trap is replication lag: a user posts a comment and can't see it. Read-your-writes routing closes it."</li>
+  </ul>
+
+  <h2>12 · Lab + project step</h2>
+  <div class="callout"><span class="label">Hands-on (do this before the quiz)</span>
+    In <code>labs/lab-0028-scaling-stages/</code>, <code>python3 scaling_lab.py</code> is a capacity-planning
+    simulator: the six stages defined as component sets, traffic ramped 10 → 1,000,000 RPS, an
+    M/M/1-flavored utilization→latency model (lesson 0.14: latency multiplies as utilization → 1)
+    computing p50/p99 per stage and naming the component that saturates FIRST at each load — plus a
+    cost proxy per stage. <code>python3 scaling_lab.py --stage 0</code> pins one stage and lets you watch
+    it die under the ramp. Do E1–E4 in the README: predict the breaking component <em>before</em> each run.
+  </div>
+  <p><strong>Project step — the final Phase-3 deliverable.</strong> Solo-narrate the full evolution aloud in ≤10 minutes, no notes: stage by stage, what breaks / the fix / the new problem, with the load numbers. Record where your narration diverged from this lesson and from the lab's observed saturation order — those deltas, plus your lab prediction-vs-observed notes, are what you bring to the next session. This rep closes Phase 3; Phase 4 puts GPUs in the boxes.</p>
+
+  <h2>Check yourself</h2>
+  <div class="quiz" id="quiz"></div>
+
+  <h2>Primary source</h2>
+  <p>Read the Primer's <a href="https://github.com/donnemartin/system-design-primer/blob/master/solutions/system_design/scaling_aws/README.md">Design a system that scales to millions of users on AWS</a> — the canonical worked version of this ladder, with AWS service names attached to each rung. Companion: the <a href="https://docs.aws.amazon.com/wellarchitected/latest/reliability-pillar/welcome.html">AWS Well-Architected reliability pillar</a> for how the industry codifies the availability and failover discipline behind stages 2–6.</p>
+
+  <footer class="lesson-footer">
+    <p><strong>Stuck or curious?</strong> Ask your teacher (the agent) anything — "at what write volume does sharding beat a bigger primary, concretely?" is an excellent follow-up question.</p>
+    <nav class="lesson-nav">
+      <span>◀ <a href="0027-payment-system.html">0027 · Payment System</a></span>
+      <span>Phase 4 · 0029 ML Serving Patterns ▶</span>
+    </nav>
+  </footer>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+renderQuiz(document.getElementById('quiz'), {
+  title: 'Check yourself',
+  questions: [
+    {
+      q: 'This rep asks you to evolve one site from one box to millions of users. What is it really testing?',
+      options: [
+        'Whether you scale by need, not fashion',
+        'Whether you memorize every AWS service name',
+        'Whether you can draw architecture diagrams quickly',
+      ],
+      answer: 0,
+      explain: 'The rep X-rays judgment: transitions must be forced by load numbers, not by fashion. Premature microservices, premature sharding, and premature multi-region are the named smells it exists to catch.',
+    },
+    {
+      q: 'Why does the canonical evolution start on a single server instead of a "proper" distributed architecture?',
+      options: [
+        'It costs nothing regardless of traffic volume',
+        'It removes any need for future migrations',
+        'It maximizes simplicity until load demands more',
+      ],
+      answer: 2,
+      explain: 'One box means no network hops, no distributed failure modes, trivial deploys, and full comprehension — YAGNI applied to infrastructure. You leave it when a measured number forces you off, and not before.',
+    },
+    {
+      q: 'Stage 3 adds read replicas behind the primary. What new problem arrives with them?',
+      options: [
+        'Slower writes because replicas block commits',
+        'Replication lag serving stale reads downstream',
+        'Higher cache miss rates on reads',
+      ],
+      answer: 1,
+      explain: 'Async replicas trail the primary, so a user can write a comment and then read its absence from a replica. Read-your-writes routing or bounded staleness returns with replication — the lesson 0004/0005 callback.',
+    },
+    {
+      q: 'What is the trigger for sharding the primary database in this evolution?',
+      options: [
+        'As soon as you add read replicas',
+        'When any table exceeds one million rows',
+        'When write volume outgrows one primary node',
+      ],
+      answer: 2,
+      explain: 'Replicas scale reads only — every replica replays every write, so the single primary remains the write wall. Sharding splits writes across N primaries, and it is deferred until then because its costs (cross-shard queries, resharding, hot shards) are severe.',
+    },
+    {
+      q: "The lesson's cost-curve thesis says every jump up the ladder is bought with what?",
+      options: [
+        'Complexity: more moving parts and ops burden',
+        'Money: bigger machines solve every scaling stage',
+        'Luck: traffic patterns rarely follow capacity plans',
+      ],
+      answer: 0,
+      explain: 'Each 10× of QPS ceiling costs roughly 10× in dollars plus a qualitative jump in operational complexity — new staleness kinds, new failure semantics, new stores to run. That is why jumping stages early is a smell.',
+    },
+    {
+      q: 'Compared with active-passive, what does active-active multi-region buy — and what does it cost?',
+      options: [
+        'Cheaper failover but data loss every time',
+        'Full capacity use but conflict resolution pain',
+        'Simpler operations but much higher latency everywhere',
+      ],
+      answer: 1,
+      explain: 'Active-active serves from every region — no idle standby, instant failover — but writes can now conflict across regions, so last-write-wins, CRDTs, or home-region pinning becomes your problem. Active-passive is simpler and wastes the standby.',
+    },
+  ],
+});
+</script>
+</body>
+</html>

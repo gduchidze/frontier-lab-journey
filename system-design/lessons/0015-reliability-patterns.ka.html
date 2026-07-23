@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html lang="ka">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>გაკვეთილი 15 · საიმედოობის პატერნები</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<div class="lesson">
+  <header class="lesson-header">
+    <p class="kicker">გაკვეთილი 0015 · ფაზა 2 — პროგრამული არქიტექტურა და საიმედოობა · <a href="0015-reliability-patterns.html">English version</a></p>
+    <h1>საიმედოობის პატერნები</h1>
+    <p class="dek">სისტემები იშვიათად კვდებიან თვითონ ჩავარდნისგან — ისინი საკუთარი დაცვებით კვდებიან. Timeout-ები, retry-ები, breaker-ები, bulkhead-ები, shedding — და როგორ ხდება თითოეული, არასწორად გამოყენებული, თავად ავარია.</p>
+  </header>
+
+  <div class="mission-tie">
+    <strong>მისიასთან კავშირი.</strong> Anthropic-ის დიზაინის ამოცანები ყოველთვის ერთსა და იმავე კითხვამდე მიდიან: <em>„და რა ხდება, როცა ის dependency შენელდება?"</em> ვინც ამბობს „დავამატოთ retry", ახლახან retry storm-ი (განმეორებების შტორმი) დააპროექტა; ვინც ასახელებს timeout budget-ს, retry budget-ს, breaker-ის ზღვრებს და shed პოლიტიკას — რიცხვებით — ის აღწერს სისტემას, რომელიც საკუთარ სამშაბათს გადაურჩება. ეს გაკვეთილი არის <a href="https://pragprog.com/titles/mnee2/release-it-second-edition/">Release It!</a>-ისა და <a href="https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/">AWS Builders' Library-ის</a> ლექსიკა. (<a href="https://www.tryexponent.com/blog/anthropic-system-design-interview">Exponent-ის 2026 Anthropic გზამკვლევი</a>)
+  </div>
+
+  <h2>1 · კასკადური ჩავარდნის ანატომია</h2>
+  <p>განაწილებული სისტემის ნაგულისხმევი ქცევა ნაწილობრივი ჩავარდნისას არის ერთი ნელი dependency-ის სრულ ავარიად გადაქცევა. კანონიკური თანმიმდევრობა <a href="https://pragprog.com/titles/mnee2/release-it-second-edition/">Release It!-იდან</a>: checkout სერვისი payments პროვაიდერს ეძახის, რომლის p99 ჩუმად 200 ms-დან 10 წამამდე ადის. არაფერი „ჩავარდნილა" — ყველა ზარი ბოლოს ბრუნდება. მაგრამ Little-ის კანონით 100 RPS × 10 წმ = <strong>1,000 პარალელური მოთხოვნა</strong> 200-thread-იან pool-ზე. Pool წამებში ივსება; მოთხოვნები, რომლებიც payments-ს საერთოდ არ ეხებიან, რიგში დგებიან მათ უკან — და მთელი საიტი ისეთივე ნელია, როგორც მისი ყველაზე ნელი dependency. <strong>Latency გადამდებია.</strong> ორი დასკვნა: <em>ნელი უარესია, ვიდრე მკვდარი</em> (მკვდარი სწრაფად ვარდება და thread-ებს ათავისუფლებს; ნელი მძევლად იჭერს), და დაცვები ერთმანეთზე მოქმედებენ — ამიტომ §7 მთლიანად მათს ჩავარდნებზეა. (<a href="https://sre.google/sre-book/addressing-cascading-failures/">SRE წიგნი: Addressing cascading failures</a>)</p>
+
+  <h2>2 · Timeout-ები — ყველა remote ზარს აქვს</h2>
+  <p>ურყევი წესი: <strong>ყველა remote ზარს აქვს timeout, ყოველთვის</strong> — ზარი timeout-ის გარეშე არის thread, რომელიც სხვის ავარიას აჩუქე (<a href="https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/">AWS Builders' Library</a>). ორი რიცხვი: <strong>connect timeout</strong> (მოკლე) და <strong>request timeout</strong> — ეს უკანასკნელი dependency-ის <em>გაზომილი p99-დან</em> აირჩიე თავისუფალი მარაგით, და არა შეგრძნებით. Timeout-ები ჯაჭვის გასწვრივ უნდა იშლებოდეს (timeout budget — ბიუჯეტი):</p>
+  <table>
+    <tr><th>Hop</th><th>Timeout</th><th>რატომ ეს რიცხვი</th></tr>
+    <tr><td>კლიენტი → edge</td><td>2,000 ms</td><td>პროდუქტის დაპირება: checkout 2 წამში პასუხობს ან ბოდიშს იხდის</td></tr>
+    <tr><td>Edge → checkout სერვისი</td><td>1,500 ms</td><td>Edge-ს 500 ms რჩება ერთი retry-სთვის ან სუფთა error გვერდისთვის</td></tr>
+    <tr><td>Checkout → payments პროვაიდერი</td><td>800 ms</td><td>პროვაიდერის p99 250 ms-ია; 3× მარაგი, ისევ ბიუჯეტში</td></tr>
+    <tr><td>Checkout → inventory DB</td><td>300 ms</td><td>p99 40 ms-ია; უფრო ნელი უკვე ანომალიაა</td></tr>
+  </table>
+  <p>ინვარიანტი ხმამაღლა თქვი: <em>შვილის timeout &lt; მშობლის დარჩენილი ბიუჯეტი, ყველა დონეზე.</em> 5-წამიანი timeout 2-წამიანის ქვეშ დეკორაციაა — მშობელი უკვე გათიშულია.</p>
+
+  <h2>3 · Retry-ები სწორად</h2>
+  <p>Retry არის ფსონი, რომ ჩავარდნა დროებითი იყო — და ის <strong>დამატებითი დატვირთვაა სისტემაზე, რომელმაც ახლახან გითხრა, რომ უჭირს</strong>. სამი წესი: (1) მხოლოდ <strong>idempotent</strong> (გამეორებადი) ოპერაციები და მხოლოდ transient (გარდამავალი) შეცდომები — payment capture-ის გამეორება ორმაგი ჩამოჭრაა; (2) <strong>exponential backoff სრული jitter-ით</strong> — უბრალო backoff (100, 200, 400 ms) ერთად ჩავარდნილ კლიენტებს სინქრონულ ტალღებად ტოვებს; სრული jitter — ძილი შემთხვევით [0, cap] შუალედში — მათ აშორებს, და <a href="https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/">AWS-ის სიმულაციამ</a> აჩვენა, რომ ის ჯამურ სამუშაოს დაახლოებით ნახევრამდე ამცირებს; (3) <strong>retry budget</strong> — retry-ები ≤ 10% საბაზო ტრაფიკისა; ბიუჯეტი რომ ამოიწურება, ვარდები და აღარ იმეორებ.</p>
+  <p><strong>ნამუშევარი მაგალითი — არითმეტიკა, რომელიც ინტერვიუერებს სმენა სურთ.</strong> Retry-ები ფენებს შორის <em>მრავლდებიან</em>: edge 3×, სერვისი 3×, მონაცემთა ფენა 3× — სრული ავარიისას ერთი მოთხოვნა ქვედა dependency-სთან <strong>3 × 3 × 3 = 27 მცდელობა</strong> ხდება. 1,000 RPS მოთხოვნაზე მომაკვდავი dependency 27,000 მცდელობა/წმ-ს იღებს — 27-ჯერადი თვითმოწყობილი DDoS, ყველაზე ცუდ მომენტში. ლაბში 2 ფენა × 3 მცდელობაც კი, მხოლოდ 50% ჩავარდნაზე, დატვირთვას <strong>3.3×</strong>-მდე წევს — და შტორმი ჩავარდნის ფანჯარას 3 წამით <em>გადააცილებს</em>, რადგან dependency-მ retry-ების შექმნილი ზვავიდან ამოძრომა უნდა მოასწროს. გამოსავალი: retry ერთ ფენაზე, ბიუჯეტით, წინ კი circuit breaker.</p>
+
+  <h2>4 · Circuit breaker — სწრაფად დავარდი, ფრთხილად გასინჯე</h2>
+  <p>Breaker-ი dependency-ის ზარებს ახვევს და ბოლო შედეგებს ითვლის; როცა ჩავარდნის წილი ზღვარს გადააჭარბებს, ის <em>ირთვება</em> და შემდეგი ზარები მყისიერად ვარდებიან, dependency-ს ხელს არ ახლებენ (<a href="https://martinfowler.com/bliki/CircuitBreaker.html">Fowler: CircuitBreaker</a>; პატერნი <a href="https://pragprog.com/titles/mnee2/release-it-second-edition/">Release It!-მა</a> დააკანონა). State machine, რომლის დახატვაც უნდა შეგეძლოს:</p>
+  <table>
+    <tr><th>მდგომარეობა</th><th>ქცევა ყოველ ზარზე</th><th>გადადის, როცა</th></tr>
+    <tr><td><strong>Closed</strong> (ნორმალური)</td><td>ზარი გადის; შედეგი მოძრავ ფანჯარაში იწერება</td><td>ჩავარდნის წილი ≥ ზღვარი (მაგ. 50% 20 ზარზე) → <strong>Open</strong></td></tr>
+    <tr><td><strong>Open</strong> (ჩართული)</td><td>მყისიერი უარი — ქსელი არ არის, ვარდნა მიკროწამებში</td><td>Cooldown გავა (მაგ. 2 წმ) → <strong>Half-open</strong></td></tr>
+    <tr><td><strong>Half-open</strong> (სინჯავს)</td><td>შეზღუდული probe (საცდელი ზარი) გადის; დანარჩენებზე უარი</td><td>Probe წარმატებულია → <strong>Closed</strong>; ჩავარდა → <strong>Open</strong></td></tr>
+  </table>
+  <p><strong>რას ყიდულობს fail-fast.</strong> Breaker-ის გარეშე ავარიისას ყოველი ზარი სრულ timeout-ს ჭამს: ლაბში 10-წამიანი ავარია 50 ზარი/წმ-ზე 1-წამიანი timeout-ით caller-ს <strong>500 caller-წამი</strong> დაბლოკილი thread-დროის უჯდება. Breaker-ით ერთი ფანჯარა იხდის timeout-ს, შემდეგ ყველაფერი მიკროწამებში ვარდება (ლაბში: სულ 14 წამი — 36-ჯერ ნაკლები), dependency კი სიჩუმეს იღებს, რომ გამოჯანმრთელდეს. Half-open probe ელეგანტურობაა: სისტემა გამოჯანმრთელებას <em>ერთი</em> მოთხოვნის ფასად აღმოაჩენს და არა ჯოგით.</p>
+
+  <h2>5 · Bulkhead-ები და cell-ები</h2>
+  <p>Nygard-მა სახელი გემის ტიხრებიდან აიღო: ერთი დატბორილი განყოფილება გემს არ უნდა ძირავდეს. პროგრამულად: <strong>ყოველ dependency-ს (ან tenant-ს) თავისი შემოსაზღვრული pool</strong> — thread-ები, connection-ები — რომ §1-ის სცენარი გახდეს „payments-ის 30-thread-იანი pool ამოიწურა; browse და search, საკუთარ pool-ებზე, ვერც ამჩნევენ." მასშტაბზე bulkhead არქიტექტურა ხდება: <strong>cell-based არქიტექტურა</strong> მთელ სტეკს დამოუკიდებელ cell-ებად ჭრის, ხოლო <strong>shuffle sharding</strong> ყოველ მომხმარებელს node-ების შემთხვევით მცირე ქვესიმრავლეს ანიჭებს — ხმაურიანი მომხმარებელი მხოლოდ თავის კომბინაციას აფუჭებს, რომელსაც თითქმის არავინ იზიარებს ზუსტად (<a href="https://aws.amazon.com/builders-library/workload-isolation-using-shuffle-sharding/">AWS Builders' Library: Shuffle sharding</a>). Blast radius (დაზიანების რადიუსი) დიზაინის შესავალი მონაცემია და არა პოსტ-ინციდენტური მეტრიკა.</p>
+
+  <h2>6 · Load shedding და graceful degradation</h2>
+  <p>როცა შემოთავაზებული დატვირთვა სიმძლავრეს აჭარბებს, ვიღაცას მაინც ვერ მოემსახურები — არჩევანი მხოლოდ <em>ვის და როგორ</em> არის. არასწორი პასუხი ნაგულისხმევია: ყველაფერი რიგში ჩააყენე და latency-მ იზარდოს, სანამ ყველა პასუხი თავისი მომლოდინის წასვლის შემდეგ არ მოვა — 100% შრომა, 0% goodput. სწორი პასუხი აშკარაა: <strong>უარი admission-ზე (მიღებისას)</strong>, იაფად და ადრე, <code>503</code> + <code>Retry-After</code>-ით (<a href="https://aws.amazon.com/builders-library/using-load-shedding-to-avoid-overload/">AWS: Using load shedding to avoid overload</a>; <a href="https://sre.google/sre-book/handling-overload/">SRE: Handling overload</a>). გაიხსენე utilization–latency მრუდი: ~80–90%-ის მერე ლოდინი ვერტიკალურად ადის — admission control 0.9C-ზე ამ კლდეზე აძრომაზე უარია. ლაბში 2× სიმძლავრეზე აწევისას დაუცველი რიგის p99 <strong>5.8 წამია და იზრდება</strong>; admission control 816 მოთხოვნას აგდებს და გადარჩენილებს ბრტყელ latency-ს უნარჩუნებს.</p>
+  <table>
+    <tr><th>კლასი</th><th>მაგალითები</th><th>გადატვირთვისას</th></tr>
+    <tr><td>კრიტიკული</td><td>Checkout, payment capture, <em>health check-ები</em></td><td>ბოლოს დააგდე — health check-ების დაგდება LB-ს ჯანმრთელი სერვერების მოკვეთას აიძულებს</td></tr>
+    <tr><td>სტანდარტული</td><td>პროდუქტის გვერდები, ძებნა</td><td>Degradable-ების მერე; სადაც შეიძლება, ძველი cache მიაწოდე</td></tr>
+    <tr><td>Degradable</td><td>რეკომენდაციები, analytics, prefetch</td><td>პირველი დააგდე — ან ფუნქცია მთლიანად გამორთე</td></tr>
+  </table>
+  <p><strong>Graceful degradation მომხმარებლების ნაცვლად ფუნქციების დაგდებაა</strong>: flash sale-ზე რეკომენდაციები მოაშორე, გუშინდელი ბესტსელერების სია cache-იდან მიაწოდე, checkout კი ხელუხლებელი დატოვე. <em>Brownout (შებინდება) &gt; blackout (ჩაქრობა).</em> და იგივე კანონი ყველა შიდა რიგზე: <strong>შემოუსაზღვრავი queue latency-ის ბომბია</strong> (<a href="https://aws.amazon.com/builders-library/avoiding-insurmountable-queue-backlogs/">AWS: Avoiding insurmountable queue backlogs</a>) — ეს <a href="0008-async-and-communication.ka.html">გაკვეთილი 0008-ის</a> ლაბში გაზომე.</p>
+
+  <h2>7 · Failure mode-ები — როცა დაცვები თავს გვესხმიან</h2>
+  <ul>
+    <li><strong>მოციმციმე (flapping) breaker.</strong> ზედმეტად პატარა ფანჯარა (5 ზარი) breaker-ს ხმაურზე ართავს, იღბლიან probe-ზე კეტავს და ისევ ართავს — caller-ები შეცდომებს დამაბნეველ პორციებად იღებენ, dependency კი სუფთა სიჩუმეს ვერასდროს. ლაბში თვითონ გამოიწვევ (E2).</li>
+    <li><strong>გლობალურად გაზიარებული retry budget.</strong> ერთი ბიუჯეტი ყველა tenant-ზე ნიშნავს, რომ ერთი ცუდი tenant-ის ჩავარდნები მთელ ბიუჯეტს წვავენ და retry <em>არავის</em> რჩება. ბიუჯეტებსაც bulkhead-ები სჭირდებათ: per-tenant, per-dependency.</li>
+    <li><strong>Fallback, რომელიც სწორედ იმ დღეს ტყდება.</strong> Fallback გზა იშვიათად ეშვება, ამიტომ გაუტესტავი და მიტოვებულია — და ზუსტად მაშინ ირთვება, როცა სისტემა ისედაც დეგრადირებულია. ეს არის AWS-ის <a href="https://aws.amazon.com/builders-library/avoiding-fallback-in-distributed-systems/">avoiding fallback</a> არგუმენტის გული: ამჯობინე მუდამ ვარჯიშში მყოფი მექანიზმები (shedding, throttling) მეორე კოდის გზას, რომელმაც ცივად, ხანძრის დროს უნდა იმუშაოს.</li>
+    <li><strong>დეკორატიული timeout.</strong> ქვედა timeout, რომელიც caller-ის დარჩენილ ბიუჯეტზე გრძელია, არაფერს იცავს — caller-მა ყურმილი უკვე დაკიდა.</li>
+    <li><strong>იაფი მოთხოვნების shedding.</strong> Shedder-ი, რომელიც შემთხვევით აგდებს, $0-იან analytics beacon-სა და $400-იან checkout-ს თანაბარი ენთუზიაზმით აგდებს — ან, უარესი, health check-ებს, და LB ჯანმრთელ სერვერებს კვეთს. პრიორიტეტი shedding-ის მთელი აზრია.</li>
+  </ul>
+
+  <div class="callout"><span class="label">LLM შტრიხი</span>
+    ყველაფერი ზემოთქმული GPU serving-ზე გადადის, ფასები კი იზრდება: GPU worker-ის „thread pool" მისი batch queue-ა, ამიტომ <strong>admission control რიგის წინ დგას</strong> (უარი, როცა queue depth × service time SLO-ს აჭარბებს); <strong>per-tenant bulkhead-ები</strong> ერთი მომხმარებლის 100k-token სამუშაოებს ყველას chat ტრაფიკის შიმშილობისგან აჩერებენ; brownout-სვლა კი <strong>პატარა მოდელზე დეგრადაციაა</strong> — გადატვირთვისას სტანდარტული ტრაფიკი იაფ მოდელზე გადადის, flagship კი premium-ს რჩება. იგივე პატერნები, უფრო ძვირი miss-ები.
+  </div>
+
+  <h2>8 · ლაბი — თვითონ ჩართე breaker-ი</h2>
+  <div class="callout"><span class="label">პრაქტიკა (ქვიზამდე გააკეთე)</span>
+    ყველაფერი ზემოთქმული ახლა შემოწმებადია: <code>labs/lab-0015-circuit-breaker/</code>-ში
+    <code>python3 reliability_lab.py</code> უშვებს სამ ექსპერიმენტს — retry-ის გამრავლება
+    (გულუბრყვილო ფენოვანი retry-ები vs 10%-იანი retry budget 50%-ით ჩავარდნად dependency-ზე,
+    შტორმით, რომელიც თავის ავარიას გადააცილებს), სრული closed/open/half-open breaker-ი
+    10-წამიან ავარიაზე (უყურე, როგორ აქცევს fail-fast 500 დაკარგულ caller-წამს 14-ად) და
+    load shedding 2× სიმძლავრეზე (დაუცველი რიგი vs admission control, Little-ის კანონი ფასებს ითვლის).
+    შემდეგ README-ს E1–E4: <em>იწინასწარმეტყველე, შეცვალე კონფიგი, გაუშვი თავიდან, შეადარე.</em>
+    მცდარი პროგნოზები არის დავალების შედეგი — მოიტანე ისინი შემდეგ სესიაზე.
+  </div>
+
+  <h2>9 · პროექტის ნაბიჯი</h2>
+  <p>დაწერე <strong>საიმედოობის პოლიტიკა gateway→worker ზარებისთვის</strong> LLM inference პლატფორმაში: timeout, retry budget, breaker-ის ზღვრები, shed პოლიტიკა — და ორი წინადადებით დაიცავი. დასაცავი მაგალითი: <em>request timeout = მოთხოვნილი max-tokens-ის p99 decode დროის 1.2×, ერთი retry მხოლოდ idempotent-უსაფრთხო ჩავარდნებზე 10%-იანი per-tenant ბიუჯეტით, breaker 50% ჩავარდნაზე 20 ზარიდან 5-წამიანი cooldown-ით თითო worker-ზე, და admission control batch queue-ს წინ, რომელიც ჯერ free-tier ტრაფიკს აგდებს 503 + Retry-After-ით.</em> დაწერე შენი — ოთხივე რიცხვი, ორი წინადადება დაცვა — და მოიტანე შემდეგ სესიაზე გასარჩევად.</p>
+
+  <h2>შეამოწმე შენი თავი</h2>
+  <div class="quiz" id="quiz"></div>
+
+  <h2>ძირითადი წყარო</h2>
+  <p>წაიკითხე <strong>AWS Builders' Library-ის</strong> წყვილი, რომელზეც ეს გაკვეთილი დგას: <a href="https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/">Timeouts, retries and backoff with jitter</a>, შემდეგ <a href="https://aws.amazon.com/builders-library/using-load-shedding-to-avoid-overload/">Using load shedding to avoid overload</a> — ორივე ამ სისტემების ოპერატორი ინჟინრების დაწერილია და სავსეა ზუსტად იმ რიცხვებით, რომლებსაც ინტერვიუერები ეძებენ. წიგნის დონეზე — <a href="https://pragprog.com/titles/mnee2/release-it-second-edition/">Release It! (მე-2 გამოცემა)</a>: circuit breaker-ისა და bulkhead-ის, როგორც პროგრამული ლექსიკის, სამშობლო.</p>
+
+  <footer class="lesson-footer">
+    <p><strong>გაიჭედე ან გაინტერესებს?</strong> ჰკითხე მასწავლებელს (აგენტს) ნებისმიერი რამ — „რატომ ამტკიცებს AWS fallback-ის *წინააღმდეგ*, load shedding-ის *მომხრედ* კი, როცა ორივე დეგრადირებული რეჟიმია?" შესანიშნავი დამატებითი კითხვაა.</p>
+    <nav class="lesson-nav">
+      <span><a href="0014-distributed-transactions.ka.html">◀ წინა: 0014 · განაწილებული ტრანზაქციები და კოორდინაცია</a></span>
+      <span><a href="0016-observability-and-ops.ka.html">შემდეგი: 0016 · Observability და Ops ▶</a></span>
+    </nav>
+  </footer>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+renderQuiz(document.getElementById('quiz'), {
+  title: 'შეამოწმე შენი თავი',
+  questions: [
+    {
+      q: 'მოთხოვნა სამ სერვისის ფენას გადის და სრული ავარიისას თითო ფენა სამ მცდელობას აკეთებს. რამდენ მცდელობას წარმოშობს ერთი კლიენტის მოთხოვნა ქვედა dependency-სთან?',
+      options: [
+        'ცხრა მცდელობას, რადგან retry-ები ფენებს შორის უბრალოდ ჯამდებიან',
+        'ოცდაშვიდ მცდელობას, რადგან ფენების retry-ები ჯაჭვში ერთმანეთზე მრავლდებიან',
+        'სამ მცდელობას, რადგან რეალურად მხოლოდ ზედა ფენა იმეორებს',
+      ],
+      answer: 1,
+      explain: 'ზედა ფენის სამივე მცდელობა შუა ფენის სამ-სამ მცდელობას იწვევს, თითოეული კი — ქვედას სამს: 3 × 3 × 3 = 27. Retry-ები ფენებს შორის მრავლდებიან — ამიტომ retry ერთ ფენაზე უნდა ცხოვრობდეს, ბიუჯეტის ქვეშ.',
+    },
+    {
+      q: 'Circuit breaker-ის open cooldown-მა გაიარა და ის half-open მდგომარეობაში გადავიდა. რას აკეთებს ის ამ მდგომარეობაში?',
+      options: [
+        'შეზღუდულ probe მოთხოვნას ატარებს, რომ dependency-ის მდგომარეობა შეამოწმოს',
+        'ყველა მოთხოვნაზე მყისიერ უარს ამბობს, სანამ ოპერატორი ხელით ჩააკეტებს',
+        'მთელ ტრაფიკს ჩვეულებრივ ატარებს და დაკვირვებულ ჩავარდნის წილს იწერს',
+      ],
+      answer: 0,
+      explain: 'Half-open ერთ (ან რამდენიმე) რეალურ მოთხოვნას ხარჯავს, რომ აღმოაჩინოს, გამოჯანმრთელდა თუ არა dependency: probe წარმატებულია → იკეტება, ჩავარდა → ისევ იღება. გამოჯანმრთელება ერთი მოთხოვნით აღმოჩნდება და არა ჯოგით.',
+    },
+    {
+      q: 'ბევრი კლიენტი ერთად ვარდება და ერთნაირი დაყოვნებებით exponential backoff-ს იყენებს. რატომ შველის backoff-ზე სრული jitter-ის დამატება?',
+      options: [
+        'ის თითოეულ ცალკეულ retry-ს ჩვეულებრივ exponential backoff-ზე უფრო სწრაფად ამთავრებინებს',
+        'ის retry-ებს დროში შემთხვევითად ფანტავს და პიკები სინქრონიზაციას წყვეტენ',
+        'ის საერთო ჯამში ამცირებს retry-ების რაოდენობას, რომელსაც კლიენტი გზავნის',
+      ],
+      answer: 1,
+      explain: 'უბრალო exponential backoff კოჰორტას სინქრონულს ტოვებს — retry-ების ტალღები ერთსა და იმავე მომენტებში ეცემა. სრული jitter ყოველ ძილს [0, cap]-ზე აფანტავს და ჯოგს აშორებს; AWS-ის სიმულაციამ აჩვენა, რომ ის ჯამურ სამუშაოს დაახლოებით ნახევრამდე ამცირებს.',
+    },
+    {
+      q: 'შენი სერვერი გაჯერებულია და მოთხოვნები ისევ მოდიან. რატომ ჯობს ჭარბის უარყოფა admission-ზე ყველაფრის რიგში ჩაყენებას?',
+      options: [
+        'მზარდი რიგი latency-ს ისე ზრდის, რომ ყველა პასუხი უსარგებლოდ გვიან მოდის',
+        'უარყოფა ქსელის გამტარუნარიანობას ათავისუფლებს, რომელიც აქ ნამდვილად დეფიციტური რესურსია',
+        'რიგში მდგომი მოთხოვნები ხარჯავენ database ტრანზაქციებს, რომლებიც უარყოფილებსაც მაინც დასჭირდებოდათ',
+      ],
+      answer: 0,
+      explain: 'შემოუსაზღვრავი რიგი გადატვირთვას შემოუსაზღვრავ დაყოვნებად აქცევს: Little-ის კანონით ლოდინი ზვავთან ერთად იზრდება, სანამ სერვერი 100%-ით არ მუშაობს პასუხებზე, რომელთა მომლოდინეები უკვე წავიდნენ. ადრეული უარი მიღებულ მოთხოვნებს სწრაფს ტოვებს — goodput ჯობს throughput-ს.',
+    },
+    {
+      q: 'ერთი ქვედა dependency ნელდება და მალე მთელი შენი სერვისი პასუხს აღარ სცემს — ის endpoint-ებიც კი, რომლებიც მას არ ეძახიან. რომელი გამოტოვებული პატერნი ხსნის ამას?',
+      options: [
+        'Retry-ები: დამატებითი მცდელობები ნელ ზარებს ბოლოს წარმატებით დაასრულებინებდა ალბათ',
+        'Caching: შენახული პასუხები უპასუხებდა მოთხოვნებს, რომლებსაც ნელი dependency ვერ პასუხობს',
+        'Bulkhead-ები: იზოლირებული pool-ები ერთ dependency-ს ყველა thread-ის დაცლას აუკრძალავდა',
+      ],
+      answer: 2,
+      explain: 'ერთი საერთო thread pool-ით ნელი dependency-ის ზარები მანამ დგანან, სანამ ყველა thread-ს არ დაიკავებენ, და შეუხებელი endpoint-ები მათ უკან შიმშილობენ. Bulkhead — შემოსაზღვრული pool თითო dependency-ზე — ზარალს ამ pool-ის ზომაზე ზღუდავს.',
+    },
+    {
+      q: 'AWS Builders\' Library რთული fallback გზების წინააღმდეგ ამტკიცებს განაწილებულ სისტემებში. რა არის ამ არგუმენტის გული?',
+      options: [
+        'Fallback გზები ყოველთვის დაახლოებით ორმაგ ინფრასტრუქტურას უჯდება ძირითად გზასთან შედარებით',
+        'Fallback ლოგიკა მხოლოდ კლიენტის ბიბლიოთეკაში უნდა იჯდეს და არასდროს სერვერზე',
+        'Fallback კოდი იშვიათად ეშვება, ამიტომ გაუტესტავია ზუსტად მაშინ, როცა სჭირდება',
+      ],
+      answer: 2,
+      explain: 'Fallback გზა მხოლოდ იშვიათ ცუდ დღეებში ეშვება, ამიტომ ლპება: გაუტესტავი, ნაკლებად უზრუნველყოფილი, და პირველად რეალურად ინციდენტის შუაგულში ირთვება. AWS ამჯობინებს მუდამ ვარჯიშში მყოფ მექანიზმებს — shedding, throttling, სტატიკური სტაბილურობა.',
+    },
+  ],
+});
+</script>
+</body>
+</html>
