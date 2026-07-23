@@ -141,11 +141,26 @@ kubectl get pods -n llm</code></pre>
 <div class="step">
 <h3>გააფუჭე მეხსიერება — გაიცანი OOMKilled</h3>
 <p>გაუშვი Pod, რომელიც თავის limit-ზე მეტს გამოყოფს:</p>
-<pre><code>kubectl run oom-demo -n llm --image=polinux/stress --restart=Never \
-  --limits=memory=64Mi \
-  -- stress --vm 1 --vm-bytes 128M --vm-hang 0
+<pre><code>kubectl apply -f - &lt;&lt;'EOF'
+apiVersion: v1
+kind: Pod
+metadata:
+  name: oom-demo
+  namespace: llm
+spec:
+  restartPolicy: Never
+  containers:
+  - name: stress
+    image: polinux/stress
+    command: ["stress", "--vm", "1", "--vm-bytes", "128M", "--vm-hang", "0"]
+    resources:
+      limits:
+        memory: 64Mi
+EOF
+
 sleep 10 && kubectl get pod oom-demo -n llm
 kubectl describe pod oom-demo -n llm | grep -A2 "Last State"</code></pre>
+<p><em>შენიშვნა:</em> ძველი გაკვეთილები იყენებენ <code>kubectl run --limits=…</code> ფლაგს — ის kubectl 1.24-ში წაიშალა. მანიფესტები სწორი გზაა (რაც ამ გაკვეთილის მთავარი აზრია).</p>
 <p class="expect">მოსალოდნელია: STATUS OOMKilled — ზუსტად ის ჩავარდნა, რომელსაც დაადიაგნოსტირებ, როცა vLLM მეხსიერების limit-ს გადააჭარბებს</p>
 <pre><code>kubectl delete pod oom-demo -n llm</code></pre>
 <div class="win"><strong>მოგება</strong>

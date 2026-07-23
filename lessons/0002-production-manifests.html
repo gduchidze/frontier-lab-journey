@@ -142,11 +142,26 @@ kubectl get pods -n llm</code></pre>
 <div class="step">
 <h3>Break memory — meet OOMKilled</h3>
 <p>Run a Pod that allocates more than its limit:</p>
-<pre><code>kubectl run oom-demo -n llm --image=polinux/stress --restart=Never \
-  --limits=memory=64Mi \
-  -- stress --vm 1 --vm-bytes 128M --vm-hang 0
+<pre><code>kubectl apply -f - &lt;&lt;'EOF'
+apiVersion: v1
+kind: Pod
+metadata:
+  name: oom-demo
+  namespace: llm
+spec:
+  restartPolicy: Never
+  containers:
+  - name: stress
+    image: polinux/stress
+    command: ["stress", "--vm", "1", "--vm-bytes", "128M", "--vm-hang", "0"]
+    resources:
+      limits:
+        memory: 64Mi
+EOF
+
 sleep 10 && kubectl get pod oom-demo -n llm
 kubectl describe pod oom-demo -n llm | grep -A2 "Last State"</code></pre>
+<p><em>Note:</em> older tutorials use <code>kubectl run --limits=…</code> — that flag was removed in kubectl 1.24. Manifests are the way (which is this lesson's whole point).</p>
 <p class="expect">expect: STATUS OOMKilled — the exact failure you'll diagnose when vLLM exceeds its memory limit</p>
 <pre><code>kubectl delete pod oom-demo -n llm</code></pre>
 <div class="win"><strong>The win</strong>
